@@ -1,0 +1,11 @@
+# The ESP-IDF this project is pinned to.
+#
+# tools/setup.ps1 refuses to run against anything else. The Bluetooth patches in
+# patches/ are unified diffs against this exact tree, and applying them to a
+# different one either fails or, worse, applies to the wrong context.
+#
+# Raising this is a deliberate act: change the two lines below, re-run setup.ps1,
+# resolve the rejects it names, commit the refreshed patches. See docs/BASE.md.
+
+version=v5.5.5
+commit=b774170ff46c393eeb5e495ea37936038d3f4f4f

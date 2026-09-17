@@ -6,3 +6,6 @@ managed_components/
 dependencies.lock
 .vscode/
 *.log
+
+# Rebuilt from the pinned IDF by tools/setup.ps1 — 71 MB, never committed (docs/BASE.md).
+components/bt/
