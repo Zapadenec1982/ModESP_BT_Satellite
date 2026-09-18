@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "audio_out.h"
+#include "link.h"
 
 #include "esp_a2dp_api.h"
 #include "esp_avrc_api.h"
@@ -13,22 +14,38 @@
 #include "esp_check.h"
 #include "esp_gap_bt_api.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "satlink/proto.h"
 
 static const char *TAG = "sat.bt";
 
-#define BT_TASK_STACK       3072
+#define BT_TASK_STACK       3584
 #define BT_TASK_PRIO        (configMAX_PRIORITIES - 4)
-#define BT_QUEUE_DEPTH      10
+#define BT_QUEUE_DEPTH      12
 
 /* Metadata we ask the phone for. PLAYING_TIME is not in the usual example masks
- * but the spec's TRACK_POS needs the track length. */
+ * but TRACK_POS needs the track length. */
 #define BT_META_ATTRS   (ESP_AVRC_MD_ATTR_TITLE   | \
                          ESP_AVRC_MD_ATTR_ARTIST  | \
                          ESP_AVRC_MD_ATTR_ALBUM   | \
                          ESP_AVRC_MD_ATTR_PLAYING_TIME)
+
+/* Transaction labels. AVRCP allows sixteen; giving each conversation its own
+ * makes a packet capture readable. */
+#define TL_META         0
+#define TL_RN_CAPS      1
+#define TL_TRACK_CHANGE 2
+#define TL_PLAY_STATUS  3
+#define TL_VOLUME       4
+#define TL_PASSTHROUGH  5
+#define TL_PLAY_POS     6
+#define TL_PLAY_STATE   7
+
+#define META_SETTLE_US  (300 * 1000)    /* attributes arrive one per event */
+#define POS_PERIOD_US   (1000 * 1000)   /* the spec's one per second, playing only */
 
 /* A2DP events arrive on the Bluetooth stack's own task. Anything that can block —
  * retuning the I2S clock, for one — is handed to this task instead. */
@@ -38,6 +55,30 @@ typedef struct {
 } bt_a2d_msg_t;
 
 static QueueHandle_t s_queue;
+
+/* Everything the host is ever told about, in one place. */
+static struct {
+    uint8_t  state;                 /* satlink_bt_state_t */
+    uint8_t  codec;                 /* satlink_codec_t */
+    uint8_t  addr[6];
+    char     name[64];
+
+    uint8_t  play_state;            /* satlink_play_state_t */
+    uint32_t elapsed_ms;
+    uint32_t total_ms;
+    int64_t  elapsed_at_us;         /* when elapsed_ms was true, for interpolation */
+
+    char     title[128];
+    char     artist[128];
+    char     album[128];
+
+    uint8_t  volume;
+    bool     avrcp_up;
+    bool     has_play_pos;          /* the phone will notify about position */
+} s_now;
+
+static esp_timer_handle_t s_meta_timer;
+static esp_timer_handle_t s_pos_timer;
 
 static const char *conn_state_name(esp_a2d_connection_state_t state)
 {
@@ -61,6 +102,71 @@ static uint32_t sbc_rate_hz(const esp_a2d_cie_sbc_t *sbc)
     return 0;
 }
 
+void bt_av_report_state(void)
+{
+    link_send_bt_state(s_now.state, s_now.codec, s_now.addr, s_now.name);
+}
+
+static void send_track_meta(void *arg)
+{
+    (void)arg;
+    link_send_track_meta(s_now.title, s_now.artist, s_now.album);
+    ESP_LOGI(TAG, "meta: \"%s\" / \"%s\" / \"%s\"", s_now.title, s_now.artist, s_now.album);
+}
+
+static void meta_settle_restart(void)
+{
+    /* Attributes come one per event and a phone may leave some out, so rather
+     * than waiting for a set that might never complete, send shortly after the
+     * last one that did arrive. */
+    esp_timer_stop(s_meta_timer);
+    esp_timer_start_once(s_meta_timer, META_SETTLE_US);
+}
+
+static void send_track_pos(void)
+{
+    uint32_t elapsed = s_now.elapsed_ms;
+    if (s_now.play_state == SATLINK_PLAY_PLAYING && s_now.elapsed_at_us != 0) {
+        int64_t since_ms = (esp_timer_get_time() - s_now.elapsed_at_us) / 1000;
+        if (since_ms > 0) {
+            elapsed += (uint32_t)since_ms;
+        }
+    }
+    link_send_track_pos(s_now.play_state, elapsed, s_now.total_ms);
+}
+
+static void pos_tick(void *arg)
+{
+    (void)arg;
+
+    /* In pause and in stop, nothing at all. The host holds the last value. */
+    if (!s_now.avrcp_up || s_now.play_state != SATLINK_PLAY_PLAYING) {
+        return;
+    }
+
+    if (s_now.has_play_pos) {
+        /* The phone notifies on movement; this is only to keep the bar sliding
+         * smoothly between notifications. */
+        send_track_pos();
+    } else {
+        /* The fallback the bench forced on us: one phone advertised 0x1f26, which
+         * has no PLAY_POS bit, so the position has to be asked for. */
+        esp_avrc_ct_send_get_play_status_cmd(TL_PLAY_STATUS);
+    }
+}
+
+static uint8_t play_state_from_avrc(esp_avrc_playback_stat_t st)
+{
+    switch (st) {
+    case ESP_AVRC_PLAYBACK_STOPPED:     return SATLINK_PLAY_STOPPED;
+    case ESP_AVRC_PLAYBACK_PLAYING:     return SATLINK_PLAY_PLAYING;
+    case ESP_AVRC_PLAYBACK_PAUSED:      return SATLINK_PLAY_PAUSED;
+    case ESP_AVRC_PLAYBACK_FWD_SEEK:    return SATLINK_PLAY_FWD_SEEK;
+    case ESP_AVRC_PLAYBACK_REV_SEEK:    return SATLINK_PLAY_REV_SEEK;
+    default:                            return SATLINK_PLAY_STOPPED;
+    }
+}
+
 static void handle_a2d_event(const bt_a2d_msg_t *msg)
 {
     const esp_a2d_cb_param_t *p = &msg->param;
@@ -71,31 +177,58 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
         ESP_LOGI(TAG, "a2dp %s, %02x:%02x:%02x:%02x:%02x:%02x",
                  conn_state_name(p->conn_stat.state),
                  bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+
+        switch (p->conn_stat.state) {
+        case ESP_A2D_CONNECTION_STATE_CONNECTED:
+            memcpy(s_now.addr, bda, sizeof(s_now.addr));
+            s_now.state = SATLINK_BT_CONNECTED;
+            break;
+        case ESP_A2D_CONNECTION_STATE_CONNECTING:
+            s_now.state = SATLINK_BT_CONNECTING;
+            break;
+        default:
+            memset(s_now.addr, 0, sizeof(s_now.addr));
+            s_now.name[0] = '\0';
+            s_now.codec = SATLINK_CODEC_NONE;
+            s_now.state = SATLINK_BT_DISCOVERABLE;
+            s_now.play_state = SATLINK_PLAY_STOPPED;
+            s_now.title[0] = s_now.artist[0] = s_now.album[0] = '\0';
+            link_send_track_meta("", "", "");
+            break;
+        }
+        bt_av_report_state();
         break;
     }
 
-    case ESP_A2D_AUDIO_STATE_EVT:
+    case ESP_A2D_AUDIO_STATE_EVT: {
+        bool started = (p->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED);
         ESP_LOGI(TAG, "stream %s (dropped %" PRIu32 " bytes so far)",
-                 p->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED ? "started" : "suspended",
-                 audio_out_dropped_bytes());
+                 started ? "started" : "suspended", audio_out_dropped_bytes());
+        s_now.state = started ? SATLINK_BT_STREAMING : SATLINK_BT_CONNECTED;
+        bt_av_report_state();
         break;
+    }
 
     case ESP_A2D_AUDIO_CFG_EVT: {
         const esp_a2d_mcc_t *mcc = &p->audio_cfg.mcc;
         if (mcc->type != ESP_A2D_MCT_SBC) {
-            /* Cannot happen on stock Bluedroid, which registers an SBC endpoint and
-             * nothing else. Worth a shout if it ever does. */
+            /* Cannot happen on stock Bluedroid, which registers an SBC endpoint
+             * and nothing else. Worth a shout if it ever does. */
             ESP_LOGE(TAG, "unexpected codec type %d", mcc->type);
             break;
         }
         uint32_t rate = sbc_rate_hz(&mcc->cie.sbc_info);
         ESP_LOGI(TAG, "codec SBC, %" PRIu32 " Hz, bitpool %u..%u",
                  rate, mcc->cie.sbc_info.min_bitpool, mcc->cie.sbc_info.max_bitpool);
+
+        s_now.codec = SATLINK_CODEC_SBC;
         if (rate != 0) {
-            /* Before the first sample, which is what STREAM_FMT will promise the
-             * host once the link exists. */
             audio_out_set_rate(rate);
+            /* Before the first sample, which is the one hard promise this message
+             * makes to the host. */
+            link_send_stream_fmt(rate, 16, 2);
         }
+        bt_av_report_state();
         break;
     }
 
@@ -136,47 +269,147 @@ static void a2d_data_cb(const uint8_t *buf, uint32_t len)
     audio_out_write(buf, len);
 }
 
-/* AVRCP responses are only logged for now, which is cheap enough to do in place.
- * It also sidesteps the trap in meta_rsp: attr_text points at memory the stack
- * reclaims when this returns, so the struct must not be queued anywhere. */
+static void copy_attr(char *dst, size_t cap, const uint8_t *text, int len)
+{
+    if (len < 0) { len = 0; }
+    size_t n = ((size_t)len < cap - 1) ? (size_t)len : cap - 1;
+    memcpy(dst, text, n);
+    dst[n] = '\0';
+}
+
+/* AVRCP responses are handled in place. It is all cheap, and it sidesteps the
+ * trap in meta_rsp: attr_text points at memory the stack reclaims when this
+ * returns, so the struct must not be queued anywhere. */
 static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param)
 {
     switch (event) {
     case ESP_AVRC_CT_CONNECTION_STATE_EVT:
-        ESP_LOGI(TAG, "avrcp %s", param->conn_stat.connected ? "connected" : "disconnected");
-        if (param->conn_stat.connected) {
-            esp_avrc_ct_send_metadata_cmd(0, BT_META_ATTRS);
+        s_now.avrcp_up = param->conn_stat.connected;
+        ESP_LOGI(TAG, "avrcp %s", s_now.avrcp_up ? "connected" : "disconnected");
+        if (s_now.avrcp_up) {
+            esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS);
             /* Ask what the phone is willing to notify us about before subscribing
              * to anything: registering for an event the target does not support
              * gets rejected, and some phones stop answering after that. */
-            esp_avrc_ct_send_get_rn_capabilities_cmd(1);
+            esp_avrc_ct_send_get_rn_capabilities_cmd(TL_RN_CAPS);
+        } else {
+            s_now.has_play_pos = false;
+            s_now.play_state = SATLINK_PLAY_STOPPED;
         }
         break;
 
     case ESP_AVRC_CT_GET_RN_CAPABILITIES_RSP_EVT: {
         esp_avrc_rn_evt_cap_mask_t caps = param->get_rn_caps_rsp.evt_set;
-        bool track_change = esp_avrc_rn_evt_bit_mask_operation(
-            ESP_AVRC_BIT_MASK_OP_TEST, &caps, ESP_AVRC_RN_TRACK_CHANGE);
-        ESP_LOGI(TAG, "peer notifies 0x%04x, track change %s",
-                 caps.bits, track_change ? "yes" : "no");
-        if (track_change) {
-            esp_avrc_ct_send_register_notification_cmd(2, ESP_AVRC_RN_TRACK_CHANGE, 0);
+        bool track  = esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_TEST, &caps,
+                                                         ESP_AVRC_RN_TRACK_CHANGE);
+        bool status = esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_TEST, &caps,
+                                                         ESP_AVRC_RN_PLAY_STATUS_CHANGE);
+        bool volume = esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_TEST, &caps,
+                                                         ESP_AVRC_RN_VOLUME_CHANGE);
+        s_now.has_play_pos = esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_TEST, &caps,
+                                                                ESP_AVRC_RN_PLAY_POS_CHANGED);
+
+        ESP_LOGI(TAG, "peer notifies 0x%04x: track %s, status %s, position %s, volume %s",
+                 caps.bits, track ? "yes" : "no", status ? "yes" : "no",
+                 s_now.has_play_pos ? "yes" : "no", volume ? "yes" : "no");
+
+        if (track)  { esp_avrc_ct_send_register_notification_cmd(TL_TRACK_CHANGE,
+                                                                 ESP_AVRC_RN_TRACK_CHANGE, 0); }
+        if (status) { esp_avrc_ct_send_register_notification_cmd(TL_PLAY_STATE,
+                                                                 ESP_AVRC_RN_PLAY_STATUS_CHANGE, 0); }
+        if (volume) { esp_avrc_ct_send_register_notification_cmd(TL_VOLUME,
+                                                                 ESP_AVRC_RN_VOLUME_CHANGE, 0); }
+        if (s_now.has_play_pos) {
+            esp_avrc_ct_send_register_notification_cmd(TL_PLAY_POS,
+                                                       ESP_AVRC_RN_PLAY_POS_CHANGED, 1);
+        } else {
+            ESP_LOGI(TAG, "no PLAY_POS bit: falling back to polling GetPlayStatus");
         }
+        /* Either way, ask once now so the host is not left with nothing. */
+        esp_avrc_ct_send_get_play_status_cmd(TL_PLAY_STATUS);
         break;
     }
 
     case ESP_AVRC_CT_METADATA_RSP_EVT:
-        ESP_LOGI(TAG, "meta 0x%02x: %.*s", param->meta_rsp.attr_id,
-                 param->meta_rsp.attr_length, (const char *)param->meta_rsp.attr_text);
+        switch (param->meta_rsp.attr_id) {
+        case ESP_AVRC_MD_ATTR_TITLE:
+            copy_attr(s_now.title, sizeof(s_now.title),
+                      param->meta_rsp.attr_text, param->meta_rsp.attr_length);
+            break;
+        case ESP_AVRC_MD_ATTR_ARTIST:
+            copy_attr(s_now.artist, sizeof(s_now.artist),
+                      param->meta_rsp.attr_text, param->meta_rsp.attr_length);
+            break;
+        case ESP_AVRC_MD_ATTR_ALBUM:
+            copy_attr(s_now.album, sizeof(s_now.album),
+                      param->meta_rsp.attr_text, param->meta_rsp.attr_length);
+            break;
+        case ESP_AVRC_MD_ATTR_PLAYING_TIME: {
+            char buf[24];
+            copy_attr(buf, sizeof(buf), param->meta_rsp.attr_text, param->meta_rsp.attr_length);
+            /* strtoll, not atoi: this is the field that came back as -1000. */
+            s_now.total_ms = satlink_sanitize_total_ms(strtoll(buf, NULL, 10));
+            break;
+        }
+        default:
+            break;
+        }
+        meta_settle_restart();
+        break;
+
+    case ESP_AVRC_CT_PLAY_STATUS_RSP_EVT:
+        s_now.total_ms      = satlink_sanitize_total_ms((int64_t)param->play_status_rsp.song_length);
+        s_now.elapsed_ms    = param->play_status_rsp.song_position;
+        s_now.elapsed_at_us = esp_timer_get_time();
+        s_now.play_state    = play_state_from_avrc(param->play_status_rsp.play_status);
+        send_track_pos();
         break;
 
     case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
-        ESP_LOGI(TAG, "avrcp notify 0x%02x", param->change_ntf.event_id);
-        if (param->change_ntf.event_id == ESP_AVRC_RN_TRACK_CHANGE) {
-            esp_avrc_ct_send_metadata_cmd(0, BT_META_ATTRS);
-            /* AVRCP notifications fire once. Re-arm or this is the last one. */
-            esp_avrc_ct_send_register_notification_cmd(2, ESP_AVRC_RN_TRACK_CHANGE, 0);
+        switch (param->change_ntf.event_id) {
+        case ESP_AVRC_RN_TRACK_CHANGE:
+            /* Notifications fire once. Re-arm or this is the last one. */
+            esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS);
+            esp_avrc_ct_send_get_play_status_cmd(TL_PLAY_STATUS);
+            esp_avrc_ct_send_register_notification_cmd(TL_TRACK_CHANGE,
+                                                       ESP_AVRC_RN_TRACK_CHANGE, 0);
+            break;
+
+        case ESP_AVRC_RN_PLAY_STATUS_CHANGE:
+            s_now.play_state = play_state_from_avrc(param->change_ntf.event_parameter.playback);
+            s_now.elapsed_at_us = esp_timer_get_time();
+            send_track_pos();
+            esp_avrc_ct_send_register_notification_cmd(TL_PLAY_STATE,
+                                                       ESP_AVRC_RN_PLAY_STATUS_CHANGE, 0);
+            break;
+
+        case ESP_AVRC_RN_PLAY_POS_CHANGED:
+            s_now.elapsed_ms = param->change_ntf.event_parameter.play_pos;
+            s_now.elapsed_at_us = esp_timer_get_time();
+            send_track_pos();
+            esp_avrc_ct_send_register_notification_cmd(TL_PLAY_POS,
+                                                       ESP_AVRC_RN_PLAY_POS_CHANGED, 1);
+            break;
+
+        case ESP_AVRC_RN_VOLUME_CHANGE:
+            /* This is the hole the host pointed out: the phone moved the slider,
+             * and without VOLUME_STATE nobody downstream would ever know. */
+            s_now.volume = param->change_ntf.event_parameter.volume;
+            ESP_LOGI(TAG, "volume %u, set on the phone", s_now.volume);
+            link_send_volume_state(s_now.volume, 1);
+            esp_avrc_ct_send_register_notification_cmd(TL_VOLUME, ESP_AVRC_RN_VOLUME_CHANGE, 0);
+            break;
+
+        default:
+            ESP_LOGD(TAG, "avrcp notify 0x%02x", param->change_ntf.event_id);
+            break;
         }
+        break;
+
+    case ESP_AVRC_CT_SET_ABSOLUTE_VOLUME_RSP_EVT:
+        s_now.volume = param->set_volume_rsp.volume;
+        ESP_LOGI(TAG, "volume %u, set from the host", s_now.volume);
+        link_send_volume_state(s_now.volume, 0);
         break;
 
     case ESP_AVRC_CT_REMOTE_FEATURES_EVT:
@@ -196,14 +429,17 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     case ESP_BT_GAP_AUTH_CMPL_EVT:
         if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
             ESP_LOGI(TAG, "paired with %s", param->auth_cmpl.device_name);
+            strncpy(s_now.name, (const char *)param->auth_cmpl.device_name, sizeof(s_now.name) - 1);
+            s_now.name[sizeof(s_now.name) - 1] = '\0';
+            bt_av_report_state();
         } else {
             ESP_LOGE(TAG, "pairing failed, status %d", param->auth_cmpl.stat);
         }
         break;
 
     case ESP_BT_GAP_CFM_REQ_EVT:
-        /* Just works / numeric comparison. There are no buttons on this device yet,
-         * so the only sane answer is yes. */
+        /* Just works / numeric comparison. There are no buttons on this device
+         * yet, so the only sane answer is yes. */
         ESP_LOGI(TAG, "confirm request, value %" PRIu32, param->cfm_req.num_val);
         esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
         break;
@@ -218,13 +454,101 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     }
 }
 
+/* ------------------------------------------------------------ host commands */
+
+void bt_av_transport(uint8_t cmd)
+{
+    static const uint8_t key[] = {
+        [SATLINK_XPORT_PLAY]       = ESP_AVRC_PT_CMD_PLAY,
+        [SATLINK_XPORT_PAUSE]      = ESP_AVRC_PT_CMD_PAUSE,
+        [SATLINK_XPORT_STOP]       = ESP_AVRC_PT_CMD_STOP,
+        [SATLINK_XPORT_NEXT]       = ESP_AVRC_PT_CMD_FORWARD,
+        [SATLINK_XPORT_PREV]       = ESP_AVRC_PT_CMD_BACKWARD,
+        [SATLINK_XPORT_FFWD_START] = ESP_AVRC_PT_CMD_FAST_FORWARD,
+        [SATLINK_XPORT_FFWD_STOP]  = ESP_AVRC_PT_CMD_FAST_FORWARD,
+        [SATLINK_XPORT_REW_START]  = ESP_AVRC_PT_CMD_REWIND,
+        [SATLINK_XPORT_REW_STOP]   = ESP_AVRC_PT_CMD_REWIND,
+    };
+
+    if (cmd > SATLINK_XPORT_REW_STOP) {
+        ESP_LOGW(TAG, "host sent transport command %u, which does not exist", cmd);
+        return;
+    }
+    if (!s_now.avrcp_up) {
+        ESP_LOGW(TAG, "transport command %u with no phone connected", cmd);
+        return;
+    }
+
+    /* Seek is a held key: start presses, stop releases. Everything else is a
+     * press followed at once by a release, which is what a tap looks like on the
+     * wire. */
+    bool hold_start = (cmd == SATLINK_XPORT_FFWD_START || cmd == SATLINK_XPORT_REW_START);
+    bool hold_stop  = (cmd == SATLINK_XPORT_FFWD_STOP  || cmd == SATLINK_XPORT_REW_STOP);
+
+    if (hold_stop) {
+        esp_avrc_ct_send_passthrough_cmd(TL_PASSTHROUGH, key[cmd], ESP_AVRC_PT_CMD_STATE_RELEASED);
+        return;
+    }
+    esp_avrc_ct_send_passthrough_cmd(TL_PASSTHROUGH, key[cmd], ESP_AVRC_PT_CMD_STATE_PRESSED);
+    if (!hold_start) {
+        esp_avrc_ct_send_passthrough_cmd(TL_PASSTHROUGH, key[cmd], ESP_AVRC_PT_CMD_STATE_RELEASED);
+    }
+}
+
+void bt_av_set_volume(uint8_t volume)
+{
+    if (volume > 127) { volume = 127; }
+    if (!s_now.avrcp_up) {
+        ESP_LOGW(TAG, "volume %u with no phone connected", volume);
+        return;
+    }
+    esp_avrc_ct_send_set_absolute_volume_cmd(TL_VOLUME, volume);
+}
+
+void bt_av_set_radio(bool on, bool discoverable, bool disconnect)
+{
+    if (disconnect && s_now.state >= SATLINK_BT_CONNECTED) {
+        esp_a2d_sink_disconnect(s_now.addr);
+    }
+
+    if (!on) {
+        esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+        s_now.state = SATLINK_BT_OFF;
+        ESP_LOGI(TAG, "radio off at the host's request");
+    } else {
+        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE,
+                                 discoverable ? ESP_BT_GENERAL_DISCOVERABLE
+                                              : ESP_BT_NON_DISCOVERABLE);
+        s_now.state = discoverable ? SATLINK_BT_DISCOVERABLE : SATLINK_BT_IDLE;
+        ESP_LOGI(TAG, "radio on, %s", discoverable ? "discoverable" : "connectable only");
+    }
+    bt_av_report_state();
+}
+
+/* ------------------------------------------------------------------- startup */
+
 esp_err_t bt_av_start(const char *device_name)
 {
+    s_now.state = SATLINK_BT_OFF;
+    s_now.codec = SATLINK_CODEC_NONE;
+    s_now.play_state = SATLINK_PLAY_STOPPED;
+
     s_queue = xQueueCreate(BT_QUEUE_DEPTH, sizeof(bt_a2d_msg_t));
     ESP_RETURN_ON_FALSE(s_queue != NULL, ESP_ERR_NO_MEM, TAG, "no memory for the event queue");
     ESP_RETURN_ON_FALSE(
         xTaskCreate(bt_av_task, "bt_av", BT_TASK_STACK, NULL, BT_TASK_PRIO, NULL) == pdPASS,
         ESP_ERR_NO_MEM, TAG, "no memory for the bt task");
+
+    const esp_timer_create_args_t meta_args = {
+        .callback = send_track_meta, .name = "bt_meta", .dispatch_method = ESP_TIMER_TASK,
+    };
+    ESP_RETURN_ON_ERROR(esp_timer_create(&meta_args, &s_meta_timer), TAG, "meta timer");
+
+    const esp_timer_create_args_t pos_args = {
+        .callback = pos_tick, .name = "bt_pos", .dispatch_method = ESP_TIMER_TASK,
+    };
+    ESP_RETURN_ON_ERROR(esp_timer_create(&pos_args, &s_pos_timer), TAG, "pos timer");
+    ESP_RETURN_ON_ERROR(esp_timer_start_periodic(s_pos_timer, POS_PERIOD_US), TAG, "pos start");
 
     /* BLE is not used. Hand its controller memory back before the controller
      * starts, which is the only moment this is allowed. */
@@ -260,6 +584,8 @@ esp_err_t bt_av_start(const char *device_name)
 
     ESP_RETURN_ON_ERROR(esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE),
                         TAG, "set_scan_mode");
+    s_now.state = SATLINK_BT_DISCOVERABLE;
+    bt_av_report_state();
 
     ESP_LOGI(TAG, "\"%s\" is discoverable, A2DP sink + AVRCP controller, SBC", device_name);
     return ESP_OK;

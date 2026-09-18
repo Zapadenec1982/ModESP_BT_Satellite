@@ -3,10 +3,18 @@ idf_component_register(
         "main.c"
         "bt_av.c"
         "audio_out.c"
+        "link.c"
+        "expander.c"
     INCLUDE_DIRS "."
     REQUIRES
         bt
+        esp_app_format
+        esp_adc
+        esp_driver_gpio
         esp_driver_i2s
+        esp_driver_uart
         esp_ringbuf
+        esp_timer
         nvs_flash
+        satlink
 )

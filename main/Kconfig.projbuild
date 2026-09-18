@@ -1,0 +1,19 @@
+menu "Satellite"
+
+config SAT_LINK_LOOPBACK
+    bool "Loop the control link back on itself"
+    default n
+    help
+        Wires UART2's transmitter to its own receiver inside the chip, so every
+        frame the device sends arrives back at it. There is no host on the other
+        end and none is needed.
+
+        This exists because the link can be brought up and exercised long before
+        the other board is on the bench: framing, CRC, sequence numbers, the
+        drop policy and the PING/PONG exchange are all observable with nothing
+        attached to GPIO17 and GPIO16.
+
+        Never ship it enabled. The device would answer its own PING and report a
+        host that is not there.
+
+endmenu
