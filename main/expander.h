@@ -22,6 +22,11 @@
  * sends GPIO_MAP. Call after link_start(). */
 esp_err_t expander_start(void);
 
+/* The capability bits this module can honestly claim. EXPANDER always, because it
+ * means "understands these messages" rather than "has pins"; ADC only when some
+ * line really can read one, which with an empty table is never. */
+uint32_t expander_caps(void);
+
 /* Handlers the link calls when the host asks for something. */
 void expander_apply_cfg(const satlink_gpio_cfg_t *cfg);
 void expander_set_outputs(uint32_t values, uint32_t mask);

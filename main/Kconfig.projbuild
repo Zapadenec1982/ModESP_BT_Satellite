@@ -16,4 +16,30 @@ config SAT_LINK_LOOPBACK
         Never ship it enabled. The device would answer its own PING and report a
         host that is not there.
 
+config SAT_LINK_ONLY
+    bool "Build the link and nothing else"
+    default n
+    help
+        Brings up the UART link, HELLO, GPIO_MAP, PING/PONG and LOG, and leaves
+        out Bluetooth and I2S entirely.
+
+        It exists to make a first failure legible. With the radio in the picture
+        a silent link could be the wire, the baud rate, the framing, the CRC, the
+        Bluetooth stack or the phone; without it, the list is four items long and
+        all four are on this side of the cable.
+
+        The HELLO from this build declares no A2DP bits, because it has no A2DP
+        and the host takes that declaration at its word.
+
+config SAT_CLOCK_PROBE
+    bool "Measure the I2S bit clock and log it"
+    default n
+    help
+        Feeds the BCLK pin's own output back into the pulse counter and reports
+        the frequency every five seconds. No wire and no oscilloscope.
+
+        It exists because "does the clock keep running when nothing is playing"
+        is a question the host's receiver depends on, and one that deserves a
+        measurement rather than a reading of the driver source.
+
 endmenu

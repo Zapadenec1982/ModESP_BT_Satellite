@@ -26,7 +26,10 @@ typedef struct {
     void (*on_adc_read)(uint8_t index);
 } link_handlers_t;
 
-esp_err_t link_start(const link_handlers_t *handlers);
+/* `caps` is what this build can actually do, not what the protocol defines. The
+ * host believes it: declaring A2DP in a build without A2DP would have it waiting
+ * for a stream that is never coming. */
+esp_err_t link_start(const link_handlers_t *handlers, uint32_t caps);
 
 /* True once a HELLO with a matching major version has arrived. Until then the
  * host is assumed absent, which is a normal state and not a fault. */
@@ -57,10 +60,12 @@ typedef struct {
     uint32_t tx_frames;
     uint32_t tx_dropped_bulk;      /* TRACK_POS, LOG, COVER: the spec allows this */
     uint32_t tx_dropped_critical;  /* anything else: the spec does not, so it is a fault */
+    uint32_t rx_bytes;             /* raw, before framing: tells a dead wire from a noisy one */
     uint32_t rx_frames;
     uint32_t rx_bad;
     uint32_t rx_seq_gaps;
     uint32_t pings_unanswered;
+    uint32_t rtt_ms;               /* last round trip, from our PING to its PONG */
 } link_stats_t;
 
 void link_get_stats(link_stats_t *out);

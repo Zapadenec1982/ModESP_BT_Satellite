@@ -8,10 +8,9 @@
  * because its GPIO_MAP must follow the HELLO.
  */
 
-#include <string.h>
-
 #include "audio_out.h"
 #include "bt_av.h"
+#include "clock_probe.h"
 #include "expander.h"
 #include "link.h"
 
@@ -28,22 +27,46 @@ static const char *TAG = "sat";
 static void on_hello(const satlink_hello_t *hello)
 {
     (void)hello;
+#if !CONFIG_SAT_LINK_ONLY
     /* A host that turns up after the phone did should not have to wait for the
      * next change to learn what is going on. */
     bt_av_report_state();
+#endif
 }
 
-static void on_transport(uint8_t cmd)      { bt_av_transport(cmd); }
-static void on_volume(uint8_t volume)      { bt_av_set_volume(volume); }
-
+#if CONFIG_SAT_LINK_ONLY
+/* Nothing to forward these to. Answered rather than ignored, so the host can see
+ * that its commands arrive and are understood. */
+static void on_transport(uint8_t cmd)  { ESP_LOGI(TAG, "transport %u, no radio in this build", cmd); }
+static void on_volume(uint8_t volume)  { ESP_LOGI(TAG, "volume %u, no radio in this build", volume); }
+static void on_radio(bool on, bool discoverable, bool disconnect)
+{
+    ESP_LOGI(TAG, "radio %u/%u/%u, no radio in this build", on, discoverable, disconnect);
+}
+#else
+static void on_transport(uint8_t cmd)  { bt_av_transport(cmd); }
+static void on_volume(uint8_t volume)  { bt_av_set_volume(volume); }
 static void on_radio(bool on, bool discoverable, bool disconnect)
 {
     bt_av_set_radio(on, discoverable, disconnect);
 }
+#endif
 
 static void on_gpio_cfg(const satlink_gpio_cfg_t *cfg) { expander_apply_cfg(cfg); }
 static void on_gpio_out(uint32_t values, uint32_t mask) { expander_set_outputs(values, mask); }
 static void on_adc_read(uint8_t index)     { expander_read_adc(index); }
+
+/* What this build can actually do. The host believes the HELLO, so a bit claimed
+ * here has to be a bit honoured later. */
+static uint32_t own_caps(void)
+{
+    uint32_t caps = expander_caps();
+#if !CONFIG_SAT_LINK_ONLY
+    caps |= SATLINK_CAP_A2DP_SINK | SATLINK_CAP_AVRCP_META |
+            SATLINK_CAP_ABS_VOLUME | SATLINK_CAP_COVER_ART;
+#endif
+    return caps;
+}
 
 void app_main(void)
 {
@@ -55,7 +78,10 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
+#if !CONFIG_SAT_LINK_ONLY
     ESP_ERROR_CHECK(audio_out_init());
+    ESP_ERROR_CHECK(clock_probe_start());
+#endif
 
     const link_handlers_t handlers = {
         .on_hello     = on_hello,
@@ -66,10 +92,14 @@ void app_main(void)
         .on_gpio_out  = on_gpio_out,
         .on_adc_read  = on_adc_read,
     };
-    ESP_ERROR_CHECK(link_start(&handlers));
+    ESP_ERROR_CHECK(link_start(&handlers, own_caps()));
     ESP_ERROR_CHECK(expander_start());
 
+#if CONFIG_SAT_LINK_ONLY
+    ESP_LOGW(TAG, "link only: no Bluetooth, no I2S, nothing but the wire");
+#else
     ESP_ERROR_CHECK(bt_av_start(DEVICE_NAME));
+#endif
 
     ESP_LOGI(TAG, "up");
 }

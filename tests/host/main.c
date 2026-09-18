@@ -19,6 +19,7 @@ int main(void)
 {
     run("framing", frame_tests, frame_test_count);
     run("messages", message_tests, message_test_count);
+    run("golden vectors from the host", golden_tests, golden_test_count);
 
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

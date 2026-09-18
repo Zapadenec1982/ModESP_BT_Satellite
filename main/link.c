@@ -75,6 +75,7 @@ static uint8_t           s_tx_seq;
 static bool              s_host_present;
 static bool              s_peer_incompatible;
 static uint32_t          s_host_caps;
+static uint32_t          s_own_caps;
 static uint32_t          s_ping_outstanding;
 static esp_timer_handle_t s_ping_timer;
 
@@ -285,9 +286,7 @@ static void send_hello(void)
     satlink_hello_t m = {
         .major = SATLINK_PROTO_MAJOR,
         .minor = SATLINK_PROTO_MINOR,
-        .caps  = SATLINK_CAP_A2DP_SINK | SATLINK_CAP_AVRCP_META |
-                 SATLINK_CAP_ABS_VOLUME | SATLINK_CAP_COVER_ART |
-                 SATLINK_CAP_EXPANDER | SATLINK_CAP_ADC,
+        .caps  = s_own_caps,
         .build = satlink_str_clip(build, LINK_BUILD_MAX),
     };
     uint8_t payload[LINK_BUF_HELLO];
@@ -356,9 +355,14 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
         break;
     }
 
-    case SATLINK_MSG_PONG:
+    case SATLINK_MSG_PONG: {
+        satlink_pong_t pong = {0};
+        if (!satlink_dec_pong(payload, len, &pong)) { s_stats.rx_bad++; break; }
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        s_stats.rtt_ms = now_ms - pong.echo_ms;   /* wraps cleanly in unsigned */
         s_ping_outstanding = 0;
         break;
+    }
 
     case SATLINK_MSG_CMD_TRANSPORT: {
         satlink_cmd_transport_t m = {0};
@@ -422,6 +426,14 @@ static void link_rx_task(void *arg)
         if (n <= 0) {
             continue;
         }
+        if (s_stats.rx_bytes == 0) {
+            /* The first byte ever. Worth its own line: it is the difference
+             * between a wire that is not connected and a peer that is not
+             * understood. */
+            ESP_LOGI(TAG, "something is transmitting on GPIO%d", BOARD_LINK_RX_GPIO);
+        }
+        s_stats.rx_bytes += (uint32_t)n;
+
         satlink_rx_feed(&s_rx, chunk, (size_t)n, on_frame, NULL);
         s_stats.rx_seq_gaps = s_rx.seq_gaps;
         s_stats.rx_bad = s_rx.err_cobs + s_rx.err_crc + s_rx.err_runt + s_rx.err_too_long;
@@ -436,17 +448,25 @@ static void report_stats(void)
     if (++beat % 10 != 0) {
         return;
     }
-    bool quiet = !s_host_present && s_stats.rx_frames == 0 &&
+    /* Nothing has ever arrived on the wire: no host, which is a normal state and
+     * not worth a line every ten seconds. Note that this asks about bytes rather
+     * than frames — a peer at the wrong baud rate produces plenty of the first and
+     * none of the second, and that is exactly the case worth shouting about. */
+    bool quiet = s_stats.rx_bytes == 0 &&
                  s_stats.tx_dropped_bulk == 0 && s_stats.tx_dropped_critical == 0;
     if (quiet) {
-        return;     /* no host has ever spoken; nothing to report and no alarm */
+        return;
     }
 
-    ESP_LOGI(TAG, "tx %" PRIu32 " (dropped %" PRIu32 "/%" PRIu32 "), rx %" PRIu32
-                  " (bad %" PRIu32 ", gaps %" PRIu32 "), pings unanswered %" PRIu32,
+    ESP_LOGI(TAG, "tx %" PRIu32 " (dropped %" PRIu32 "/%" PRIu32 "), rx %" PRIu32 " bytes "
+                  "%" PRIu32 " frames (bad %" PRIu32 ", gaps %" PRIu32 "), "
+                  "pings unanswered %" PRIu32,
              s_stats.tx_frames, s_stats.tx_dropped_bulk, s_stats.tx_dropped_critical,
-             s_stats.rx_frames, s_stats.rx_bad, s_stats.rx_seq_gaps,
+             s_stats.rx_bytes, s_stats.rx_frames, s_stats.rx_bad, s_stats.rx_seq_gaps,
              s_stats.pings_unanswered);
+    if (s_host_present) {
+        ESP_LOGI(TAG, "round trip %" PRIu32 " ms", s_stats.rtt_ms);
+    }
 }
 
 static void ping_tick(void *arg)
@@ -520,8 +540,9 @@ void link_get_stats(link_stats_t *out)
     if (out != NULL) { *out = s_stats; }
 }
 
-esp_err_t link_start(const link_handlers_t *handlers)
+esp_err_t link_start(const link_handlers_t *handlers, uint32_t caps)
 {
+    s_own_caps = caps;
     if (handlers != NULL) {
         s_handlers = *handlers;
     }

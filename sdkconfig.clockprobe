@@ -1,0 +1,5 @@
+# Overlay for answering "what does BCLK do when nothing is playing".
+#
+#   idf.py -B build_probe -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.clockprobe" build
+#   idf.py -B build_probe -p COM13 flash monitor
+CONFIG_SAT_CLOCK_PROBE=y

@@ -21,7 +21,12 @@ bool satlink_frame_encode(uint8_t type, uint8_t seq,
     if (payload == NULL && payload_len != 0) {
         return false;
     }
-    if (out_cap < SATLINK_COBS_MAX(HDR_LEN + payload_len + CRC_LEN) + 1) {
+    /* Both delimiters, leading and trailing. The leading one is optional by the
+     * contract and the host emits it, so emitting it too makes our bytes identical
+     * to the reference implementation's — worth one byte a frame to never have to
+     * ask why two encoders disagree. Back-to-back frames then show an empty run
+     * between two zeros, which every receiver here ignores by construction. */
+    if (out_cap < SATLINK_COBS_MAX(HDR_LEN + payload_len + CRC_LEN) + 2) {
         return false;
     }
 
@@ -34,8 +39,10 @@ bool satlink_frame_encode(uint8_t type, uint8_t seq,
 
     /* Straight into the caller's buffer, piece by piece. Concatenating first
      * would mean a frame-sized scratch on whichever stack called us. */
+    out[0] = SATLINK_DELIMITER;
+
     satlink_cobs_enc_t e;
-    satlink_cobs_enc_begin(&e, out, out_cap - 1);   /* leave room for the delimiter */
+    satlink_cobs_enc_begin(&e, out + 1, out_cap - 2);   /* both delimiters reserved */
     satlink_cobs_enc_push(&e, hdr, HDR_LEN);
     satlink_cobs_enc_push(&e, payload, payload_len);
     satlink_cobs_enc_push(&e, crc_le, CRC_LEN);
@@ -45,8 +52,8 @@ bool satlink_frame_encode(uint8_t type, uint8_t seq,
         return false;
     }
 
-    out[encoded] = SATLINK_DELIMITER;
-    *out_len = encoded + 1;
+    out[1 + encoded] = SATLINK_DELIMITER;
+    *out_len = encoded + 2;
     return true;
 }
 

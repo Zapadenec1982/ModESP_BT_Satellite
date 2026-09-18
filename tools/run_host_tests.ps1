@@ -34,6 +34,7 @@ $sources = @(
     (Join-Path $repoRoot 'tests\host\main.c'),
     (Join-Path $repoRoot 'tests\host\test_satlink.c'),
     (Join-Path $repoRoot 'tests\host\test_messages.c'),
+    (Join-Path $repoRoot 'tests\host\test_golden.c'),
     (Join-Path $repoRoot 'components\satlink\cobs.c'),
     (Join-Path $repoRoot 'components\satlink\crc16.c'),
     (Join-Path $repoRoot 'components\satlink\frame.c'),

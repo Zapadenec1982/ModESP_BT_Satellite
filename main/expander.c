@@ -271,6 +271,18 @@ static void expander_task(void *arg)
     }
 }
 
+uint32_t expander_caps(void)
+{
+    uint32_t caps = SATLINK_CAP_EXPANDER;
+    for (uint8_t i = 0; i < EXP_PIN_COUNT; i++) {
+        if (s_pins[i].flags & SATLINK_PIN_CAN_ADC) {
+            caps |= SATLINK_CAP_ADC;
+            break;
+        }
+    }
+    return caps;
+}
+
 esp_err_t expander_start(void)
 {
     satlink_gpio_map_t map = { .count = (uint8_t)EXP_PIN_COUNT };

@@ -42,3 +42,6 @@ extern const size_t      frame_test_count;
 
 extern const test_case_t message_tests[];
 extern const size_t      message_test_count;
+
+extern const test_case_t golden_tests[];
+extern const size_t      golden_test_count;
