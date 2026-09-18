@@ -89,8 +89,11 @@ tests/host/           the link layer, tested without a board
 The receiver works: a phone pairs, SBC plays at 44.1 kHz, and the samples leave on the I2S
 pins. Track title, artist, album and length arrive over AVRCP and refresh on every skip.
 
-The link is implemented in full against `docs/PROTOCOL.md` 1.0 and tested on the host, but it
-has not yet spoken to a real host — there is no second board on the bench.
+The link is implemented in full against `docs/PROTOCOL.md` 1.0 — all nineteen messages, both
+directions — and verified on the board with the UART looped back on itself: 95 frames out, 95
+in, no CRC errors, no sequence gaps, every PING answered. It has not yet spoken to a real
+host, because there is no second board on the bench.
 
 Still open: AAC and aptX, which wait on the stack patches; the expander's pin table, which
-waits on something to connect to it; and cover art.
+waits on something to connect to it; and cover art, which is written but has never met a real
+phone.
