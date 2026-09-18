@@ -1,44 +1,96 @@
 # modesp-bt-satellite
 
-Bluetooth A2DP sink and I/O expander for [`modesp-player`](../modesp-player), on an original
-ESP32. A separate project that sits next to the player rather than inside it.
+A Bluetooth A2DP receiver on an original ESP32. It takes audio from a phone and hands it to a
+host over I2S, tells the host what is playing over a UART, and lends the host a few of its own
+GPIO on the side.
 
-## Why it exists
+The host is somebody else's microcontroller. What it is does not change a single requirement
+here, so this project does not know and does not care.
 
-The player runs on an ESP32-P4 and cannot receive Bluetooth audio at all: A2DP needs
-Bluetooth Classic, which exists only in the original ESP32, and the ESP32-C6 that carries the
-player's Wi-Fi has BLE only.
+## Documents
 
-It also closes a second gap. The player's pin budget is exhausted, so the amplifier's fault
-lines and the extra buttons were headed for a separate I2C expander chip. A satellite with
-spare GPIO makes that chip unnecessary, and gives an ADC, timers and edge counting that a
-PCF8574 cannot.
+Two, and they are self-contained.
 
-## What it does
+| | |
+|---|---|
+| [`docs/DEVICE_SPEC.md`](docs/DEVICE_SPEC.md) | the device: hardware, pins, codecs, I2S, behaviour |
+| [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | the link, byte by byte, version 1.0 |
+| [`docs/BASE.md`](docs/BASE.md) | why the Bluetooth stack is patched and how those patches are carried |
 
-- Receives A2DP and emits I2S to the player. SBC, AAC, aptX and aptX HD.
-- Reports what is playing over a UART link: title, artist, album, position, and the cover art
-  the phone sends over AVRCP.
-- Accepts transport and volume commands back.
-- Owns a handful of GPIO on the player's behalf, with debounce and edge detection done
-  locally so the link stays quiet.
+A gap in the specification is a question for the customer, not an invitation to go looking in
+the folder next door.
 
-## The link
+## Hardware
 
-UART at 460800, COBS framed with a CRC-16. The full protocol, and the reasoning behind
-choosing it over I2C, is in the player's `docs/SATELLITE_BRIEF.md` section 5. That document is
-canonical for the protocol and both sides reference it.
+ESP32-WROOM-32 on a DevKitC. Not an S3, C3 or C6: only the original ESP32 has Bluetooth
+Classic, and without it there is no A2DP. Wi-Fi is never brought up; this device does not go
+on a network.
 
-The player side is written against the protocol, not against this firmware. Replacing the
-satellite with a bought Bluetooth module later means changing this firmware or writing a
-translator, and not touching the player.
+| Signal | GPIO |
+|---|---|
+| I2S BCLK, WS, DOUT | 25, 26, 27 |
+| UART to the host | TX 17, RX 16 |
 
-## Boundary
+The I2S three sit next to each other in the left header row and the UART two in the right, so
+each comes off on one ribbon. 17 and 16 are also the IOMUX pins of UART2, which keeps 460800
+baud off the GPIO matrix.
 
-This project never writes to the player's tree and never flashes the player's panel. See
-`CLAUDE.md`.
+Flashing and logs are on **COM13**.
+
+## Building
+
+```powershell
+. C:\Espressif\tools\Microsoft.v5.5.5.PowerShell_profile.ps1
+$env:IDF_COMPONENT_CACHE_PATH = "D:\P4_DSP\.idf_cache"
+idf.py set-target esp32
+idf.py build
+idf.py -p COM13 flash monitor
+```
+
+Stock Bluedroid does A2DP sink in SBC and refuses to register an endpoint for anything else,
+so AAC and aptX need changes inside the stack. Rather than vendoring a whole IDF tree, this
+repository pins one in `idf.pin` and keeps the delta in `patches/`. `tools/setup.ps1` builds a
+local `components/bt` from the two. The shared IDF on disk is read and never written — it
+belongs to more than this project.
+
+## Testing
+
+```powershell
+.\tools\run_host_tests.ps1
+```
+
+`components/satlink` has no ESP-IDF dependencies on purpose, so the framing, the CRC, the
+reassembler and all nineteen message layouts build and run with a host compiler. A framing bug
+is far cheaper to find in a terminal than over a UART.
+
+The link can also be exercised on the board with no host attached, by looping the UART back on
+itself inside the chip:
+
+```powershell
+idf.py -B build_loopback -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.loopback" build
+idf.py -B build_loopback -p COM13 flash monitor
+```
+
+## Layout
+
+```
+components/satlink/   the protocol: COBS, CRC-16, framing, every message. No IDF, host-testable
+main/link.c           the UART transport, the two send queues and the drop policy
+main/bt_av.c          A2DP sink and AVRCP controller, and what the host is told about them
+main/audio_out.c      I2S master out, ring buffer, clock that follows the stream
+main/expander.c       the GPIO this board lends out. The table is empty and that is a valid state
+main/board.h          every pin number in the project, and nowhere else
+patches/              the Bluetooth stack delta, one diff per logical change
+tests/host/           the link layer, tested without a board
+```
 
 ## Status
 
-Stage 0. Three gates are open and they all live on the player's bench, so they belong to the
-customer to schedule. No satellite code yet.
+The receiver works: a phone pairs, SBC plays at 44.1 kHz, and the samples leave on the I2S
+pins. Track title, artist, album and length arrive over AVRCP and refresh on every skip.
+
+The link is implemented in full against `docs/PROTOCOL.md` 1.0 and tested on the host, but it
+has not yet spoken to a real host — there is no second board on the bench.
+
+Still open: AAC and aptX, which wait on the stack patches; the expander's pin table, which
+waits on something to connect to it; and cover art.

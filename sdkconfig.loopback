@@ -1,0 +1,9 @@
+# Overlay for the self-test build: the link talks to itself.
+#
+#   idf.py -B build_loopback -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.loopback" build
+#   idf.py -B build_loopback -p COM13 flash monitor
+#
+# Every frame the device sends comes back in on its own receiver, so framing,
+# CRC, sequence numbers, the drop policy and the PING/PONG exchange can all be
+# watched with nothing wired to GPIO17 and GPIO16. Never ship this.
+CONFIG_SAT_LINK_LOOPBACK=y

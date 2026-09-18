@@ -1,36 +1,66 @@
 #include "satlink/cobs.h"
 
+void satlink_cobs_enc_begin(satlink_cobs_enc_t *e, uint8_t *out, size_t cap)
+{
+    e->out      = out;
+    e->cap      = cap;
+    e->len      = 1;     /* out[0] is reserved for the first run length */
+    e->code_pos = 0;
+    e->code     = 1;
+    e->ok       = (out != NULL && cap >= 1);
+}
+
+void satlink_cobs_enc_push(satlink_cobs_enc_t *e, const uint8_t *data, size_t len)
+{
+    if (len == 0) {
+        return;
+    }
+    if (!e->ok || data == NULL) {
+        e->ok = false;
+        return;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] != 0) {
+            if (e->len >= e->cap) { e->ok = false; return; }
+            e->out[e->len++] = data[i];
+            e->code++;
+            if (e->code != 0xFF) {
+                continue;
+            }
+            /* A full run of 254 non-zero bytes: close it and start another. */
+        }
+        e->out[e->code_pos] = e->code;
+        if (e->len >= e->cap) { e->ok = false; return; }
+        e->code_pos = e->len++;
+        e->code = 1;
+    }
+}
+
+bool satlink_cobs_enc_finish(satlink_cobs_enc_t *e, size_t *out_len)
+{
+    if (!e->ok || out_len == NULL) {
+        return false;
+    }
+    e->out[e->code_pos] = e->code;
+    *out_len = e->len;
+    return true;
+}
+
 bool satlink_cobs_encode(const uint8_t *in, size_t in_len,
                          uint8_t *out, size_t out_cap, size_t *out_len)
 {
-    if (out == NULL || out_len == NULL || (in == NULL && in_len != 0)) {
+    if (out_len == NULL || (in == NULL && in_len != 0)) {
         return false;
     }
     if (out_cap < SATLINK_COBS_MAX(in_len)) {
         return false;
     }
 
-    size_t code_pos = 0;    /* where the current run length goes */
-    size_t pos      = 1;    /* first free byte after it */
-    uint8_t code    = 1;    /* run length so far, including the code byte itself */
-
-    for (size_t i = 0; i < in_len; i++) {
-        if (in[i] != 0) {
-            out[pos++] = in[i];
-            code++;
-            if (code != 0xFF) {
-                continue;
-            }
-            /* A full run of 254 non-zero bytes: close it and start another. */
-        }
-        out[code_pos] = code;
-        code_pos = pos++;
-        code = 1;
-    }
-
-    out[code_pos] = code;
-    *out_len = pos;
-    return true;
+    satlink_cobs_enc_t e;
+    satlink_cobs_enc_begin(&e, out, out_cap);
+    satlink_cobs_enc_push(&e, in, in_len);
+    return satlink_cobs_enc_finish(&e, out_len);
 }
 
 bool satlink_cobs_decode(const uint8_t *in, size_t in_len,

@@ -21,48 +21,52 @@ bool satlink_frame_encode(uint8_t type, uint8_t seq,
     if (payload == NULL && payload_len != 0) {
         return false;
     }
-
-    uint8_t plain[SATLINK_FRAME_MAX];
-    plain[0] = type;
-    plain[1] = seq;
-    if (payload_len != 0) {
-        memcpy(plain + HDR_LEN, payload, payload_len);
+    if (out_cap < SATLINK_COBS_MAX(HDR_LEN + payload_len + CRC_LEN) + 1) {
+        return false;
     }
+
+    const uint8_t hdr[HDR_LEN] = { type, seq };
 
     /* The CRC covers type | seq | payload, before encoding. */
-    uint16_t crc = satlink_crc16(plain, HDR_LEN + payload_len);
-    plain[HDR_LEN + payload_len]     = (uint8_t)(crc & 0xFF);         /* little-endian */
-    plain[HDR_LEN + payload_len + 1] = (uint8_t)(crc >> 8);
+    uint16_t crc = satlink_crc16_update(SATLINK_CRC16_INIT, hdr, HDR_LEN);
+    crc = satlink_crc16_update(crc, payload, payload_len);
+    const uint8_t crc_le[CRC_LEN] = { (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8) };
 
-    size_t plain_len = HDR_LEN + payload_len + CRC_LEN;
+    /* Straight into the caller's buffer, piece by piece. Concatenating first
+     * would mean a frame-sized scratch on whichever stack called us. */
+    satlink_cobs_enc_t e;
+    satlink_cobs_enc_begin(&e, out, out_cap - 1);   /* leave room for the delimiter */
+    satlink_cobs_enc_push(&e, hdr, HDR_LEN);
+    satlink_cobs_enc_push(&e, payload, payload_len);
+    satlink_cobs_enc_push(&e, crc_le, CRC_LEN);
 
     size_t encoded = 0;
-    if (!satlink_cobs_encode(plain, plain_len, out, out_cap, &encoded)) {
+    if (!satlink_cobs_enc_finish(&e, &encoded)) {
         return false;
     }
-    if (encoded + 1 > out_cap) {
-        return false;
-    }
+
     out[encoded] = SATLINK_DELIMITER;
     *out_len = encoded + 1;
     return true;
 }
 
 satlink_frame_result_t satlink_frame_decode(const uint8_t *cobs, size_t cobs_len,
+                                            uint8_t *scratch, size_t scratch_cap,
                                             uint8_t *type, uint8_t *seq,
-                                            uint8_t *payload, size_t payload_cap,
-                                            size_t *payload_len)
+                                            const uint8_t **payload, size_t *payload_len)
 {
     if (cobs_len == 0) {
         return SATLINK_FRAME_EMPTY;
+    }
+    if (scratch == NULL || scratch_cap < SATLINK_FRAME_MAX) {
+        return SATLINK_FRAME_TOO_LONG;
     }
     if (cobs_len > SATLINK_COBS_MAX(SATLINK_FRAME_MAX)) {
         return SATLINK_FRAME_TOO_LONG;
     }
 
-    uint8_t plain[SATLINK_FRAME_MAX];
     size_t plain_len = 0;
-    if (!satlink_cobs_decode(cobs, cobs_len, plain, sizeof(plain), &plain_len)) {
+    if (!satlink_cobs_decode(cobs, cobs_len, scratch, scratch_cap, &plain_len)) {
         return SATLINK_FRAME_BAD_COBS;
     }
     if (plain_len < HDR_LEN + CRC_LEN) {
@@ -70,22 +74,16 @@ satlink_frame_result_t satlink_frame_decode(const uint8_t *cobs, size_t cobs_len
     }
 
     size_t body_len = plain_len - CRC_LEN;
-    uint16_t want = (uint16_t)plain[body_len] | (uint16_t)((uint16_t)plain[body_len + 1] << 8);
-    if (satlink_crc16(plain, body_len) != want) {
+    uint16_t want = (uint16_t)scratch[body_len] |
+                    (uint16_t)((uint16_t)scratch[body_len + 1] << 8);
+    if (satlink_crc16(scratch, body_len) != want) {
         return SATLINK_FRAME_BAD_CRC;
     }
 
-    size_t len = body_len - HDR_LEN;
-    if (len > payload_cap) {
-        return SATLINK_FRAME_TOO_LONG;
-    }
-
-    if (type != NULL) { *type = plain[0]; }
-    if (seq  != NULL) { *seq  = plain[1]; }
-    if (len != 0 && payload != NULL) {
-        memcpy(payload, plain + HDR_LEN, len);
-    }
-    if (payload_len != NULL) { *payload_len = len; }
+    if (type != NULL) { *type = scratch[0]; }
+    if (seq  != NULL) { *seq  = scratch[1]; }
+    if (payload != NULL) { *payload = scratch + HDR_LEN; }
+    if (payload_len != NULL) { *payload_len = body_len - HDR_LEN; }
     return SATLINK_FRAME_OK;
 }
 
@@ -99,11 +97,13 @@ void satlink_rx_init(satlink_rx_t *rx)
 static void rx_deliver(satlink_rx_t *rx, satlink_rx_frame_cb cb, void *ctx)
 {
     uint8_t type = 0, seq = 0;
-    uint8_t payload[SATLINK_PAYLOAD_MAX];
+    const uint8_t *payload = NULL;
     size_t payload_len = 0;
 
-    switch (satlink_frame_decode(rx->buf, rx->len, &type, &seq,
-                                 payload, sizeof(payload), &payload_len)) {
+    /* The scratch lives in the receiver rather than on this stack: it is a frame
+     * wide, and this runs in whichever task reads the UART. */
+    switch (satlink_frame_decode(rx->buf, rx->len, rx->plain, sizeof(rx->plain),
+                                 &type, &seq, &payload, &payload_len)) {
     case SATLINK_FRAME_OK:
         rx->frames_ok++;
         if (rx->have_seq) {

@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "satlink/cobs.h"
 #include "satlink/frame.h"
 
 static const char *TAG = "sat.link";
@@ -34,8 +35,33 @@ static const char *TAG = "sat.link";
 
 #define LINK_PING_PERIOD_US  1000000
 
+/*
+ * How much stack a sender is allowed to take.
+ *
+ * These were SATLINK_PAYLOAD_MAX, all 1036 bytes of it, and that overflowed the
+ * main task on the first boot: the log bridge runs in whoever happens to be
+ * logging, and app_main calling into a sender that allocates a kilobyte is the
+ * end of a 3584-byte stack. A message gets room for what it can actually carry
+ * and no more. Only COVER needs the full payload, and it has a static buffer.
+ */
+#define LINK_NAME_MAX      64        /* a Bluetooth device name */
+#define LINK_META_MAX     128        /* one of title, artist, album */
+#define LINK_LOG_MAX      224        /* one log line */
+#define LINK_BUILD_MAX     80        /* "sat <version> <idf>" */
+
+#define LINK_BUF_BT_STATE  (1 + 1 + 6 + 2 + LINK_NAME_MAX)
+#define LINK_BUF_META      (3 * (2 + LINK_META_MAX))
+#define LINK_BUF_LOG       (1 + 2 + LINK_LOG_MAX)
+#define LINK_BUF_HELLO     (1 + 1 + 4 + 2 + LINK_BUILD_MAX)
+
+/* The payload, not the frame. Sequence numbers are stamped at the moment of
+ * transmission rather than of queueing, because there are two queues and the
+ * sender drains one before the other: numbering at queue time puts frames on the
+ * wire out of order, and the receiver's gap counter then reports losses that
+ * never happened. Found exactly that way, in loopback, counting 256 phantom gaps
+ * every ten seconds. */
 typedef struct {
-    uint8_t *data;
+    uint8_t *payload;
     uint16_t len;
     uint8_t  type;
 } tx_item_t;
@@ -69,8 +95,8 @@ static bool type_is_droppable(uint8_t type)
 
 static void tx_item_free(tx_item_t *item)
 {
-    free(item->data);
-    item->data = NULL;
+    free(item->payload);
+    item->payload = NULL;
 }
 
 static void tx_push(uint8_t type, const uint8_t *payload, size_t payload_len)
@@ -85,19 +111,22 @@ static void tx_push(uint8_t type, const uint8_t *payload, size_t payload_len)
         return;
     }
 
-    uint8_t wire[SATLINK_WIRE_MAX];
-    size_t wire_len = 0;
-    if (!satlink_frame_encode(type, s_tx_seq, payload, payload_len,
-                              wire, sizeof(wire), &wire_len)) {
+    if (payload_len > SATLINK_PAYLOAD_MAX) {
         return;     /* the encoders already refuse oversize; nothing to say here */
     }
-    s_tx_seq++;
 
-    tx_item_t item = { .data = malloc(wire_len), .len = (uint16_t)wire_len, .type = type };
-    if (item.data == NULL) {
+    /* A copy of the payload and nothing more. Framing happens in the sender, so
+     * nothing frame-sized ever lands on the caller's stack — and the caller can
+     * be any task at all, since the log bridge runs in whoever happened to log. */
+    uint8_t *buf = malloc(payload_len != 0 ? payload_len : 1);
+    if (buf == NULL) {
         return;
     }
-    memcpy(item.data, wire, wire_len);
+    if (payload_len != 0) {
+        memcpy(buf, payload, payload_len);
+    }
+
+    tx_item_t item = { .payload = buf, .len = (uint16_t)payload_len, .type = type };
 
     bool bulk = type_is_droppable(type);
     QueueHandle_t q = bulk ? s_q_bulk : s_q_critical;
@@ -136,10 +165,19 @@ static void link_tx_task(void *arg)
             }
         }
 
-        /* The UART driver's own buffer absorbs this; a full one means the host is
-         * not draining, and waiting forever there would violate rule one. */
-        uart_write_bytes(BOARD_LINK_UART_NUM, item.data, item.len);
-        s_stats.tx_frames++;
+        /* Framed here, in transmission order, and into a buffer only this task
+         * touches. */
+        static uint8_t wire[SATLINK_WIRE_MAX];
+        size_t wire_len = 0;
+        if (satlink_frame_encode(item.type, s_tx_seq, item.payload, item.len,
+                                 wire, sizeof(wire), &wire_len)) {
+            s_tx_seq++;
+            /* There is no flow control on this link, so the transmitter always
+             * drains and this wait is bounded by the baud rate. The queues in
+             * front are what keep callers from ever waiting at all. */
+            uart_write_bytes(BOARD_LINK_UART_NUM, wire, wire_len);
+            s_stats.tx_frames++;
+        }
         tx_item_free(&item);
     }
 }
@@ -148,10 +186,11 @@ static void link_tx_task(void *arg)
 
 void link_send_bt_state(uint8_t state, uint8_t codec, const uint8_t addr[6], const char *name)
 {
-    satlink_bt_state_t_msg m = { .state = state, .codec = codec, .name = satlink_str(name) };
+    satlink_bt_state_t_msg m = { .state = state, .codec = codec,
+                                 .name = satlink_str_clip(name, LINK_NAME_MAX) };
     if (addr != NULL) { memcpy(m.addr, addr, sizeof(m.addr)); }
 
-    uint8_t payload[SATLINK_PAYLOAD_MAX];
+    uint8_t payload[LINK_BUF_BT_STATE];
     size_t len = satlink_enc_bt_state(payload, sizeof(payload), &m);
     if (len != 0) { tx_push(SATLINK_MSG_BT_STATE, payload, len); }
 }
@@ -159,11 +198,11 @@ void link_send_bt_state(uint8_t state, uint8_t codec, const uint8_t addr[6], con
 void link_send_track_meta(const char *title, const char *artist, const char *album)
 {
     satlink_track_meta_t m = {
-        .title  = satlink_str(title),
-        .artist = satlink_str(artist),
-        .album  = satlink_str(album),
+        .title  = satlink_str_clip(title, LINK_META_MAX),
+        .artist = satlink_str_clip(artist, LINK_META_MAX),
+        .album  = satlink_str_clip(album, LINK_META_MAX),
     };
-    uint8_t payload[SATLINK_PAYLOAD_MAX];
+    uint8_t payload[LINK_BUF_META];
     size_t len = satlink_enc_track_meta(payload, sizeof(payload), &m);
     if (len != 0) { tx_push(SATLINK_MSG_TRACK_META, payload, len); }
 }
@@ -227,8 +266,8 @@ void link_send_cover(uint16_t chunk, uint16_t total, uint8_t mime,
 
 void link_send_log(uint8_t level, const char *text)
 {
-    satlink_log_t m = { .level = level, .text = satlink_str(text) };
-    uint8_t payload[SATLINK_PAYLOAD_MAX];
+    satlink_log_t m = { .level = level, .text = satlink_str_clip(text, LINK_LOG_MAX) };
+    uint8_t payload[LINK_BUF_LOG];
     size_t len = satlink_enc_log(payload, sizeof(payload), &m);
     if (len != 0) { tx_push(SATLINK_MSG_LOG, payload, len); }
 }
@@ -249,9 +288,9 @@ static void send_hello(void)
         .caps  = SATLINK_CAP_A2DP_SINK | SATLINK_CAP_AVRCP_META |
                  SATLINK_CAP_ABS_VOLUME | SATLINK_CAP_COVER_ART |
                  SATLINK_CAP_EXPANDER | SATLINK_CAP_ADC,
-        .build = satlink_str(build),
+        .build = satlink_str_clip(build, LINK_BUILD_MAX),
     };
-    uint8_t payload[SATLINK_PAYLOAD_MAX];
+    uint8_t payload[LINK_BUF_HELLO];
     size_t len = satlink_enc_hello(payload, sizeof(payload), &m);
     if (len != 0) { tx_push(SATLINK_MSG_HELLO, payload, len); }
 }
@@ -389,6 +428,27 @@ static void link_rx_task(void *arg)
     }
 }
 
+/* Every tenth beat, and only once there is something worth saying. A link that
+ * is working says one line every ten seconds; a link that is not says why. */
+static void report_stats(void)
+{
+    static uint32_t beat;
+    if (++beat % 10 != 0) {
+        return;
+    }
+    bool quiet = !s_host_present && s_stats.rx_frames == 0 &&
+                 s_stats.tx_dropped_bulk == 0 && s_stats.tx_dropped_critical == 0;
+    if (quiet) {
+        return;     /* no host has ever spoken; nothing to report and no alarm */
+    }
+
+    ESP_LOGI(TAG, "tx %" PRIu32 " (dropped %" PRIu32 "/%" PRIu32 "), rx %" PRIu32
+                  " (bad %" PRIu32 ", gaps %" PRIu32 "), pings unanswered %" PRIu32,
+             s_stats.tx_frames, s_stats.tx_dropped_bulk, s_stats.tx_dropped_critical,
+             s_stats.rx_frames, s_stats.rx_bad, s_stats.rx_seq_gaps,
+             s_stats.pings_unanswered);
+}
+
 static void ping_tick(void *arg)
 {
     (void)arg;
@@ -398,6 +458,8 @@ static void ping_tick(void *arg)
         /* Not an error. A host that is not answering is a host that is busy or
          * absent, and this device is expected to keep playing either way. */
     }
+
+    report_stats();
 
     satlink_ping_t m = { .tick_ms = (uint32_t)(esp_timer_get_time() / 1000) };
     uint8_t payload[8];

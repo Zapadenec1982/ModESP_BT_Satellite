@@ -29,11 +29,16 @@ bool satlink_frame_encode(uint8_t type, uint8_t seq,
                           const uint8_t *payload, size_t payload_len,
                           uint8_t *out, size_t out_cap, size_t *out_len);
 
-/* Decodes the bytes between two delimiters. */
+/* Decodes the bytes between two delimiters.
+ *
+ * `scratch` must be at least SATLINK_FRAME_MAX and is where the decoded frame
+ * lands; `*payload` points into it, so it is valid exactly as long as the scratch
+ * is untouched. The buffer is the caller's because a frame is a kilobyte, and a
+ * kilobyte on an embedded stack is how this firmware crashed once already. */
 satlink_frame_result_t satlink_frame_decode(const uint8_t *cobs, size_t cobs_len,
+                                            uint8_t *scratch, size_t scratch_cap,
                                             uint8_t *type, uint8_t *seq,
-                                            uint8_t *payload, size_t payload_cap,
-                                            size_t *payload_len);
+                                            const uint8_t **payload, size_t *payload_len);
 
 /*
  * Byte-stream reassembly.
@@ -48,7 +53,8 @@ typedef void (*satlink_rx_frame_cb)(void *ctx, uint8_t type, uint8_t seq,
                                     const uint8_t *payload, size_t payload_len);
 
 typedef struct {
-    uint8_t  buf[SATLINK_WIRE_MAX];
+    uint8_t  buf[SATLINK_WIRE_MAX];      /* bytes as they arrive, still encoded */
+    uint8_t  plain[SATLINK_FRAME_MAX];   /* where a frame is decoded, off the stack */
     size_t   len;
     bool     overrun;          /* current frame too long: discard to the next delimiter */
 

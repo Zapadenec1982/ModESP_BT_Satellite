@@ -14,6 +14,23 @@ satlink_str_t satlink_str(const char *s)
     return out;
 }
 
+satlink_str_t satlink_str_clip(const char *s, uint16_t max_bytes)
+{
+    satlink_str_t out = satlink_str(s);
+    if (out.len <= max_bytes) {
+        return out;
+    }
+
+    /* Back up off a continuation byte, so the last character is either whole or
+     * gone. A continuation byte is 10xxxxxx; anything else starts a character. */
+    uint16_t n = max_bytes;
+    while (n > 0 && ((uint8_t)s[n] & 0xC0u) == 0x80u) {
+        n--;
+    }
+    out.len = n;
+    return out;
+}
+
 /* Every encoder ends the same way: the sticky flag decides, and a failed write
  * yields 0 rather than a half-built payload. */
 static size_t wr_finish(const satlink_wr_t *w)

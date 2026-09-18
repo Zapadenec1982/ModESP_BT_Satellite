@@ -28,6 +28,12 @@ typedef struct {
  * "unknown" rather than as an error. */
 satlink_str_t satlink_str(const char *s);
 
+/* Same, but never longer than max_bytes, and never cut through the middle of a
+ * UTF-8 sequence. The protocol says the strings are UTF-8, and half a character
+ * is not: a host that decodes strictly would reject the whole field over one
+ * stray byte. */
+satlink_str_t satlink_str_clip(const char *s, uint16_t max_bytes);
+
 /* ------------------------------------------------------------------ 0x01 HELLO */
 
 typedef struct {

@@ -440,6 +440,30 @@ static void test_encoders_refuse_small_buffers(void)
     CHECK_EQ(satlink_enc_log(tiny, sizeof(tiny), &log), 0);
 }
 
+static void test_utf8_clip(void)
+{
+    /* Cutting a UTF-8 string at a byte boundary is how invalid UTF-8 gets onto a
+     * wire that promises UTF-8. The real track title from the bench is the test
+     * case: "Salomé" is seven bytes for six characters. */
+    const char *s = "Salomé Das";               /* ten characters, eleven bytes */
+
+    CHECK_EQ(satlink_str_clip(s, 100).len, 11);   /* under the limit: untouched */
+    CHECK_EQ(satlink_str_clip(s, 11).len, 11);    /* exactly the limit */
+    CHECK_EQ(satlink_str_clip(s, 10).len, 10);    /* cuts between two plain bytes */
+    CHECK_EQ(satlink_str_clip(s, 7).len, 7);      /* right after the é */
+    CHECK_EQ(satlink_str_clip(s, 6).len, 5);      /* mid-é: back off the whole character */
+    CHECK_EQ(satlink_str_clip(s, 5).len, 5);
+    CHECK_EQ(satlink_str_clip(s, 0).len, 0);
+    CHECK_EQ(satlink_str_clip(NULL, 10).len, 0);
+
+    /* A three-byte character, cut at each of its bytes. */
+    const char *cyr = "aбв";                       /* 1 + 2 + 2 bytes */
+    CHECK_EQ(satlink_str_clip(cyr, 2).len, 1);
+    CHECK_EQ(satlink_str_clip(cyr, 3).len, 3);
+    CHECK_EQ(satlink_str_clip(cyr, 4).len, 3);
+    CHECK_EQ(satlink_str_clip(cyr, 5).len, 5);
+}
+
 static void test_every_message_through_a_frame(void)
 {
     /* The largest payload any message can produce still has to fit a frame, and
@@ -479,6 +503,7 @@ const test_case_t message_tests[] = {
     { "log",                   test_msg_log },
     { "encoders refuse small", test_encoders_refuse_small_buffers },
     { "worst case in a frame", test_every_message_through_a_frame },
+    { "utf-8 clipping",        test_utf8_clip },
 };
 
 const size_t message_test_count = sizeof(message_tests) / sizeof(message_tests[0]);
