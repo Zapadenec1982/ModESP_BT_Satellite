@@ -11,6 +11,11 @@
     The shared IDF at $env:IDF_PATH is never written to. It is read, copied out of,
     and left exactly as it was found.
 
+.NOTES
+    Deliberately pure ASCII. Windows PowerShell 5.1 reads a .ps1 without a byte
+    order mark in the system codepage, not UTF-8, so a stray em dash in a string
+    is enough to make the whole file fail to parse. It did, for a while.
+
 .PARAMETER Clean
     Discard an existing components/bt and copy it again. Without this the script
     refuses to touch a copy that is already there, because patches are not idempotent.
@@ -41,7 +46,7 @@ function Fail($message) {
 # --- 1. The pinned IDF must be the one that is active -------------------------
 
 if (-not $env:IDF_PATH) {
-    Fail 'IDF_PATH is not set. Activate ESP-IDF first (see CLAUDE.md, section Збірка).'
+    Fail 'IDF_PATH is not set. Activate ESP-IDF first (see CLAUDE.md, section Build).'
 }
 if (-not (Test-Path $pinFile)) {
     Fail "idf.pin not found at $pinFile"
@@ -55,8 +60,17 @@ if (-not $pin.version -or -not $pin.commit) {
     Fail 'idf.pin must define both version= and commit=.'
 }
 
-$versionFile = Join-Path $env:IDF_PATH 'version.txt'
-$actualVersion = if (Test-Path $versionFile) { (Get-Content $versionFile -Raw).Trim() } else { '<no version.txt>' }
+# version.cmake, not version.txt: the latter does not exist in an IDF checkout,
+# which this script asserted against for a while and therefore never ran.
+$versionFile = Join-Path $env:IDF_PATH 'tools/cmake/version.cmake'
+if (-not (Test-Path $versionFile)) {
+    Fail "No tools/cmake/version.cmake under $env:IDF_PATH. That does not look like an ESP-IDF."
+}
+$v = @{}
+foreach ($line in Get-Content $versionFile) {
+    if ($line -match '^\s*set\(IDF_VERSION_(MAJOR|MINOR|PATCH)\s+(\d+)\)') { $v[$Matches[1]] = $Matches[2] }
+}
+$actualVersion = "v$($v.MAJOR).$($v.MINOR).$($v.PATCH)"
 if ($actualVersion -ne $pin.version) {
     Fail "IDF_PATH is $actualVersion, idf.pin wants $($pin.version). Patches are cut against $($pin.version) only."
 }
@@ -71,7 +85,7 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host 'setup: IDF_PATH is not a git checkout, commit not verified.' -ForegroundColor Yellow
 }
 
-Write-Host "setup: IDF $($pin.version) at $env:IDF_PATH — matches idf.pin." -ForegroundColor Green
+Write-Host "setup: IDF $($pin.version) at $env:IDF_PATH - matches idf.pin." -ForegroundColor Green
 
 # --- 2. Copy components/bt out of the shared tree -----------------------------
 
@@ -105,13 +119,13 @@ if (Test-Path $patchDir) {
 }
 
 if ($patches.Count -eq 0) {
-    Write-Host 'setup: no patches yet — this is stock Bluedroid, which means SBC only.' -ForegroundColor Yellow
+    Write-Host 'setup: no patches yet - this is stock Bluedroid, which means SBC only.' -ForegroundColor Yellow
 } else {
     foreach ($patch in $patches) {
         Write-Host "setup: applying $($patch.Name) ..."
         & git -C $repoRoot apply --directory=components/bt --whitespace=nowarn -- $patch.FullName
         if ($LASTEXITCODE -ne 0) {
-            Fail "$($patch.Name) did not apply. Do not hand-edit components/bt — fix the patch and re-run with -Clean."
+            Fail "$($patch.Name) did not apply. Do not hand-edit components/bt - fix the patch and re-run with -Clean."
         }
     }
     Write-Host "setup: $($patches.Count) patch(es) applied." -ForegroundColor Green
