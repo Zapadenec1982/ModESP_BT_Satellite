@@ -84,6 +84,25 @@ patches/              the Bluetooth stack delta, one diff per logical change
 tests/host/           the link layer, tested without a board
 ```
 
+## The bit clock, measured
+
+Asked by the host, whose receiver is a slave and has to tell a stopped clock from
+silence. Measured on the board itself: the pulse counter is fed from the BCLK pin's
+own output, so no wire and no oscilloscope are involved (`CONFIG_SAT_CLOCK_PROBE`).
+
+**It never stops.** With no phone and no stream, BCLK ran continuously at 1 411 256 Hz
+for twenty-five seconds, and the data line carries zeros rather than a repeated buffer.
+
+Nominal is 1 411 200 Hz, so the clock is **+40 ppm fast** — about 143 ms of drift an
+hour. Both clocks in that measurement come from the same crystal, so the figure is the
+APLL's own fractional error; the crystal's error adds to it in absolute terms. It is
+the drift the host's rate servo has to absorb, and its sign.
+
+One exception worth knowing: changing the sample rate disables and re-enables the
+channel, so the clock genuinely stops for that moment rather than going quiet. Today
+that path never runs — the rate is 44.1 kHz at boot and stock Bluedroid negotiates
+nothing else — but it would if 48 kHz were ever announced.
+
 ## Status
 
 The receiver works: a phone pairs, SBC plays at 44.1 kHz, and the samples leave on the I2S
