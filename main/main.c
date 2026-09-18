@@ -80,7 +80,6 @@ void app_main(void)
 
 #if !CONFIG_SAT_LINK_ONLY
     ESP_ERROR_CHECK(audio_out_init());
-    ESP_ERROR_CHECK(clock_probe_start());
 #endif
 
     const link_handlers_t handlers = {
@@ -94,6 +93,11 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(link_start(&handlers, own_caps()));
     ESP_ERROR_CHECK(expander_start());
+
+    /* After both peripherals have claimed their pins: the probe reads those pins'
+     * own output back in, and configuring it first would only have it overwritten
+     * by uart_set_pin. */
+    ESP_ERROR_CHECK(clock_probe_start());
 
 #if CONFIG_SAT_LINK_ONLY
     ESP_LOGW(TAG, "link only: no Bluetooth, no I2S, nothing but the wire");

@@ -22,6 +22,12 @@ static const char *TAG = "sat.link";
 #define LINK_RX_BUF          (SATLINK_WIRE_MAX * 2)
 #define LINK_TX_BUF          (SATLINK_WIRE_MAX * 2)
 #define LINK_READ_CHUNK      256
+#define LINK_EVENT_QUEUE     16
+
+/* Symbol periods of idle before the hardware calls a burst finished. Ten of them
+ * at 460800 is about 217 us, which is far inside the 30 ms the spec allows a GPIO
+ * edge to reach the wire, and long enough not to split a frame in two. */
+#define LINK_RX_TIMEOUT_SYM  10
 
 /* Two queues, because the spec divides messages into those that may be thrown
  * away when the host stops reading and those that may not. Draining critical
@@ -34,6 +40,10 @@ static const char *TAG = "sat.link";
 #define LINK_TX_PRIO         (configMAX_PRIORITIES - 7)
 
 #define LINK_PING_PERIOD_US  1000000
+
+/* A HELLO answers a HELLO, but no faster than this. Two polite implementations
+ * with no limit would greet each other until the wire melted. */
+#define LINK_HELLO_MIN_GAP_US (1000 * 1000)
 
 /*
  * How much stack a sender is allowed to take.
@@ -66,6 +76,7 @@ typedef struct {
     uint8_t  type;
 } tx_item_t;
 
+static QueueHandle_t     s_uart_events;
 static QueueHandle_t     s_q_critical;
 static QueueHandle_t     s_q_bulk;
 static link_handlers_t   s_handlers;
@@ -77,6 +88,7 @@ static bool              s_peer_incompatible;
 static uint32_t          s_host_caps;
 static uint32_t          s_own_caps;
 static uint32_t          s_ping_outstanding;
+static int64_t           s_last_hello_us;
 static esp_timer_handle_t s_ping_timer;
 
 /* Guards the log bridge against feeding on itself: a failure inside a send would
@@ -108,7 +120,8 @@ static void tx_push(uint8_t type, const uint8_t *payload, size_t payload_len)
     /* An incompatible peer gets liveness and log lines and nothing else: it would
      * not understand the rest, and guessing is worse than silence. */
     if (s_peer_incompatible &&
-        type != SATLINK_MSG_PING && type != SATLINK_MSG_PONG && type != SATLINK_MSG_LOG) {
+        type != SATLINK_MSG_HELLO && type != SATLINK_MSG_PING &&
+        type != SATLINK_MSG_PONG && type != SATLINK_MSG_LOG) {
         return;
     }
 
@@ -291,7 +304,22 @@ static void send_hello(void)
     };
     uint8_t payload[LINK_BUF_HELLO];
     size_t len = satlink_enc_hello(payload, sizeof(payload), &m);
-    if (len != 0) { tx_push(SATLINK_MSG_HELLO, payload, len); }
+    if (len != 0) {
+        s_last_hello_us = esp_timer_get_time();
+        tx_push(SATLINK_MSG_HELLO, payload, len);
+    }
+}
+
+/* The reply half of the greeting. Without it a peer that started first never
+ * learns our version or our capabilities, and is right to refuse to bring the
+ * link up: it would be guessing at what we can do. */
+static void answer_hello(void)
+{
+    int64_t now = esp_timer_get_time();
+    if (s_last_hello_us != 0 && now - s_last_hello_us < LINK_HELLO_MIN_GAP_US) {
+        return;
+    }
+    send_hello();
 }
 
 /* ------------------------------------------------------------------- inbound */
@@ -312,6 +340,9 @@ static void handle_hello(const uint8_t *payload, size_t len)
         s_host_present = false;
         ESP_LOGE(TAG, "host speaks protocol %u.%u, we speak %u.%u — link disabled, audio unaffected",
                  h.major, h.minor, SATLINK_PROTO_MAJOR, SATLINK_PROTO_MINOR);
+        /* Still answer. Two sides that both fall silent on a version mismatch
+         * leave nobody able to say what the mismatch was. */
+        answer_hello();
         return;
     }
 
@@ -324,6 +355,10 @@ static void handle_hello(const uint8_t *payload, size_t len)
     if ((h.caps & SATLINK_HOST_CAP_RELOCK) == 0) {
         ESP_LOGI(TAG, "host cannot relock: announcing 44.1 kHz only");
     }
+
+    /* The spec asks for a HELLO after start and in answer to one. Only the first
+     * half was here, so a host that came up second waited for ever. */
+    answer_hello();
 
     if (s_handlers.on_hello != NULL) {
         s_handlers.on_hello(&h);
@@ -416,27 +451,74 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
     }
 }
 
+/*
+ * Driven by the driver's event queue rather than by polling.
+ *
+ * The obvious version asks uart_read_bytes for a bufferful with a timeout, and
+ * that is a trap: it returns when the buffer fills OR the timeout expires, and
+ * our frames are a dozen bytes, so it waits out the whole timeout every single
+ * time. Measured on the bench, that put 100 ms of latency on every message in
+ * this direction — survivable for PING, fatal for GPIO_IN, which the spec gives
+ * 30 ms from edge to wire.
+ *
+ * The event queue wakes us when the hardware says a burst has ended, which at
+ * this baud rate is a few hundred microseconds after the last byte.
+ */
 static void link_rx_task(void *arg)
 {
     (void)arg;
     uint8_t chunk[LINK_READ_CHUNK];
 
     for (;;) {
-        int n = uart_read_bytes(BOARD_LINK_UART_NUM, chunk, sizeof(chunk), pdMS_TO_TICKS(100));
-        if (n <= 0) {
+        uart_event_t event;
+        if (xQueueReceive(s_uart_events, &event, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        if (s_stats.rx_bytes == 0) {
-            /* The first byte ever. Worth its own line: it is the difference
-             * between a wire that is not connected and a peer that is not
-             * understood. */
-            ESP_LOGI(TAG, "something is transmitting on GPIO%d", BOARD_LINK_RX_GPIO);
-        }
-        s_stats.rx_bytes += (uint32_t)n;
 
-        satlink_rx_feed(&s_rx, chunk, (size_t)n, on_frame, NULL);
-        s_stats.rx_seq_gaps = s_rx.seq_gaps;
-        s_stats.rx_bad = s_rx.err_cobs + s_rx.err_crc + s_rx.err_runt + s_rx.err_too_long;
+        switch (event.type) {
+        case UART_DATA: {
+            size_t remaining = event.size;
+            while (remaining > 0) {
+                size_t want = (remaining < sizeof(chunk)) ? remaining : sizeof(chunk);
+                int n = uart_read_bytes(BOARD_LINK_UART_NUM, chunk, want, 0);
+                if (n <= 0) {
+                    break;
+                }
+                remaining -= (size_t)n;
+
+                if (s_stats.rx_bytes == 0) {
+                    /* The first byte ever. Worth its own line: it is the
+                     * difference between a wire that is not connected and a peer
+                     * that is not understood. */
+                    ESP_LOGI(TAG, "something is transmitting on GPIO%d", BOARD_LINK_RX_GPIO);
+                }
+                s_stats.rx_bytes += (uint32_t)n;
+
+                satlink_rx_feed(&s_rx, chunk, (size_t)n, on_frame, NULL);
+                s_stats.rx_seq_gaps = s_rx.seq_gaps;
+                s_stats.rx_bad = s_rx.err_cobs + s_rx.err_crc + s_rx.err_runt + s_rx.err_too_long;
+            }
+            break;
+        }
+
+        case UART_FIFO_OVF:
+        case UART_BUFFER_FULL:
+            /* We stopped reading for long enough to lose bytes. Throw away what
+             * is left rather than feed the reassembler a hole in the middle of a
+             * frame: it would resynchronise anyway, but this says so in the log.
+             * The counter moves because a lost frame is a lost frame. */
+            ESP_LOGW(TAG, "receiver overran, %s",
+                     event.type == UART_FIFO_OVF ? "hardware fifo" : "ring buffer");
+            uart_flush_input(BOARD_LINK_UART_NUM);
+            xQueueReset(s_uart_events);
+            satlink_rx_init(&s_rx);
+            s_stats.rx_bad++;
+            break;
+
+        default:
+            ESP_LOGD(TAG, "uart event %d", event.type);
+            break;
+        }
     }
 }
 
@@ -562,10 +644,13 @@ esp_err_t link_start(const link_handlers_t *handlers, uint32_t caps)
         .source_clk = UART_SCLK_DEFAULT,
     };
     ESP_RETURN_ON_ERROR(uart_driver_install(BOARD_LINK_UART_NUM, LINK_RX_BUF, LINK_TX_BUF,
-                                            0, NULL, 0), TAG, "uart_driver_install");
+                                            LINK_EVENT_QUEUE, &s_uart_events, 0),
+                        TAG, "uart_driver_install");
     ESP_RETURN_ON_ERROR(uart_param_config(BOARD_LINK_UART_NUM, &cfg), TAG, "uart_param_config");
     ESP_RETURN_ON_ERROR(uart_set_pin(BOARD_LINK_UART_NUM, BOARD_LINK_TX_GPIO, BOARD_LINK_RX_GPIO,
                                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE), TAG, "uart_set_pin");
+    ESP_RETURN_ON_ERROR(uart_set_rx_timeout(BOARD_LINK_UART_NUM, LINK_RX_TIMEOUT_SYM),
+                        TAG, "uart_set_rx_timeout");
 
 #if CONFIG_SAT_LINK_LOOPBACK
     /* Wires TX to RX inside the chip so the whole link can be exercised with
