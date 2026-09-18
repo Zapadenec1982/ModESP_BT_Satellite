@@ -31,7 +31,20 @@ static const char *TAG = "sat.bt";
 #define BT_META_ATTRS   (ESP_AVRC_MD_ATTR_TITLE   | \
                          ESP_AVRC_MD_ATTR_ARTIST  | \
                          ESP_AVRC_MD_ATTR_ALBUM   | \
-                         ESP_AVRC_MD_ATTR_PLAYING_TIME)
+                         ESP_AVRC_MD_ATTR_PLAYING_TIME | \
+                         ESP_AVRC_MD_ATTR_COVER_ART)
+
+/*
+ * How large a cover this device will carry.
+ *
+ * The protocol's ceiling is 256 KB, which this board does not have: a WROOM has
+ * no PSRAM and Bluedroid has already taken its share. What AVRCP calls the linked
+ * thumbnail is a 200x200 image and runs to a few kilobytes, so 48 KB is generous
+ * for what is actually asked for and affordable with what is actually here.
+ * Anything larger is not sent at all, per the protocol: a truncated image is
+ * worse than none, because the host cannot tell it from a lost tail.
+ */
+#define BT_COVER_MAX_BYTES  (48 * 1024)
 
 /* Transaction labels. AVRCP allows sixteen; giving each conversation its own
  * makes a packet capture readable. */
@@ -75,6 +88,12 @@ static struct {
     uint8_t  volume;
     bool     avrcp_up;
     bool     has_play_pos;          /* the phone will notify about position */
+
+    char     art_handle[8];         /* seven characters and a terminator */
+    uint8_t *art;                   /* grown while a transfer runs, freed after */
+    size_t   art_len;
+    bool     art_busy;
+    bool     art_oversize;
 } s_now;
 
 static esp_timer_handle_t s_meta_timer;
@@ -153,6 +172,112 @@ static void pos_tick(void *arg)
          * has no PLAY_POS bit, so the position has to be asked for. */
         esp_avrc_ct_send_get_play_status_cmd(TL_PLAY_STATUS);
     }
+}
+
+/* ---------------------------------------------------------------- cover art */
+
+static void cover_reset(void)
+{
+    free(s_now.art);
+    s_now.art = NULL;
+    s_now.art_len = 0;
+    s_now.art_busy = false;
+    s_now.art_oversize = false;
+}
+
+static uint8_t cover_mime(const uint8_t *data, size_t len)
+{
+    if (len >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF) {
+        return SATLINK_MIME_JPEG;
+    }
+    if (len >= 4 && data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G') {
+        return SATLINK_MIME_PNG;
+    }
+    return SATLINK_MIME_UNKNOWN;
+}
+
+/* Only when the host asked for covers. With no host the bit is clear, so none of
+ * this runs and the behaviour of a device sitting on its own is unchanged. */
+static void cover_fetch(void)
+{
+    if (s_now.art_busy || s_now.art_handle[0] == '\0') {
+        return;
+    }
+    if ((link_host_caps() & SATLINK_HOST_CAP_COVER) == 0) {
+        return;
+    }
+    s_now.art_busy = true;
+    s_now.art_oversize = false;
+    if (esp_avrc_ct_cover_art_connect(ESP_AVRC_CA_MTU_MAX) != ESP_OK) {
+        ESP_LOGW(TAG, "cover art: the phone would not open an OBEX channel");
+        s_now.art_busy = false;
+    }
+}
+
+static void cover_send(void)
+{
+    uint16_t total = (uint16_t)((s_now.art_len + SATLINK_COVER_CHUNK_MAX - 1) /
+                                SATLINK_COVER_CHUNK_MAX);
+    uint8_t mime = cover_mime(s_now.art, s_now.art_len);
+
+    ESP_LOGI(TAG, "cover art: %u bytes, %u chunks, mime %u",
+             (unsigned)s_now.art_len, total, mime);
+
+    for (uint16_t i = 0; i < total; i++) {
+        size_t offset = (size_t)i * SATLINK_COVER_CHUNK_MAX;
+        size_t n = s_now.art_len - offset;
+        if (n > SATLINK_COVER_CHUNK_MAX) { n = SATLINK_COVER_CHUNK_MAX; }
+        link_send_cover(i, total, mime, (uint32_t)s_now.art_len,
+                        s_now.art + offset, (uint16_t)n);
+    }
+}
+
+static void cover_on_data(const esp_avrc_ct_cb_param_t *param)
+{
+    if (param->cover_art_data.status != ESP_BT_STATUS_SUCCESS) {
+        ESP_LOGW(TAG, "cover art: transfer failed");
+        cover_reset();
+        esp_avrc_ct_cover_art_disconnect();
+        return;
+    }
+
+    size_t len = param->cover_art_data.data_len;
+    if (!s_now.art_oversize && len != 0) {
+        if (s_now.art_len + len > BT_COVER_MAX_BYTES) {
+            /* Stop collecting but keep draining: abandoning mid-transfer would
+             * leave the OBEX channel in a state the phone has to time out of. */
+            ESP_LOGW(TAG, "cover art: over %d bytes, not sending it at all",
+                     BT_COVER_MAX_BYTES);
+            s_now.art_oversize = true;
+            free(s_now.art);
+            s_now.art = NULL;
+            s_now.art_len = 0;
+        } else {
+            uint8_t *grown = realloc(s_now.art, s_now.art_len + len);
+            if (grown == NULL) {
+                ESP_LOGW(TAG, "cover art: out of memory at %u bytes",
+                         (unsigned)s_now.art_len);
+                s_now.art_oversize = true;
+                free(s_now.art);
+                s_now.art = NULL;
+                s_now.art_len = 0;
+            } else {
+                memcpy(grown + s_now.art_len, param->cover_art_data.p_data, len);
+                s_now.art = grown;
+                s_now.art_len += len;
+            }
+        }
+    }
+
+    if (!param->cover_art_data.final) {
+        return;
+    }
+
+    if (!s_now.art_oversize && s_now.art_len > 0) {
+        cover_send();
+    }
+    cover_reset();
+    esp_avrc_ct_cover_art_disconnect();
 }
 
 static uint8_t play_state_from_avrc(esp_avrc_playback_stat_t st)
@@ -295,6 +420,8 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         } else {
             s_now.has_play_pos = false;
             s_now.play_state = SATLINK_PLAY_STOPPED;
+            s_now.art_handle[0] = '\0';
+            cover_reset();
         }
         break;
 
@@ -343,6 +470,11 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         case ESP_AVRC_MD_ATTR_ALBUM:
             copy_attr(s_now.album, sizeof(s_now.album),
                       param->meta_rsp.attr_text, param->meta_rsp.attr_length);
+            break;
+        case ESP_AVRC_MD_ATTR_COVER_ART:
+            copy_attr(s_now.art_handle, sizeof(s_now.art_handle),
+                      param->meta_rsp.attr_text, param->meta_rsp.attr_length);
+            cover_fetch();
             break;
         case ESP_AVRC_MD_ATTR_PLAYING_TIME: {
             char buf[24];
@@ -404,6 +536,23 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             ESP_LOGD(TAG, "avrcp notify 0x%02x", param->change_ntf.event_id);
             break;
         }
+        break;
+
+    case ESP_AVRC_CT_COVER_ART_STATE_EVT:
+        if (param->cover_art_state.state == ESP_AVRC_COVER_ART_CONNECTED) {
+            /* The linked thumbnail rather than the full image: it is the one size
+             * BIP guarantees exists, and the only one this board has room for. */
+            esp_avrc_ct_cover_art_get_linked_thumbnail((uint8_t *)s_now.art_handle);
+        } else {
+            if (s_now.art_busy) {
+                ESP_LOGW(TAG, "cover art: channel closed mid-transfer");
+            }
+            cover_reset();
+        }
+        break;
+
+    case ESP_AVRC_CT_COVER_ART_DATA_EVT:
+        cover_on_data(param);
         break;
 
     case ESP_AVRC_CT_SET_ABSOLUTE_VOLUME_RSP_EVT:
