@@ -26,6 +26,13 @@ void bt_av_transport(uint8_t cmd);          /* satlink_transport_t */
 void bt_av_set_volume(uint8_t volume);      /* absolute AVRCP volume, 0..127 */
 void bt_av_set_radio(bool on, bool discoverable, bool disconnect);
 
-/* Pushes the current Bluetooth state at the host. Used when a host appears after
- * the phone did, so that it does not have to wait for the next change. */
+/* Pushes everything the host needs in order to stop guessing, and is safe to call
+ * at any time.
+ *
+ * This exists because both of these are otherwise announced exactly once, when
+ * the phone connects — and a host that comes up after the phone would never hear
+ * them. STREAM_FMT in particular is the one the specification says must arrive
+ * before the first sample, precisely so that nobody has to measure the rate off
+ * the stream. */
 void bt_av_report_state(void);
+void bt_av_report_stream_fmt(void);

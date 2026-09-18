@@ -8,6 +8,8 @@
 #include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -35,17 +37,76 @@ static RingbufHandle_t    s_ring;
 static SemaphoreHandle_t  s_lock;       /* guards the channel against retune-while-writing */
 static uint32_t           s_rate_hz = AUDIO_RATE_DEFAULT;
 static volatile uint32_t  s_dropped;
+static volatile uint32_t  s_underruns;
+static volatile uint32_t  s_fill_min = UINT32_MAX;
+static volatile uint32_t  s_fill_max;
+static volatile bool      s_streaming;   /* an empty ring only matters while playing */
+static volatile uint32_t  s_peak;
+
+/* Ten seconds, and only while something is playing. A line an hour from an idle
+ * device is noise; a line every ten seconds from a stuttering one is the whole
+ * diagnosis. */
+#define AUDIO_REPORT_US  (10 * 1000 * 1000)
+
+static void audio_report(void)
+{
+    static int64_t next_us;
+    int64_t now = esp_timer_get_time();
+    if (!s_streaming || now < next_us) {
+        return;
+    }
+    next_us = now + AUDIO_REPORT_US;
+
+    audio_out_stats_t st;
+    audio_out_get_stats(&st);
+    /* Peak as a fraction of full scale, in tenths of a percent, so that a glance
+     * says whether the signal is loud without anyone reaching for a calculator. */
+    unsigned peak_permille = (unsigned)((st.peak * 1000u) / 32768u);
+
+    ESP_LOGI(TAG, "ring %u..%u of %u bytes, underruns %" PRIu32 ", dropped %" PRIu32
+                  ", peak %" PRIu32 "/32768 (%u.%u%% of full scale), free dma %u",
+             (unsigned)st.fill_min, (unsigned)st.fill_max, (unsigned)AUDIO_RING_BYTES,
+             st.underruns, st.dropped_bytes, st.peak,
+             peak_permille / 10, peak_permille % 10,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
+}
 
 static void audio_out_task(void *arg)
 {
     (void)arg;
 
     for (;;) {
+        audio_report();
         size_t len = 0;
         uint8_t *item = xRingbufferReceiveUpTo(s_ring, &len, pdMS_TO_TICKS(100), AUDIO_CHUNK_BYTES);
         if (item == NULL) {
-            continue;   /* nothing playing; the channel keeps clocking out silence */
+            /* Nothing to send. Between tracks that is silence and correct; during
+             * a stream it is a hole in the music, because the DMA fills it with
+             * zeros and says nothing. */
+            if (s_streaming) {
+                s_underruns++;
+                s_fill_min = 0;
+            }
+            continue;
         }
+
+        /* The level we are actually handing over, before anything downstream sees
+         * it. Sixteen-bit two's complement, so full scale is 32768. */
+        const int16_t *samples = (const int16_t *)(const void *)item;
+        size_t n_samples = len / sizeof(int16_t);
+        uint32_t peak = s_peak;
+        for (size_t i = 0; i < n_samples; i++) {
+            int32_t v = samples[i];
+            uint32_t mag = (uint32_t)(v < 0 ? -v : v);
+            if (mag > peak) { peak = mag; }
+        }
+        s_peak = peak;
+
+        /* Sampled after the read, so it is what was left behind. */
+        size_t free_bytes = xRingbufferGetCurFreeSize(s_ring);
+        uint32_t fill = (uint32_t)(AUDIO_RING_BYTES - free_bytes);
+        if (fill < s_fill_min) { s_fill_min = fill; }
+        if (fill > s_fill_max) { s_fill_max = fill; }
 
         xSemaphoreTake(s_lock, portMAX_DELAY);
         size_t written = 0;
@@ -169,4 +230,24 @@ esp_err_t audio_out_set_rate(uint32_t rate_hz)
 uint32_t audio_out_dropped_bytes(void)
 {
     return s_dropped;
+}
+
+void audio_out_set_streaming(bool streaming)
+{
+    s_streaming = streaming;
+}
+
+void audio_out_get_stats(audio_out_stats_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    out->dropped_bytes = s_dropped;
+    out->underruns     = s_underruns;
+    out->fill_min      = (s_fill_min == UINT32_MAX) ? 0 : s_fill_min;
+    out->fill_max      = s_fill_max;
+    out->peak          = s_peak;
+    s_fill_min = UINT32_MAX;
+    s_fill_max = 0;
+    s_peak = 0;
 }

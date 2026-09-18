@@ -16,6 +16,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "satlink/proto.h"
 
@@ -28,9 +29,27 @@ static void on_hello(const satlink_hello_t *hello)
 {
     (void)hello;
 #if !CONFIG_SAT_LINK_ONLY
-    /* A host that turns up after the phone did should not have to wait for the
-     * next change to learn what is going on. */
+    /*
+     * A host that turns up after the phone did should not have to wait for the
+     * next change to learn what is going on — and must not be left to measure the
+     * sample rate off the stream, which is exactly what happens when STREAM_FMT
+     * is announced once and missed once.
+     *
+     * Rate limited rather than done once, though. The host repeats its HELLO
+     * every couple of seconds, and answering every one with a full set of state
+     * put a needless message a second on a link that also carries audio
+     * telemetry. A limit rather than a one-shot because a host that restarts
+     * greets us again and has every right to be told everything a second time.
+     */
+    static int64_t next_announce_us;
+    int64_t now = esp_timer_get_time();
+    if (now < next_announce_us) {
+        return;
+    }
+    next_announce_us = now + (10 * 1000 * 1000);
+
     bt_av_report_state();
+    bt_av_report_stream_fmt();
 #endif
 }
 

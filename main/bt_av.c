@@ -60,6 +60,17 @@ static const char *TAG = "sat.bt";
 #define META_SETTLE_US  (300 * 1000)    /* attributes arrive one per event */
 #define POS_PERIOD_US   (1000 * 1000)   /* the spec's one per second, playing only */
 
+/*
+ * How often the phone is asked to notify about playback position, in seconds.
+ *
+ * One second was the obvious choice and the wrong one: every notification costs
+ * an AVRCP packet inbound and a re-registration outbound, on the same radio link
+ * that is carrying the music. Five seconds cuts that traffic fivefold, and the
+ * progress bar does not suffer, because TRACK_POS still goes out once a second
+ * with the position interpolated from the last notification.
+ */
+#define POS_NOTIFY_INTERVAL_S  5
+
 /* A2DP events arrive on the Bluetooth stack's own task. Anything that can block —
  * retuning the I2S clock, for one — is handed to this task instead. */
 typedef struct {
@@ -85,7 +96,12 @@ static struct {
     char     artist[128];
     char     album[128];
 
-    uint8_t  volume;
+    uint32_t rate_hz;               /* what STREAM_FMT last announced, 0 if never */
+    uint8_t  bits;
+    uint8_t  channels;
+
+    uint8_t  volume;                /* absolute AVRCP volume, 0..127, ours to own */
+    bool     volume_notify;         /* the phone asked to be told when it changes */
     bool     avrcp_up;
     bool     has_play_pos;          /* the phone will notify about position */
 
@@ -124,6 +140,16 @@ static uint32_t sbc_rate_hz(const esp_a2d_cie_sbc_t *sbc)
 void bt_av_report_state(void)
 {
     link_send_bt_state(s_now.state, s_now.codec, s_now.addr, s_now.name);
+}
+
+void bt_av_report_stream_fmt(void)
+{
+    if (s_now.rate_hz == 0) {
+        return;     /* nothing negotiated yet; there is no format to announce */
+    }
+    link_send_stream_fmt(s_now.rate_hz, s_now.bits, s_now.channels);
+    ESP_LOGI(TAG, "announced %" PRIu32 " Hz, %u-bit slots, %u channels",
+             s_now.rate_hz, s_now.bits, s_now.channels);
 }
 
 static void send_track_meta(void *arg)
@@ -315,6 +341,7 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
             memset(s_now.addr, 0, sizeof(s_now.addr));
             s_now.name[0] = '\0';
             s_now.codec = SATLINK_CODEC_NONE;
+            s_now.rate_hz = 0;
             s_now.state = SATLINK_BT_DISCOVERABLE;
             s_now.play_state = SATLINK_PLAY_STOPPED;
             s_now.title[0] = s_now.artist[0] = s_now.album[0] = '\0';
@@ -329,6 +356,7 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
         bool started = (p->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED);
         ESP_LOGI(TAG, "stream %s (dropped %" PRIu32 " bytes so far)",
                  started ? "started" : "suspended", audio_out_dropped_bytes());
+        audio_out_set_streaming(started);
         s_now.state = started ? SATLINK_BT_STREAMING : SATLINK_BT_CONNECTED;
         bt_av_report_state();
         break;
@@ -349,9 +377,15 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
         s_now.codec = SATLINK_CODEC_SBC;
         if (rate != 0) {
             audio_out_set_rate(rate);
+            /* Sixteen-bit slots and two channels, which is what the I2S master is
+             * actually configured for and what a counter on the pins measures:
+             * BCLK divided by WS is exactly 32. */
+            s_now.rate_hz  = rate;
+            s_now.bits     = 16;
+            s_now.channels = 2;
             /* Before the first sample, which is the one hard promise this message
              * makes to the host. */
-            link_send_stream_fmt(rate, 16, 2);
+            bt_av_report_stream_fmt();
         }
         bt_av_report_state();
         break;
@@ -448,7 +482,8 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
                                                                  ESP_AVRC_RN_VOLUME_CHANGE, 0); }
         if (s_now.has_play_pos) {
             esp_avrc_ct_send_register_notification_cmd(TL_PLAY_POS,
-                                                       ESP_AVRC_RN_PLAY_POS_CHANGED, 1);
+                                                       ESP_AVRC_RN_PLAY_POS_CHANGED,
+                                                       POS_NOTIFY_INTERVAL_S);
         } else {
             ESP_LOGI(TAG, "no PLAY_POS bit: falling back to polling GetPlayStatus");
         }
@@ -520,7 +555,8 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             s_now.elapsed_at_us = esp_timer_get_time();
             send_track_pos();
             esp_avrc_ct_send_register_notification_cmd(TL_PLAY_POS,
-                                                       ESP_AVRC_RN_PLAY_POS_CHANGED, 1);
+                                                       ESP_AVRC_RN_PLAY_POS_CHANGED,
+                                                       POS_NOTIFY_INTERVAL_S);
             break;
 
         case ESP_AVRC_RN_VOLUME_CHANGE:
@@ -568,6 +604,61 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
 
     default:
         ESP_LOGD(TAG, "avrcp event %d", event);
+        break;
+    }
+}
+
+/* ------------------------------------------------------- avrcp target role */
+
+/*
+ * Absolute volume, and why this device is the target for it.
+ *
+ * Without a target on this side the phone has nowhere to send a volume, so it
+ * applies its own before encoding — which throws away resolution before the
+ * audio has even left the handset, and is why Bluetooth arrived quieter than
+ * everything else. With a target, the phone sends the stream at full scale and
+ * tells us the number instead.
+ *
+ * The number is then forwarded to the host and not applied here. Attenuating in
+ * this firmware would recreate the same loss one step further along; the host has
+ * a DSP with headroom and is the right place to scale.
+ */
+static void avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_AVRC_TG_CONNECTION_STATE_EVT:
+        ESP_LOGI(TAG, "avrcp target %s",
+                 param->conn_stat.connected ? "connected" : "disconnected");
+        if (!param->conn_stat.connected) {
+            s_now.volume_notify = false;
+        }
+        break;
+
+    case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:
+        s_now.volume = param->set_abs_vol.volume;
+        ESP_LOGI(TAG, "volume %u, set on the phone", s_now.volume);
+        /* Source 1: the peer moved it. The host scales; we do not. */
+        link_send_volume_state(s_now.volume, 1);
+        break;
+
+    case ESP_AVRC_TG_REGISTER_NOTIFICATION_EVT:
+        if (param->reg_ntf.event_id == ESP_AVRC_RN_VOLUME_CHANGE) {
+            s_now.volume_notify = true;
+            esp_avrc_rn_param_t rn = { .volume = s_now.volume };
+            /* Interim now, changed later — that is the shape the profile wants:
+             * an immediate acknowledgement carrying the current value, and a
+             * second response only when it actually moves. */
+            esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE, ESP_AVRC_RN_RSP_INTERIM, &rn);
+        }
+        break;
+
+    case ESP_AVRC_TG_REMOTE_FEATURES_EVT:
+        ESP_LOGI(TAG, "peer avrcp ct features 0x%" PRIx32 ", flag 0x%x",
+                 param->rmt_feats.feat_mask, param->rmt_feats.ct_feat_flag);
+        break;
+
+    default:
+        ESP_LOGD(TAG, "avrcp tg event %d", event);
         break;
     }
 }
@@ -647,11 +738,19 @@ void bt_av_transport(uint8_t cmd)
 void bt_av_set_volume(uint8_t volume)
 {
     if (volume > 127) { volume = 127; }
-    if (!s_now.avrcp_up) {
-        ESP_LOGW(TAG, "volume %u with no phone connected", volume);
-        return;
+    s_now.volume = volume;
+
+    /* The host turned the knob, so this device now holds a different volume than
+     * the phone last heard about. Telling it keeps the handset's own slider in
+     * step, which is the whole point of absolute volume. */
+    if (s_now.volume_notify) {
+        esp_avrc_rn_param_t rn = { .volume = volume };
+        esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE, ESP_AVRC_RN_RSP_CHANGED, &rn);
+        s_now.volume_notify = false;   /* one response per registration */
     }
-    esp_avrc_ct_send_set_absolute_volume_cmd(TL_VOLUME, volume);
+
+    ESP_LOGI(TAG, "volume %u, set from the host", volume);
+    link_send_volume_state(volume, 0);
 }
 
 void bt_av_set_radio(bool on, bool discoverable, bool disconnect)
@@ -723,6 +822,16 @@ esp_err_t bt_av_start(const char *device_name)
 
     ESP_RETURN_ON_ERROR(esp_avrc_ct_init(), TAG, "avrc_ct_init");
     ESP_RETURN_ON_ERROR(esp_avrc_ct_register_callback(avrc_ct_cb), TAG, "avrc_ct_register");
+
+    /* The target half, which exists for exactly one reason: absolute volume. */
+    ESP_RETURN_ON_ERROR(esp_avrc_tg_init(), TAG, "avrc_tg_init");
+    ESP_RETURN_ON_ERROR(esp_avrc_tg_register_callback(avrc_tg_cb), TAG, "avrc_tg_register");
+
+    esp_avrc_rn_evt_cap_mask_t evt_set = {0};
+    esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &evt_set,
+                                       ESP_AVRC_RN_VOLUME_CHANGE);
+    ESP_RETURN_ON_ERROR(esp_avrc_tg_set_rn_evt_cap(&evt_set), TAG, "avrc_tg_rn_cap");
+    s_now.volume = 127;    /* full scale until the phone says otherwise */
 
     ESP_RETURN_ON_ERROR(esp_a2d_register_callback(a2d_cb), TAG, "a2d_register");
     ESP_RETURN_ON_ERROR(esp_a2d_sink_init(), TAG, "a2d_sink_init");
