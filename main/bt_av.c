@@ -146,8 +146,24 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         ESP_LOGI(TAG, "avrcp %s", param->conn_stat.connected ? "connected" : "disconnected");
         if (param->conn_stat.connected) {
             esp_avrc_ct_send_metadata_cmd(0, BT_META_ATTRS);
+            /* Ask what the phone is willing to notify us about before subscribing
+             * to anything: registering for an event the target does not support
+             * gets rejected, and some phones stop answering after that. */
+            esp_avrc_ct_send_get_rn_capabilities_cmd(1);
         }
         break;
+
+    case ESP_AVRC_CT_GET_RN_CAPABILITIES_RSP_EVT: {
+        esp_avrc_rn_evt_cap_mask_t caps = param->get_rn_caps_rsp.evt_set;
+        bool track_change = esp_avrc_rn_evt_bit_mask_operation(
+            ESP_AVRC_BIT_MASK_OP_TEST, &caps, ESP_AVRC_RN_TRACK_CHANGE);
+        ESP_LOGI(TAG, "peer notifies 0x%04x, track change %s",
+                 caps.bits, track_change ? "yes" : "no");
+        if (track_change) {
+            esp_avrc_ct_send_register_notification_cmd(2, ESP_AVRC_RN_TRACK_CHANGE, 0);
+        }
+        break;
+    }
 
     case ESP_AVRC_CT_METADATA_RSP_EVT:
         ESP_LOGI(TAG, "meta 0x%02x: %.*s", param->meta_rsp.attr_id,
@@ -158,7 +174,8 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         ESP_LOGI(TAG, "avrcp notify 0x%02x", param->change_ntf.event_id);
         if (param->change_ntf.event_id == ESP_AVRC_RN_TRACK_CHANGE) {
             esp_avrc_ct_send_metadata_cmd(0, BT_META_ATTRS);
-            esp_avrc_ct_send_register_notification_cmd(1, ESP_AVRC_RN_TRACK_CHANGE, 0);
+            /* AVRCP notifications fire once. Re-arm or this is the last one. */
+            esp_avrc_ct_send_register_notification_cmd(2, ESP_AVRC_RN_TRACK_CHANGE, 0);
         }
         break;
 
