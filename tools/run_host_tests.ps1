@@ -83,4 +83,8 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Replay the codec-switch race through source extracted from our generated BT.
 & $Python (Join-Path $repoRoot 'tools\run_bta_reopen_tests.py') --cc $Cc
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# A live PING/PONG link must recover a dropped startup capability greeting.
+& $Python (Join-Path $repoRoot 'tools\run_hello_tests.py') --cc $Cc
 exit $LASTEXITCODE

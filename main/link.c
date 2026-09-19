@@ -2,6 +2,7 @@
 
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #include "board.h"
@@ -103,14 +104,15 @@ static link_handlers_t   s_handlers;
 static satlink_rx_t      s_rx;
 static link_stats_t      s_stats;
 static uint8_t           s_tx_seq;
-static bool              s_host_present;
-static bool              s_peer_incompatible;
+static atomic_bool       s_host_present;
+static atomic_bool       s_peer_incompatible;
 static uint32_t          s_host_caps;
 static portMUX_TYPE s_fmt_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_fmt_nonce, s_fmt_generation, s_fmt_sent_ms;
 static uint32_t          s_own_caps;
 static uint32_t          s_ping_outstanding;
 static int64_t           s_last_hello_us;
+static portMUX_TYPE s_hello_mux = portMUX_INITIALIZER_UNLOCKED;
 static esp_timer_handle_t s_ping_timer;
 
 /* Guards the log bridge against feeding on itself: a failure inside a send would
@@ -374,7 +376,6 @@ static void send_hello(void)
         ESP_LOGE(TAG, "HELLO will not encode into %u bytes", (unsigned)sizeof(payload));
         return;
     }
-    s_last_hello_us = esp_timer_get_time();
     s_stats.hello_sent++;
     ESP_LOGI(TAG, "HELLO out: %u.%u, caps 0x%08" PRIx32 ", %u bytes",
              SATLINK_PROTO_MAJOR, SATLINK_PROTO_MINOR, s_own_caps, (unsigned)len);
@@ -387,9 +388,15 @@ static void send_hello(void)
 static void answer_hello(void)
 {
     int64_t now = esp_timer_get_time();
+    // RX, startup and retry timer share one reservation; do not hold the lock
+    // while encoding, logging or queueing the message.
+    portENTER_CRITICAL(&s_hello_mux);
     if (s_last_hello_us != 0 && now - s_last_hello_us < LINK_HELLO_MIN_GAP_US) {
+        portEXIT_CRITICAL(&s_hello_mux);
         return;
     }
+    s_last_hello_us = now;
+    portEXIT_CRITICAL(&s_hello_mux);
     send_hello();
 }
 
@@ -642,6 +649,10 @@ static void ping_tick(void *arg)
 {
     (void)arg;
 
+    // PONG proves liveness, not capability negotiation. A lost startup HELLO
+    // or reply must not leave a restarted satellite permanently in legacy mode.
+    if (!s_host_present && !s_peer_incompatible) answer_hello();
+
     if (s_ping_outstanding > 0) {
         s_stats.pings_unanswered++;
         /* Not an error. A host that is not answering is a host that is busy or
@@ -785,7 +796,7 @@ esp_err_t link_start(const link_handlers_t *handlers, uint32_t caps)
     /* HELLO first, then GPIO_MAP, always and in that order — the host reads the
      * map as the answer to "what lines does this thing have", and an empty one is
      * a legitimate answer. */
-    send_hello();
+    answer_hello();
 
     ESP_LOGI(TAG, "UART%d at %d baud, TX %d, RX %d",
              BOARD_LINK_UART_NUM, BOARD_LINK_BAUD, BOARD_LINK_TX_GPIO, BOARD_LINK_RX_GPIO);
