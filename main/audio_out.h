@@ -74,6 +74,12 @@ typedef struct {
      * one question and answers it without argument: is this device handing over a
      * quiet signal, or a loud one that something downstream is turning down. */
     uint32_t peak;
+    /* The same measurement repeated on the bytes going into the DMA, and the
+     * first frame of the loudest block. Two meters at opposite ends of the same
+     * pipe: agreement means the pipe is sound, disagreement says which end to
+     * open. */
+    uint32_t wire_peak;
+    uint8_t  wire_head[8];
 } audio_out_stats_t;
 
 /* Reads the counters and resets the high and low water marks. */
