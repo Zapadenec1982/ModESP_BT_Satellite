@@ -24,7 +24,10 @@ static const char *TAG = "sat.link";
 /* Four frames rather than two: at 460800 baud this is about ninety milliseconds
  * of wire, which is the margin the receiver has if something delays it. */
 #define LINK_RX_BUF          (SATLINK_WIRE_MAX * 4)
-#define LINK_TX_BUF          (SATLINK_WIRE_MAX * 2)
+/* IDF 5.5.5 uart_tx_all spins when a buffered TX ring has no free bytes.
+ * With no driver TX ring it waits on the FIFO semaphore instead. Only our
+ * dedicated sender waits; Bluetooth callbacks still enqueue without blocking. */
+#define LINK_TX_BUF          0
 #define LINK_READ_CHUNK      256
 #define LINK_EVENT_QUEUE     16
 
