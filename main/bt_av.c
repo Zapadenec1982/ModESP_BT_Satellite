@@ -255,6 +255,37 @@ static uint8_t aptx_channels(const uint8_t *cie)
     return (cie[APTX_CIE_FREQ_CHAN] & 0x01) ? 1 : 2;    /* 0x01 mono, 0x02 stereo */
 }
 
+void bt_av_apply_host_caps(void)
+{
+    uint8_t want = (link_host_caps() & SATLINK_HOST_CAP_WIDE) ? 32 : 16;
+    if (want == audio_out_slot_bits()) {
+        return;
+    }
+
+    /*
+     * Announce, then be quiet, then change. PROTOCOL.md 1.2 asks for exactly this
+     * and it asks because of this: an earlier build widened the slots at startup,
+     * with no A2DP connection in sight and therefore no STREAM_FMT to trigger.
+     * BCLK went from 32 clocks a frame to 64 while the host was still reading
+     * 16-bit words, and the speakers made noise.
+     *
+     * If nothing has been negotiated yet, what is announced is what the clock is
+     * actually doing: the I2S rate, in the width it is about to take. That is not
+     * a guess, it is a description.
+     */
+    if (s_now.rate_hz == 0) {
+        s_now.rate_hz = audio_out_rate_hz();
+    }
+    s_now.bits     = want;
+    s_now.channels = 2;
+    bt_av_report_stream_fmt();
+
+    audio_out_flush();
+    vTaskDelay(pdMS_TO_TICKS(BT_AV_FMT_SILENCE_MS));
+
+    audio_out_set_slot_bits(want);
+}
+
 void bt_av_report_state(void)
 {
     link_send_bt_state(s_now.state, s_now.codec, s_now.addr, s_now.name);
@@ -1085,26 +1116,7 @@ esp_err_t bt_av_start(const char *device_name)
     A2DP_SinkOfferAptx(BT_AV_OFFER_APTX);
     A2DP_SinkOfferAac(BT_AV_OFFER_AAC);
 
-    if (host_caps & SATLINK_HOST_CAP_WIDE) {
-        /*
-         * Announce, then be quiet, then widen. PROTOCOL.md 1.2 asks for exactly
-         * this and it asks because of this: the previous build widened the slots
-         * here, at startup, with no A2DP connection in sight and therefore no
-         * STREAM_FMT to trigger. BCLK went from 32 clocks a frame to 64 while the
-         * host was still reading 16-bit words, and the speakers made noise.
-         *
-         * There is no negotiated rate yet, so what is announced is what the clock
-         * is actually doing: the I2S default, in the width it is about to take.
-         * That is not a guess, it is a description.
-         */
-        s_now.rate_hz  = audio_out_rate_hz();
-        s_now.bits     = 32;
-        s_now.channels = 2;
-        bt_av_report_stream_fmt();
-        vTaskDelay(pdMS_TO_TICKS(BT_AV_FMT_SILENCE_MS));
-
-        audio_out_set_slot_bits(32);
-    }
+    bt_av_apply_host_caps();
     ESP_LOGI(TAG, "endpoints: SBC%s%s%s, %s, %u-bit slots",
              BT_AV_OFFER_AAC ? " AAC" : "",
              BT_AV_OFFER_APTX ? " aptX" : "",

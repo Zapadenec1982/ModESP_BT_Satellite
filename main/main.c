@@ -50,6 +50,10 @@ static void on_hello(const satlink_hello_t *hello)
      * that restarts must not then wait ten seconds to learn it. The message is six
      * bytes; the state dump behind it is not, and that keeps its limit.
      */
+    /* A host that was slow to greet us left the device narrow until a reboot.
+     * 1.2 allows the width to change whenever, so long as it is announced, so a
+     * late greeting is now enough to widen. Does nothing when already correct. */
+    bt_av_apply_host_caps();
     bt_av_report_stream_fmt();
 
     static int64_t next_announce_us;

@@ -34,5 +34,18 @@ void bt_av_set_radio(bool on, bool discoverable, bool disconnect);
  * them. STREAM_FMT in particular is the one the specification says must arrive
  * before the first sample, precisely so that nobody has to measure the rate off
  * the stream. */
+/*
+ * Takes the slot width the host asked for, announcing it first.
+ *
+ * Called at startup and again whenever a greeting arrives, because a host that
+ * was slow to say hello used to leave the device narrow until someone power
+ * cycled it. Contract 1.2 permits the change at any time provided it is
+ * announced, so there is no longer a reason to wait for a reboot.
+ *
+ * Does nothing when the width already matches, so calling it on every HELLO is
+ * free.
+ */
+void bt_av_apply_host_caps(void);
+
 void bt_av_report_state(void);
 void bt_av_report_stream_fmt(void);
