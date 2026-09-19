@@ -69,6 +69,8 @@ void link_send_adc_value(uint8_t index, uint16_t raw, uint16_t mv);
 void link_send_log(uint8_t level, const char *text);
 
 void link_send_cover_reset(uint32_t nonce, uint32_t generation);
+bool link_try_cover_stream(uint32_t nonce, uint32_t generation, uint32_t offset,
+                           const uint8_t *data, size_t len, uint32_t crc);
 void link_send_cover_data(uint32_t nonce, uint32_t generation, uint32_t total,
                           uint32_t offset, const uint8_t *data, uint16_t len);
 
@@ -113,3 +115,4 @@ void link_get_stats(link_stats_t *out);
  * message per event and cannot outrun the wire.
  */
 uint32_t link_bulk_pending(void);
+#define LINK_BULK_COVER_HEADROOM 4

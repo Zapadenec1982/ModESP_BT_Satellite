@@ -11,6 +11,7 @@
 #include "driver/uart.h"
 #include "esp_app_desc.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -345,6 +346,26 @@ void link_send_cover_reset(uint32_t nonce, uint32_t generation)
     tx_push(COVER_RESET, p, sizeof p);
 }
 
+// BTC callback only. Bounded, nonblocking; END shares the DATA FIFO so it cannot
+// overtake data. Never evict another frame to make room for an image.
+bool link_try_cover_stream(uint32_t nonce, uint32_t generation, uint32_t offset,
+                           const uint8_t *data, size_t len, uint32_t crc)
+{
+    if (!(link_host_caps() & COVER_STREAM_CAP) || !s_q_bulk ||
+        len>COVER_PART_MAX || (!data && len) ||
+        link_bulk_pending()>LINK_BULK_COVER_HEADROOM) return false;
+    size_t bytes=16+len;
+    if (heap_caps_get_free_size(MALLOC_CAP_8BIT)<bytes+16*1024) return false;
+    uint8_t *p=malloc(bytes);
+    if (!p) return false;
+    cover_put32(p,nonce); cover_put32(p+4,generation);
+    cover_put32(p+8,len?0:offset); cover_put32(p+12,len?offset:crc);
+    if (len) memcpy(p+16,data,len);
+    tx_item_t item={.payload=p,.len=(uint16_t)bytes,.type=len?COVER_DATA:COVER_END};
+    if (xQueueSend(s_q_bulk,&item,0)==pdTRUE) return true;
+    free(p); return false;
+}
+
 void link_send_cover_data(uint32_t nonce, uint32_t generation, uint32_t total,
                           uint32_t offset, const uint8_t *data, uint16_t len)
 {
@@ -453,6 +474,7 @@ static void handle_hello(const uint8_t *payload, size_t len)
     if (h.minor < 4 || !(caps & FMT_HOST_CAP) || !(caps & SATLINK_HOST_CAP_RELOCK))
         caps &= ~SATLINK_HOST_CAP_96KHZ;
     if (h.minor < 5) caps &= ~SATLINK_HOST_CAP_COVER;
+    if (h.minor < 6 || !(caps & SATLINK_HOST_CAP_COVER)) caps &= ~COVER_STREAM_CAP;
     __atomic_store_n(&s_host_caps, caps, __ATOMIC_SEQ_CST);
     ESP_LOGI(TAG, "host %u.%u, caps 0x%08" PRIx32 ", build \"%.*s\"",
              h.major, h.minor, h.caps, (int)h.build.len, h.build.ptr);

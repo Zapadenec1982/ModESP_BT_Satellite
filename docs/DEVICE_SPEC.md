@@ -196,4 +196,7 @@ Runtime performance and audio fidelity need bench verification with an LHDC V5 s
 
 ## Cover integration (2026-09-20)
 
-Protocol 1.5 uses track-scoped JPEG RESET/DATA, gated by host bit 1 and minor >=5. Linked thumbnails only, 48 KiB local memory ceiling, independent paced sender. See `BT_COVER_2026-09-20.md`.
+Protocol 1.6 streams linked JPEG thumbnails into host memory with RESET/DATA/END,
+gated by host bits 1+6 and minor >=6. Maximum 256 KiB, explicit length/CRC completion,
+bounded nonblocking UART enqueue and 16-KiB heap reserve. A 1.5 host still uses
+the previous 48-KiB collection path. See `BT_COVER_2026-09-20.md`.

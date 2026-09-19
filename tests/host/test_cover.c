@@ -16,6 +16,54 @@ static void counted_free(void *p) { if (p) ++frees; free(p); }
 #define free counted_free
 #include "cover_buffer.h"
 #undef free
+#include "cover_stream.h"
+
+static uint8_t streamed[COVER_BYTES_MAX];
+static uint32_t stream_used, stream_crc;
+static unsigned emits, reject_emit, ends;
+static bool collect(void *ctx,uint32_t off,const uint8_t *p,size_t len,uint32_t crc) {
+    (void)ctx;
+    if (++emits==reject_emit) return false;
+    CHECK(off==stream_used);
+    if (len) {
+        CHECK(len<=COVER_PART_MAX);
+        memcpy(streamed+off,p,len); stream_used+=(uint32_t)len;
+    } else { ++ends; stream_crc=crc; }
+    return true;
+}
+static void stream_tests(void) {
+    static uint8_t source[COVER_BYTES_MAX];
+    for (size_t i=0;i<sizeof source;++i) source[i]=(uint8_t)(i*17);
+    source[0]=0xff; source[1]=0xd8; source[2]=0xff;
+    CHECK(cover_crc32(0,(const uint8_t*)"123456789",9)==0xcbf43926u);
+    for (size_t split=1;split<=1691;split+=169) {
+        cover_stream_t s={0}; emits=reject_emit=ends=stream_used=0;
+        for(size_t off=0;off<sizeof source;off+=split) {
+            size_t n=sizeof source-off; if(n>split)n=split;
+            REQUIRE(cover_stream_feed(&s,source+off,n,false,collect,NULL));
+            CHECK(!s.finished); CHECK(ends==0);
+        }
+        REQUIRE(cover_stream_feed(&s,NULL,0,true,collect,NULL));
+        CHECK(s.finished); CHECK(ends==1); CHECK(stream_used==sizeof source);
+        CHECK(memcmp(streamed,source,sizeof source)==0);
+        CHECK(stream_crc==cover_crc32(0,source,sizeof source));
+        CHECK(!cover_stream_feed(&s,source,1,true,collect,NULL));
+    }
+    for (unsigned fail=1;fail<=4;++fail) {
+        cover_stream_t s={0}; emits=ends=stream_used=0; reject_emit=fail;
+        CHECK(!cover_stream_feed(&s,source,2501,true,collect,NULL));
+        CHECK(s.failed); CHECK(!s.finished); CHECK(ends==0);
+        CHECK(!cover_stream_feed(&s,NULL,0,true,collect,NULL));
+    }
+    cover_stream_t s={0}; emits=ends=reject_emit=stream_used=0;
+    REQUIRE(cover_stream_feed(&s,source,sizeof source,false,collect,NULL));
+    CHECK(!cover_stream_feed(&s,source,1,true,collect,NULL)); CHECK(ends==0);
+    s=(cover_stream_t){0}; stream_used=0;
+    CHECK(!cover_stream_feed(&s,source,2,true,collect,NULL)); CHECK(ends==0);
+    s=(cover_stream_t){0}; stream_used=0;
+    CHECK(!cover_stream_feed(&s,source+3,10,true,collect,NULL)); CHECK(ends==0);
+    CHECK(sizeof(cover_stream_t)<32); // JPEG size cannot grow sender storage.
+}
 
 typedef unsigned char UINT8, BOOLEAN;
 typedef unsigned short UINT16;
@@ -82,7 +130,7 @@ static void pacing_tests(void) {
     cover_continue_cb(&cover_continue_timer[1]); CHECK(sent==2);
 }
 int main(void) {
-    buffer_tests(); pacing_tests();
+    buffer_tests(); pacing_tests(); stream_tests();
     printf("Cover buffering/pacing: %d checks, %d failures\n",g_checks,g_failures);
     return g_failures?1:0;
 }

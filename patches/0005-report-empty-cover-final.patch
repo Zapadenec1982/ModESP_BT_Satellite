@@ -1,0 +1,14 @@
+--- a/host/bluedroid/bta/av/bta_av_ca_act.c
++++ b/host/bluedroid/bta/av/bta_av_ca_act.c
+@@ -499,8 +499,9 @@
+                 report_data_event(p_data->ca_response.pkt, body_data, body_data_len, TRUE);
+             }
+             else {
+-                /* not any body data */
+-                osi_free(p_data->ca_response.pkt);
++                /* A successful empty final response still completes the object.
++                 * BTC owns/frees the packet after delivering this event. */
++                report_data_event(p_data->ca_response.pkt, NULL, 0, TRUE);
+             }
+         }
+         else {

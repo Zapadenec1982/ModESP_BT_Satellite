@@ -1,3 +1,4 @@
+#include "satlink/cover_wire.h"
 /* Actual link handlers + codecs; clock, UART queue, logging and lock are stubs.
  * This checks greeting recovery, not FreeRTOS scheduling or physical UART loss.
  */
@@ -83,6 +84,10 @@ int main(void) {
     receive_hello(1, 4, 0x3b); CHECK(s_host_caps == 0x39);
     receive_hello(1, 5, 0x3b); CHECK(s_host_caps == 0x3b);
     receive_hello(1, 5, 0x39); CHECK(s_host_caps == 0x39);
+    // Streaming requires both the new minor and explicit cover capability.
+    receive_hello(1, 5, 0x7b); CHECK(s_host_caps == 0x3b);
+    receive_hello(1, 6, 0x7b); CHECK(s_host_caps == 0x7b);
+    receive_hello(1, 6, 0x79); CHECK(s_host_caps == 0x39);
     // A known incompatible host is not a lost greeting; do not retry forever.
     reset_case(); answer_hello(); receive_hello(2, 0, 0);
     CHECK(s_peer_incompatible); CHECK(!s_host_present); CHECK(callbacks == 0);

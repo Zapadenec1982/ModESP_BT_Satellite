@@ -13,9 +13,10 @@
 
 Доповнює `DEVICE_SPEC.md`. Тут розкладки, яких там бракувало.
 
-Ця версія **1.5** і вона узгоджена з другою реалізацією. Міняти можна, але правкою тут і
+Ця версія **1.6** і вона узгоджена з другою реалізацією. Міняти можна, але правкою тут і
 підняттям `proto_minor`.
 
+- **1.6** - bounded unknown-length cover streaming with length/CRC completion.
 - **1.5** — track-scoped JPEG covers (RESET/DATA); asynchronous transfer and decoding.
 - **1.4** — LHDC V5 codec ID 5; host capability bit 5 authorizes 96 kHz.
 - **1.3** — optional acknowledged format transitions (`STREAM_PREPARE` / `STREAM_READY`),
@@ -93,6 +94,7 @@ I2S від лінка не залежить, і пристрій, який гр�
 | 3 | **приймає 32-бітні слоти** (`proto_minor` >= 1) |
 | 4 | FORMAT_READY: acknowledges prepared formats (`proto_minor` >= 3) |
 | 5 | accepts 96 kHz in 16/32-bit stereo slots (`proto_minor` >= 4; requires bits 0 and 4) |
+| 6 | accepts streaming covers with END (`proto_minor` >= 6; requires bit 1) |
 
 **Bit 5 is an explicit frequency capability.** RELOCK alone authorizes only
 44.1/48 kHz. Offer LHDC V5 at 96 kHz only after HELLO 1.4 with bits 0, 4 and 5;
@@ -479,3 +481,33 @@ Bluetooth callbacks never wait for UART draining. A separate low-priority task
 paces DATA and abandons it if the epoch changes or the queue stalls for 2 s.
 The P4 receives into PSRAM; JPEG decoding is off the UART/module task, and
 publication checks the current generation again after decoding.
+
+
+### Bounded streaming JPEG covers (protocol 1.6)
+
+Host capability bit 6 (COVER_STREAM_CAP) requires host minor >=6 AND cover bit 1.
+The satellite falls back to unchanged 1.5 collection for a 1.5 host; a 1.6 host
+continues accepting known-length 1.5 DATA. Audio formats and capabilities do not change.
+
+With streaming negotiated, DATA 0x18 uses total_bytes=0 (unknown until OBEX final).
+Each DATA carries 1..1000 bytes, contiguous offsets starting at zero. Part sizes
+may vary. The host reserves at most 256 KiB in PSRAM and never publishes on DATA.
+Mixing known/unknown totals within one generation is invalid. RESET is unchanged.
+
+`0x19 COVER_END`, device to host: `u32 boot_nonce`, `u32 track_generation`,
+`u32 actual_bytes`, `u32 crc32`. Exactly 16 bytes, all little endian.
+CRC-32/ISO-HDLC covers the concatenated JPEG bytes (check `123456789` = CB F4 39 26
+as numeric 0xCBF43926, wire bytes 26 39 F4 CB; polynomial 0xEDB88320 reflected, initial/final xor 0xFFFFFFFF).
+END uses the SAME bulk FIFO as DATA and cannot overtake it. It is emitted only
+after successful OBEX final. Host commits only if current pair, length and CRC
+all match, length is 3..262144, and no gap/duplicate/error has occurred.
+Missing END/parts time out after 5 seconds without received data. Old epochs
+remain ignored. No partial/corrupt image is published; no automatic retransmission.
+
+ESP32 copies borrowed OBEX callback bytes into bounded UART queue allocations,
+never retains the entire JPEG, never waits on the callback task, never evicts
+another frame for cover streaming, and retains the 16-KiB heap reserve. Queue
+pressure, invalid JPEG or the 256-KiB limit cancels this image without sending END.
+The existing 512-byte OBEX MTU / 50-ms continuation pacing remains. Packet total
+size need not be supplied by the phone. UART TX still waits on the hardware FIFO
+semaphore, preserving the audio decoder's opportunity to run.

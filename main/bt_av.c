@@ -1,5 +1,6 @@
 #include "bt_av.h"
 #include "cover_buffer.h"
+#include "cover_stream.h"
 #include "esp_heap_caps.h"
 #include "satlink/cover_wire.h"
 
@@ -111,7 +112,6 @@ static const char *TAG = "sat.bt";
 
 /* Leave room in the droppable queue for the telemetry that shares it, so a cover
  * transfer does not evict a TRACK_POS or a LOG on its way past. */
-#define LINK_BULK_COVER_HEADROOM   4
 
 /* Transaction labels. AVRCP allows sixteen; giving each conversation its own
  * makes a packet capture readable. */
@@ -192,6 +192,8 @@ static struct {
 
     char     art_handle[8];         /* seven characters and a terminator */
     cover_buffer_t art;             /* ownership moves to the UART sender */
+    cover_stream_t art_stream;
+    bool art_streaming;
     bool     art_connected;
     bool     art_connecting;
     bool     art_supported;
@@ -433,6 +435,7 @@ static void pos_tick(void *arg)
 static void cover_reset(void)
 {
     cover_buffer_clear(&s_now.art);
+    s_now.art_stream=(cover_stream_t){0};
     s_now.art_busy = false; s_now.art_oversize = false;
 }
 
@@ -461,6 +464,7 @@ static void cover_fetch(void)
     }
     if (!s_now.art_handle[0] || s_now.art_done_generation == atomic_load(&s_cover_epoch)) return;
     s_now.art_busy = true;
+    s_now.art_streaming=(link_host_caps() & COVER_STREAM_CAP)!=0;
     s_now.art_generation = atomic_load(&s_cover_epoch);
     memcpy(s_now.art_request, s_now.art_handle, sizeof s_now.art_request);
     esp_err_t err = esp_avrc_ct_cover_art_get_linked_thumbnail((uint8_t *)s_now.art_request);
@@ -510,6 +514,14 @@ static void *cover_allocate(size_t bytes)
     return malloc(bytes);
 }
 
+static bool cover_emit(void *ctx, uint32_t offset, const uint8_t *data,
+                       size_t len, uint32_t crc)
+{
+    (void)ctx;
+    return s_now.art_generation==atomic_load(&s_cover_epoch) &&
+           link_try_cover_stream(s_cover_nonce,s_now.art_generation,offset,data,len,crc);
+}
+
 static void cover_on_data(const esp_avrc_ct_cb_param_t *param)
 {
     if (!s_now.art_busy) return;
@@ -519,6 +531,26 @@ static void cover_on_data(const esp_avrc_ct_cb_param_t *param)
     }
     bool stale = s_now.art_generation != atomic_load(&s_cover_epoch);
     size_t len = param->cover_art_data.data_len;
+    if (s_now.art_streaming) {
+        if (!stale && !s_now.art_stream.failed &&
+            !cover_stream_feed(&s_now.art_stream,param->cover_art_data.p_data,len,
+                               param->cover_art_data.final,cover_emit,NULL)) {
+            ESP_LOGW(TAG,"cover art: stream cancelled at %lu bytes (limit/queue/invalid JPEG)",
+                     (unsigned long)s_now.art_stream.used);
+        }
+        if (param->cover_art_data.final) {
+            if (!stale) {
+                ESP_LOGI(TAG,"cover art: streamed %lu bytes, generation %lu, %s, heap %u",
+                         (unsigned long)s_now.art_stream.used,(unsigned long)s_now.art_generation,
+                         s_now.art_stream.finished?"queued":"discarded",
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
+                s_now.art_done_generation=s_now.art_generation;
+            }
+            cover_reset();
+            if (stale) cover_fetch();
+        }
+        return;
+    }
     if (!stale && !s_now.art_oversize && len) {
         const size_t before = s_now.art.size;
         if (!cover_buffer_append(&s_now.art, param->cover_art_data.p_data, len,
