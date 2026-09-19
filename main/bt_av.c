@@ -1,4 +1,6 @@
 #include "bt_av.h"
+#include "cover_buffer.h"
+#include "esp_heap_caps.h"
 #include "satlink/cover_wire.h"
 
 #include <inttypes.h>
@@ -153,7 +155,7 @@ static atomic_bool s_cover_query;
 static atomic_uint s_cover_epoch;
 static atomic_bool s_cover_sending;
 static uint32_t s_cover_nonce;
-typedef struct { uint8_t *data; size_t len; uint32_t generation; } cover_job_t;
+typedef struct { cover_buffer_t image; uint32_t generation; } cover_job_t;
 static QueueHandle_t s_cover_queue;
 static atomic_uint s_latest_codec_epoch;
 static uint32_t s_codec_epoch;
@@ -189,8 +191,7 @@ static struct {
     bool     has_play_pos;          /* the phone will notify about position */
 
     char     art_handle[8];         /* seven characters and a terminator */
-    uint8_t *art;                   /* grown while a transfer runs, freed after */
-    size_t   art_len;
+    cover_buffer_t art;             /* ownership moves to the UART sender */
     bool     art_connected;
     bool     art_connecting;
     bool     art_supported;
@@ -431,7 +432,7 @@ static void pos_tick(void *arg)
 
 static void cover_reset(void)
 {
-    free(s_now.art); s_now.art = NULL; s_now.art_len = 0;
+    cover_buffer_clear(&s_now.art);
     s_now.art_busy = false; s_now.art_oversize = false;
 }
 
@@ -452,7 +453,7 @@ static void cover_fetch(void)
     // connect on remote features, then request metadata again on OBEX connected.
     if (!s_now.art_connected) {
         if (!s_now.art_connecting) {
-            const esp_err_t err = esp_avrc_ct_cover_art_connect(ESP_AVRC_CA_MTU_MAX);
+            const esp_err_t err = esp_avrc_ct_cover_art_connect(512);
             s_now.art_connecting = err == ESP_OK;
             if (err != ESP_OK) ESP_LOGW(TAG, "cover art: connect: %s", esp_err_to_name(err));
         }
@@ -477,7 +478,9 @@ static void cover_sender(void *arg)
     for (;;) {
         if (xQueueReceive(s_cover_queue, &job, portMAX_DELAY) != pdTRUE) continue;
         bool complete = true;
-        for (uint32_t off = 0; off < job.len; off += COVER_PART_MAX) {
+        uint32_t off = 0;
+        const size_t total = job.image.size;
+        while (job.image.head) {
             int waited = 0;
             while (link_bulk_pending() > LINK_BULK_COVER_HEADROOM && waited < 2000 &&
                    job.generation == atomic_load(&s_cover_epoch)) {
@@ -485,17 +488,26 @@ static void cover_sender(void *arg)
             }
             if (waited >= 2000 || job.generation != atomic_load(&s_cover_epoch) ||
                 !(link_host_caps() & SATLINK_HOST_CAP_COVER)) { complete = false; break; }
-            size_t len = job.len - off;
-            if (len > COVER_PART_MAX) len = COVER_PART_MAX;
-            link_send_cover_data(s_cover_nonce, job.generation, job.len, off, job.data+off, len);
+            cover_block_t *block = job.image.head;
+            link_send_cover_data(s_cover_nonce, job.generation, total, off, block->data, block->used);
+            off += block->used;
+            job.image.head = block->next;
+            free(block);
         }
-        ESP_LOGI(TAG, "cover art: %u bytes, generation %lu, %s", (unsigned)job.len,
+        ESP_LOGI(TAG, "cover art: %u bytes, generation %lu, %s", (unsigned)total,
                  (unsigned long)job.generation, complete ? "queued" : "cancelled");
-        free(job.data);
+        cover_buffer_clear(&job.image);
         atomic_store(&s_cover_sending, false);
         if (job.generation != atomic_load(&s_cover_epoch))
             esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS);
     }
+}
+
+// Software reserve for Bluetooth/control allocations; never consume the last heap.
+static void *cover_allocate(size_t bytes)
+{
+    if (heap_caps_get_free_size(MALLOC_CAP_8BIT) < bytes + 16 * 1024) return NULL;
+    return malloc(bytes);
 }
 
 static void cover_on_data(const esp_avrc_ct_cb_param_t *param)
@@ -508,27 +520,25 @@ static void cover_on_data(const esp_avrc_ct_cb_param_t *param)
     bool stale = s_now.art_generation != atomic_load(&s_cover_epoch);
     size_t len = param->cover_art_data.data_len;
     if (!stale && !s_now.art_oversize && len) {
-        if (len > BT_COVER_MAX_BYTES - s_now.art_len) s_now.art_oversize = true;
-        else {
-            uint8_t *grown = realloc(s_now.art, s_now.art_len + len);
-            if (!grown) s_now.art_oversize = true;
-            else {
-                memcpy(grown+s_now.art_len, param->cover_art_data.p_data, len);
-                s_now.art = grown; s_now.art_len += len;
-            }
-        }
-        if (s_now.art_oversize) {
-            ESP_LOGW(TAG, "cover art: thumbnail exceeds memory budget");
-            free(s_now.art); s_now.art=NULL; s_now.art_len=0;
+        const size_t before = s_now.art.size;
+        if (!cover_buffer_append(&s_now.art, param->cover_art_data.p_data, len,
+                                 BT_COVER_MAX_BYTES, cover_allocate)) {
+            ESP_LOGW(TAG, "cover art: dropped at %u+%u bytes (%s), free %u largest %u",
+                     (unsigned)before, (unsigned)len,
+                     len > BT_COVER_MAX_BYTES-before ? "size limit" : "heap reserve/allocation",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+            s_now.art_oversize = true;
+            cover_buffer_clear(&s_now.art);
         }
     }
     if (!param->cover_art_data.final) return;
-    if (!stale && !s_now.art_oversize && s_now.art_len >= 3 &&
-        s_now.art[0] == 0xff && s_now.art[1] == 0xd8 && s_now.art[2] == 0xff) {
-        cover_job_t job = {s_now.art, s_now.art_len, s_now.art_generation};
+    if (!stale && !s_now.art_oversize && s_now.art.size >= 3 &&
+        s_now.art.head->data[0] == 0xff && s_now.art.head->data[1] == 0xd8 && s_now.art.head->data[2] == 0xff) {
+        cover_job_t job = {s_now.art, s_now.art_generation};
         atomic_store(&s_cover_sending, true);
         if (xQueueSend(s_cover_queue, &job, 0) == pdTRUE) {
-            s_now.art = NULL;
+            s_now.art = (cover_buffer_t){0};
             s_now.art_done_generation = s_now.art_generation;
         }
         else atomic_store(&s_cover_sending, false);

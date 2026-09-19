@@ -89,5 +89,9 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $Python (Join-Path $repoRoot 'tools\run_hello_tests.py') --cc $Cc
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+# Cover buffering must survive fragmented heaps and cancel delayed OBEX pulls.
+& $Python (Join-Path $repoRoot 'tools\run_cover_tests.py') --cc $Cc
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 & $Python (Join-Path $repoRoot 'tools\run_lhdc_tests.py') --cc $Cc
 exit $LASTEXITCODE

@@ -1,0 +1,115 @@
+--- a/host/bluedroid/bta/av/bta_av_ca_act.c
++++ b/host/bluedroid/bta/av/bta_av_ca_act.c
+@@ -125,8 +125,45 @@
+     }
+ }
+ 
++/* Satellite policy: pull one small OBEX packet at a time. BTA alarms dispatch
++ * on BTU, so no Bluetooth callback/task sleeps while A2DP is running. */
++static TIMER_LIST_ENT cover_continue_timer[BTA_AV_NUM_RCB];
++static BOOLEAN cover_continue_pending[BTA_AV_NUM_RCB];
++static UINT16 cover_continue_handle[BTA_AV_NUM_RCB];
++
++static void cover_cancel_continue(tBTA_AV_RCB *p_rcb)
++{
++    UINT8 idx = get_rcb_idx(p_rcb);
++    cover_continue_pending[idx] = FALSE;
++    bta_sys_stop_timer(&cover_continue_timer[idx]);
++}
++
++static void cover_continue_cb(void *arg)
++{
++    TIMER_LIST_ENT *timer = (TIMER_LIST_ENT *)arg;
++    UINT32 idx = (UINT32)timer->param;
++    if (idx >= BTA_AV_NUM_RCB || !cover_continue_pending[idx]) return;
++    cover_continue_pending[idx] = FALSE;
++    tBTA_AV_RCB *p_rcb = &bta_av_cb.rcb[idx];
++    if (p_rcb->handle != BTA_AV_RC_HANDLE_NONE && p_rcb->cover_art_goep_hdl &&
++        p_rcb->cover_art_goep_hdl == cover_continue_handle[idx])
++        build_and_send_empty_get_req(p_rcb);
++}
++
++static void cover_schedule_continue(tBTA_AV_RCB *p_rcb)
++{
++    UINT8 idx = get_rcb_idx(p_rcb);
++    TIMER_LIST_ENT *timer = &cover_continue_timer[idx];
++    timer->p_cback = cover_continue_cb;
++    timer->param = idx;
++    cover_continue_handle[idx] = p_rcb->cover_art_goep_hdl;
++    cover_continue_pending[idx] = TRUE;
++    bta_sys_start_timer(timer, 0, 50);
++}
++
+ static void close_goepc_and_disconnect(tBTA_AV_RCB *p_rcb)
+ {
++    cover_cancel_continue(p_rcb);
+     if (p_rcb->cover_art_goep_hdl) {
+         GOEPC_Close(p_rcb->cover_art_goep_hdl);
+     }
+@@ -232,6 +269,7 @@
+ 
+ void bta_av_ca_api_open(tBTA_AV_RCB *p_rcb, tBTA_AV_DATA *p_data)
+ {
++    cover_cancel_continue(p_rcb);
+     tOBEX_SVR_INFO svr = {0};
+     svr.tl = OBEX_OVER_L2CAP;
+     svr.l2cap.psm = p_rcb->cover_art_l2cap_psm;
+@@ -261,12 +299,14 @@
+ 
+ void bta_av_ca_api_close(tBTA_AV_RCB *p_rcb, tBTA_AV_DATA *p_data)
+ {
++    cover_cancel_continue(p_rcb);
+     /* this is a normal disconnect, just build and send OBEX disconnect request */
+     build_and_send_disconnect_req(p_rcb);
+ }
+ 
+ void bta_av_ca_api_get(tBTA_AV_RCB *p_rcb, tBTA_AV_DATA *p_data)
+ {
++    cover_cancel_continue(p_rcb);
+     tOBEX_PARSE_INFO info = {0};
+     UINT8 image_handle_utf16[BTA_AV_CA_IMG_HDL_UTF16_LEN];
+     info.opcode = OBEX_OPCODE_GET_FINAL;
+@@ -300,8 +340,8 @@
+         GOEPC_RequestAddHeader(p_rcb->cover_art_goep_hdl, COVER_ART_HEADER_ID_IMG_DESCRIPTOR, (UINT8 *)p_data->api_ca_get.image_descriptor, p_data->api_ca_get.image_descriptor_len);
+         osi_free(p_data->api_ca_get.image_descriptor);
+     }
+-    /* always request to enable srm */
+-    GOEPC_RequestSetSRM(p_rcb->cover_art_goep_hdl, TRUE, FALSE);
++    /* SRM would let the server flood cover data alongside A2DP.
++     * Omit its header: GOEPC_RequestSetSRM(FALSE, FALSE) is invalid. */
+ 
+     if (GOEPC_SendRequest(p_rcb->cover_art_goep_hdl) != GOEP_SUCCESS) {
+         goto error;
+@@ -362,7 +402,7 @@
+ 
+         /* if SRM not enable, we need to send a empty get request */
+         if (!p_data->ca_response.srm_en || p_data->ca_response.srm_wait) {
+-            build_and_send_empty_get_req(p_rcb);
++            cover_schedule_continue(p_rcb);
+         }
+     }
+     else {
+@@ -377,6 +417,7 @@
+ 
+ void bta_av_ca_response_final(tBTA_AV_RCB *p_rcb, tBTA_AV_DATA *p_data)
+ {
++    cover_cancel_continue(p_rcb);
+     tOBEX_PARSE_INFO info;
+     if (OBEX_ParseResponse(p_data->ca_response.pkt, p_data->ca_response.opcode, &info) != OBEX_SUCCESS) {
+         osi_free(p_data->ca_response.pkt);
+@@ -493,6 +534,7 @@
+ 
+ void bta_av_ca_goep_disconnect(tBTA_AV_RCB *p_rcb, tBTA_AV_DATA *p_data)
+ {
++    cover_cancel_continue(p_rcb);
+     p_rcb->cover_art_goep_hdl = 0;
+     p_rcb->cover_art_max_rx = 0;
+     p_rcb->cover_art_max_tx = 0;
+@@ -506,6 +548,7 @@
+ 
+ void bta_av_ca_force_disconnect(tBTA_AV_RCB *p_rcb, tBTA_AV_DATA *p_data)
+ {
++    cover_cancel_continue(p_rcb);
+     if (p_rcb->cover_art_goep_hdl) {
+         GOEPC_Close(p_rcb->cover_art_goep_hdl);
+     }
