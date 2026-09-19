@@ -203,7 +203,10 @@ bool A2DP_InitCodecConfig(btav_a2dp_codec_index_t codec_index, UINT8 *p_result) 
     return true;
   }
 
-  LOG_ERROR("%s: unsupported codec index %u", __func__, codec_index);
+  /* The endpoint loop walks every index in the range and registers what it
+   * finds, so an index with no codec compiled in is the expected way for
+   * this to end, not a fault. aptX Low Latency is one such index here. */
+  LOG_DEBUG("%s: no codec at index %u, skipping", __func__, codec_index);
   return false;
 }
 

@@ -105,8 +105,8 @@ bool a2dp_aptx_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf, size_t b
     size_t processed = -1;
     while (src_size > 0 && processed) {
         /* Flush buffer via callback when nearly full to prevent overflow.
-         * aptX has ~8x expansion ratio, so a 700-byte packet can produce
-         * ~5.6KB of PCM. We flush in buffer-sized batches. */
+         * aptX is 4:1 on 16-bit samples, so a 700-byte packet produces about
+         * 2.8 KB of PCM. We flush in buffer-sized batches. */
         if (avail < 256) {
             size_t len = buf_len - avail;
             if (len > 0) {
@@ -117,7 +117,12 @@ bool a2dp_aptx_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf, size_t b
         }
 
         size_t written;
-        processed = aptx_decode32(decoder_context, src, (size_t)src_size, dst, (size_t)avail, &written);
+        /* decode16, not decode32: this device hands the host 16-bit slots and
+         * nothing else, which is what docs/DEVICE_SPEC.md fixes and what a
+         * counter on the pins measures (BCLK / WS is exactly 32). aptX HD
+         * carries 24-bit samples and is truncated here rather than widening
+         * the I2S bus for one codec. */
+        processed = aptx_decode16(decoder_context, src, (size_t)src_size, dst, (size_t)avail, &written);
 
         src += processed;
         src_size -= processed;

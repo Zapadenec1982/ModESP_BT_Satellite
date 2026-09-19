@@ -2,9 +2,9 @@
  * A2DP sink and AVRCP controller, and the bridge between what the phone does and
  * what the host is told about it.
  *
- * Stage 1 is SBC only: that is all stock Bluedroid can register as a stream
- * endpoint (btc_av_reg_sep rejects every other codec type). AAC and aptX arrive
- * with the patches in patches/ — see docs/BASE.md.
+ * SBC, AAC, aptX and aptX HD. Stock Bluedroid registers an SBC endpoint and
+ * nothing else; the rest arrive with patches/ and bt_overlay/ — see docs/BASE.md.
+ * Whichever the phone picks, the host is handed 16-bit slots.
  */
 
 #pragma once

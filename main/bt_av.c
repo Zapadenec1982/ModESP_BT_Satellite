@@ -20,6 +20,19 @@
 #include "freertos/task.h"
 #include "satlink/proto.h"
 
+/* What the stack will actually register stream endpoints for, so the startup line
+ * says what is true of this build rather than what was true of the first one. The
+ * two Kconfig options come from patches/0001; see docs/BASE.md. */
+#if defined(CONFIG_BT_A2DP_APTX_DECODER) && defined(CONFIG_BT_A2DP_AAC_DECODER)
+#define BT_AV_CODEC_LIST    ", SBC, AAC, aptX, aptX HD"
+#elif defined(CONFIG_BT_A2DP_APTX_DECODER)
+#define BT_AV_CODEC_LIST    ", SBC, aptX, aptX HD"
+#elif defined(CONFIG_BT_A2DP_AAC_DECODER)
+#define BT_AV_CODEC_LIST    ", SBC, AAC"
+#else
+#define BT_AV_CODEC_LIST    ", SBC"
+#endif
+
 static const char *TAG = "sat.bt";
 
 #define BT_TASK_STACK       3584
@@ -135,6 +148,64 @@ static uint32_t sbc_rate_hz(const esp_a2d_cie_sbc_t *sbc)
     if (sbc->samp_freq & ESP_A2D_SBC_CIE_SF_32K) { return 32000; }
     if (sbc->samp_freq & ESP_A2D_SBC_CIE_SF_16K) { return 16000; }
     return 0;
+}
+
+/*
+ * The rest of the codec information elements, read as raw bytes.
+ *
+ * `cie` holds the codec specific information element with the AVDTP header
+ * already removed, so byte 0 is the first codec byte. The bitfield structs in
+ * esp_a2dp_api.h only cover SBC and the MPEG family, and the vendor codecs have
+ * no struct at all, so these read the bytes directly. Layouts are from the A2DP
+ * codec specifications and match what the stack's own parsers do.
+ */
+
+/* MPEG-2/4 AAC: [0] object type, [1..2] a twelve bit frequency mask,
+ * [2] bits 3..2 channels, [3..5] bit rate. */
+static uint32_t aac_rate_hz(const uint8_t *cie)
+{
+    uint16_t f = (uint16_t)cie[1] | (uint16_t)((cie[2] << 8) & 0xF000);
+    if (f & 0x8000) { return 48000; }
+    if (f & 0x0001) { return 44100; }
+    if (f & 0x0002) { return 32000; }
+    if (f & 0x0004) { return 24000; }
+    if (f & 0x0008) { return 22050; }
+    if (f & 0x0010) { return 16000; }
+    return 0;
+}
+
+static uint8_t aac_channels(const uint8_t *cie)
+{
+    return (cie[2] & 0x0C) == 0x08 ? 1 : 2;     /* 0x08 mono, 0x04 stereo */
+}
+
+/* aptX and aptX HD: [0..3] vendor id and [4..5] codec id, both little endian,
+ * then [6] with the frequency in the high nibble and the channel mode in the
+ * low one. aptX HD adds four reserved bytes that carry nothing we need. */
+#define APTX_CIE_FREQ_CHAN      6
+
+static uint32_t aptx_vendor_id(const uint8_t *cie)
+{
+    return (uint32_t)cie[0] | ((uint32_t)cie[1] << 8) |
+           ((uint32_t)cie[2] << 16) | ((uint32_t)cie[3] << 24);
+}
+
+static uint16_t aptx_codec_id(const uint8_t *cie)
+{
+    return (uint16_t)cie[4] | (uint16_t)((uint16_t)cie[5] << 8);
+}
+
+static uint32_t aptx_rate_hz(const uint8_t *cie)
+{
+    uint8_t f = cie[APTX_CIE_FREQ_CHAN];
+    if (f & 0x10) { return 48000; }
+    if (f & 0x20) { return 44100; }
+    return 0;
+}
+
+static uint8_t aptx_channels(const uint8_t *cie)
+{
+    return (cie[APTX_CIE_FREQ_CHAN] & 0x01) ? 1 : 2;    /* 0x01 mono, 0x02 stereo */
 }
 
 void bt_av_report_state(void)
@@ -364,25 +435,64 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
 
     case ESP_A2D_AUDIO_CFG_EVT: {
         const esp_a2d_mcc_t *mcc = &p->audio_cfg.mcc;
-        if (mcc->type != ESP_A2D_MCT_SBC) {
-            /* Cannot happen on stock Bluedroid, which registers an SBC endpoint
-             * and nothing else. Worth a shout if it ever does. */
-            ESP_LOGE(TAG, "unexpected codec type %d", mcc->type);
+        const uint8_t *cie = (const uint8_t *)&mcc->cie;
+        uint32_t rate = 0;
+        uint8_t  channels = 2;
+
+        switch (mcc->type) {
+        case ESP_A2D_MCT_SBC:
+            rate = sbc_rate_hz(&mcc->cie.sbc_info);
+            s_now.codec = SATLINK_CODEC_SBC;
+            ESP_LOGI(TAG, "codec SBC, %" PRIu32 " Hz, bitpool %u..%u",
+                     rate, mcc->cie.sbc_info.min_bitpool, mcc->cie.sbc_info.max_bitpool);
+            break;
+
+        case ESP_A2D_MCT_M24:
+            rate = aac_rate_hz(cie);
+            channels = aac_channels(cie);
+            s_now.codec = SATLINK_CODEC_AAC;
+            ESP_LOGI(TAG, "codec AAC, %" PRIu32 " Hz, %u channel(s)", rate, channels);
+            break;
+
+        case ESP_A2D_MCT_NON_A2DP: {
+            uint32_t vendor = aptx_vendor_id(cie);
+            uint16_t codec  = aptx_codec_id(cie);
+            rate     = aptx_rate_hz(cie);
+            channels = aptx_channels(cie);
+
+            if (vendor == 0x0000004F && codec == 0x0001) {
+                s_now.codec = SATLINK_CODEC_APTX;
+                ESP_LOGI(TAG, "codec aptX, %" PRIu32 " Hz, %u channel(s)", rate, channels);
+            } else if (vendor == 0x000000D7 && codec == 0x0024) {
+                s_now.codec = SATLINK_CODEC_APTX_HD;
+                /* The decoder truncates aptX HD's 24-bit samples to 16: this
+                 * device hands the host 16-bit slots and only those. */
+                ESP_LOGI(TAG, "codec aptX HD, %" PRIu32 " Hz, %u channel(s), 24-bit truncated to 16",
+                         rate, channels);
+            } else {
+                ESP_LOGE(TAG, "vendor codec %08" PRIx32 ":%04x negotiated, which this "
+                              "build cannot name to the host", vendor, codec);
+                s_now.codec = SATLINK_CODEC_NONE;
+                rate = 0;
+            }
             break;
         }
-        uint32_t rate = sbc_rate_hz(&mcc->cie.sbc_info);
-        ESP_LOGI(TAG, "codec SBC, %" PRIu32 " Hz, bitpool %u..%u",
-                 rate, mcc->cie.sbc_info.min_bitpool, mcc->cie.sbc_info.max_bitpool);
 
-        s_now.codec = SATLINK_CODEC_SBC;
+        default:
+            /* An endpoint we never registered. Say so rather than stream noise. */
+            ESP_LOGE(TAG, "unexpected codec type %d", mcc->type);
+            s_now.codec = SATLINK_CODEC_NONE;
+            break;
+        }
+
         if (rate != 0) {
             audio_out_set_rate(rate);
-            /* Sixteen-bit slots and two channels, which is what the I2S master is
-             * actually configured for and what a counter on the pins measures:
-             * BCLK divided by WS is exactly 32. */
+            /* Sixteen-bit slots, whatever the codec: that is what the I2S master
+             * is configured for and what a counter on the pins measures, BCLK
+             * divided by WS being exactly 32. */
             s_now.rate_hz  = rate;
             s_now.bits     = 16;
-            s_now.channels = 2;
+            s_now.channels = channels;
             /* Before the first sample, which is the one hard promise this message
              * makes to the host. */
             bt_av_report_stream_fmt();
@@ -845,6 +955,7 @@ esp_err_t bt_av_start(const char *device_name)
     s_now.state = SATLINK_BT_DISCOVERABLE;
     bt_av_report_state();
 
-    ESP_LOGI(TAG, "\"%s\" is discoverable, A2DP sink + AVRCP controller, SBC", device_name);
+    ESP_LOGI(TAG, "\"%s\" is discoverable, A2DP sink + AVRCP controller%s",
+             device_name, BT_AV_CODEC_LIST);
     return ESP_OK;
 }
