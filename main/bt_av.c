@@ -486,6 +486,17 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
         }
 
         if (rate != 0) {
+            /* A tripwire, not a policy. The stream endpoints advertise 44.1 kHz
+             * and nothing else precisely so this cannot happen; if it ever fires,
+             * some endpoint's advertised capability and this promise have drifted
+             * apart, and the host is about to be handed a rate it cannot follow.
+             * That is inaudible in every counter this firmware keeps, so it has
+             * to be said out loud. */
+            if (rate != 44100 && (link_host_caps() & SATLINK_HOST_CAP_RELOCK) == 0) {
+                ESP_LOGE(TAG, "negotiated %" PRIu32 " Hz, but the host was promised 44.1 kHz "
+                              "and cannot relock: an endpoint is advertising a rate this "
+                              "device must not offer", rate);
+            }
             audio_out_set_rate(rate);
             /* Sixteen-bit slots, whatever the codec: that is what the I2S master
              * is configured for and what a counter on the pins measures, BCLK

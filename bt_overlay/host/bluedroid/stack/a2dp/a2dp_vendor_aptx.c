@@ -19,7 +19,7 @@
 static const tA2DP_APTX_CIE a2dp_aptx_source_caps = {
     A2DP_APTX_VENDOR_ID,                                       /* vendorId */
     A2DP_APTX_CODEC_ID_BLUETOOTH,                              /* codecId */
-    (A2DP_APTX_SAMPLERATE_44100 | A2DP_APTX_SAMPLERATE_48000), /* sampleRate */
+    A2DP_APTX_SAMPLERATE_44100,                                /* sampleRate */
     A2DP_APTX_CHANNELS_STEREO,                                 /* channelMode */
     A2DP_APTX_FUTURE_1,                                        /* future1 */
     A2DP_APTX_FUTURE_2,                                        /* future2 */
@@ -27,6 +27,16 @@ static const tA2DP_APTX_CIE a2dp_aptx_source_caps = {
 };
 
 /* aptX Sink codec capabilities */
+/* 44.1 kHz only, deliberately.
+ *
+ * docs/DEVICE_SPEC.md fixes the output at 44.1 kHz, and the host on the other end
+ * of the I2S bus locks its clock once and cannot follow a change mid-flight -- it
+ * says so in HELLO, by not setting SATLINK_HOST_CAP_RELOCK. Advertise 48 kHz here
+ * and a phone will take it: aptX HD picks 48 given the choice. The stream then
+ * plays at the wrong rate on the far side, which sounds like distortion with
+ * dropouts and looks like nothing at all in this firmware's own counters.
+ *
+ * When a host appears that can relock, this is where 48 kHz comes back. */
 static const tA2DP_APTX_CIE a2dp_aptx_sink_caps = {
     A2DP_APTX_VENDOR_ID,                                       /* vendorId */
     A2DP_APTX_CODEC_ID_BLUETOOTH,                              /* codecId */

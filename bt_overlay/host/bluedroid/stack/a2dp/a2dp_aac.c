@@ -41,13 +41,24 @@ static const tA2DP_AAC_CIE a2dp_aac_cbr_source_caps = {
     BTAV_A2DP_CODEC_BITS_PER_SAMPLE_16};
 
 /* AAC Sink codec capabilities */
+/* 44.1 kHz only, deliberately.
+ *
+ * docs/DEVICE_SPEC.md fixes the output at 44.1 kHz, and the host on the other end
+ * of the I2S bus locks its clock once and cannot follow a change mid-flight -- it
+ * says so in HELLO, by not setting SATLINK_HOST_CAP_RELOCK. Advertise 48 kHz here
+ * and a phone will take it: aptX HD picks 48 given the choice. The stream then
+ * plays at the wrong rate on the far side, which sounds like distortion with
+ * dropouts and looks like nothing at all in this firmware's own counters.
+ *
+ * When a host appears that can relock, this is where 48 kHz comes back. */
 static const tA2DP_AAC_CIE a2dp_aac_sink_caps = {
     // objectType
     A2DP_AAC_OBJECT_TYPE_MPEG2_LC | A2DP_AAC_OBJECT_TYPE_MPEG2_LC,
-    // sampleRate
-    A2DP_AAC_SAMPLING_FREQ_44100 | A2DP_AAC_SAMPLING_FREQ_48000,
-    // channelMode
-    A2DP_AAC_CHANNEL_MODE_MONO | A2DP_AAC_CHANNEL_MODE_STEREO,
+    // sampleRate -- see the note above
+    A2DP_AAC_SAMPLING_FREQ_44100,
+    // channelMode. Mono is not offered either: the I2S bus is two channels and
+    // the host is told so once, in STREAM_FMT.
+    A2DP_AAC_CHANNEL_MODE_STEREO,
     // variableBitRateSupport
     A2DP_AAC_VARIABLE_BIT_RATE_ENABLED,
     // bitRate
