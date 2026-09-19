@@ -1,0 +1,16 @@
+--- a/host/bluedroid/bta/av/bta_av_ssm.c
++++ b/host/bluedroid/bta/av/bta_av_ssm.c
+@@ -414,6 +414,13 @@
+     /* to Incoming state. Later, when STR_CONFIG_IND_EVT is coming, we     */
+     /* know if it is A2DP or VDP.                                          */
+     if ((p_scb->state == BTA_AV_INIT_SST) && (event == BTA_AV_STR_CONFIG_IND_EVT)) {
++        /* CONFIG_IND may have arrived while a preceding CLOSE was still queued.
++         * Its callback then saw OPEN and could not set force_incoming. Decide
++         * again here, after CLOSE has taken effect, so bta_av_config_ind notifies
++         * BTC to enter OPENING before codec configuration and OPEN/START events.
++         * This also covers the direct INIT -> INCOMING state-table path below.
++         */
++        p_scb->force_incoming = TRUE;
+         for (xx = 0; xx < BTA_AV_NUM_STRS; xx++) {
+             if (bta_av_cb.p_scb[xx]) {
+                 if (bta_av_cb.p_scb[xx]->state == BTA_AV_INCOMING_SST) {

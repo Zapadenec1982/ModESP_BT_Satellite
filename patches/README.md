@@ -1,18 +1,19 @@
-# Патчі Bluetooth-стека
+# Bluetooth stack patches
 
-Порожньо, і поки це нормально: стоковий Bluedroid уміє A2DP sink на SBC, і етап 1
-будується без жодного патча.
+Apply in filename order to the exact ESP-IDF component pinned in `idf.pin`,
+then copy `bt_overlay/`. `tools/setup.ps1 -Clean` reproduces the local ignored
+`components/bt`; never patch the shared IDF or rely on edits to generated files.
 
-Сюди лягає дельта для AAC, aptX і aptX HD — витягнута з
-`WillyBilly06/ESP32-A2DP-SINK-WITH-CODECS-UPDATED` проти стокового `components/bt`
-і розкладена **по одному diff на логічну зміну**, а не одним шматком на 2000 рядків.
+- `0001-a2dp-multi-codec-framework.patch`: codec framework, SBC/AAC/aptX/aptX HD
+  integration and project adaptations. See `docs/BASE.md` for provenance/exclusions.
+- `0002-notify-btc-on-queued-stream-reopen.patch`: complete the existing incoming
+  configuration notification when CONFIG is dispatched from INIT after a queued
+  CLOSE. This prevents BTC remaining IDLE during a peer codec switch.
 
-Правила:
+Patch paths are relative to `components/bt`; setup uses
+`git apply --directory=components/bt` and stops on a rejected hunk.
 
-- Diff проти дерева, прибитого в `idf.pin`. Проти іншого вони не застосовуються.
-- Шляхи всередині патча — відносно `components/bt`, бо `tools/setup.ps1` накладає їх
-  через `git apply --directory=components/bt`.
-- Порядок накладання — за іменем файлу. Тому нумерувати: `0001-…`, `0002-…`.
-- `components/bt` руками не правити ніколи. Правиться патч, далі `setup.ps1 -Clean`.
-
-Чому не ціле дерево IDF і чим це коштує при підйомі версії — `docs/BASE.md`.
+Run `tools/run_host_tests.ps1` after setup. It includes the production-source BTA
+reopen replay via `tools/run_bta_reopen_tests.py`. Use its `--bt-root` option with
+the pinned stock component to reproduce the regression before patch 0002.
+Tests stub transport/codec actions; a passing replay is not a phone/bench result.
