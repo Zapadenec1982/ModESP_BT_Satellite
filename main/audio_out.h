@@ -37,6 +37,11 @@ esp_err_t audio_out_set_rate(uint32_t rate_hz);
 esp_err_t audio_out_set_slot_bits(uint8_t bits);
 uint8_t   audio_out_slot_bits(void);
 
+/* What the master clock is actually producing. Needed to announce the format
+ * before changing it, which is what PROTOCOL.md 1.2 requires and what this
+ * firmware failed to do when it switched slot width at startup. */
+uint32_t  audio_out_rate_hz(void);
+
 /*
  * What the decoder is about to start handing to audio_out_write(): 16-bit
  * samples, or 32-bit ones carrying 24 significant bits in the top.

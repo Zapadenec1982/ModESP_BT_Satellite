@@ -66,6 +66,12 @@ static const char        *s_codec_name = "?";
  * state with anything else, and it runs on the Bluetooth task where neither a
  * lock nor a surprise is welcome.
  */
+static volatile uint32_t  s_partial_frames;   /* ring handed back a part frame */
+/* Bytes of an unfinished frame, carried to the front of the next write. Never
+ * more than one frame less one byte, so eight bytes is the whole of it. */
+static uint8_t            s_carry[8];
+static size_t             s_carry_len;
+
 static uint32_t s_dither_state = 0x2545F491u;
 
 static inline uint32_t audio_xorshift32(void)
@@ -128,12 +134,25 @@ static void audio_report(void)
                      : 0u;
 
     ESP_LOGI(TAG, "%s %" PRIu32 " Hz %u-bit slots: ring %u..%u of %u (%u ms), underruns %" PRIu32
-                  ", dropped %" PRIu32 ", peak %" PRIu32 "/32768 (%u.%u%%), free dma %u",
+                  ", dropped %" PRIu32 ", peak %" PRIu32 "/32768 (%u.%u%%), part %" PRIu32
+                  ", free dma %u",
              s_codec_name, s_rate_hz, s_slot_bits,
              (unsigned)st.fill_min, (unsigned)st.fill_max, (unsigned)AUDIO_RING_BYTES, fill_ms,
              st.underruns, st.dropped_bytes, st.peak,
-             peak_permille / 10, peak_permille % 10,
+             peak_permille / 10, peak_permille % 10, s_partial_frames,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
+}
+
+static void i2s_write_locked(const void *data, size_t len)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    size_t written = 0;
+    esp_err_t err = i2s_channel_write(s_tx, data, len, &written, pdMS_TO_TICKS(AUDIO_WRITE_TIMEOUT_MS));
+    xSemaphoreGive(s_lock);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "write failed: %s (%u of %u bytes)", esp_err_to_name(err),
+                 (unsigned)written, (unsigned)len);
+    }
 }
 
 static void audio_out_task(void *arg)
@@ -156,7 +175,43 @@ static void audio_out_task(void *arg)
         }
 
         /* Peak is measured in audio_out_write(), where the sample width is known.
-         * By here the ring holds wire format and this task just moves bytes. */
+         * By here the ring holds wire format and this task just moves bytes.
+         *
+         * Whole frames only. The ring is a byte buffer and hands back whatever is
+         * contiguous, which need not end on a frame boundary; writing a partial
+         * frame shifts every sample after it by a byte or two and the channels
+         * never line up again. At 16-bit slots that is a swapped pair, audible but
+         * self-correcting. At 32-bit slots it is noise that stays. The leftover
+         * goes back to the front of the next write rather than to the bin. */
+        const size_t frame = (size_t)(s_slot_bits / 8) * 2u;
+        size_t off = 0;
+
+        /* Finish the frame left over from last time, if there is one. */
+        if (s_carry_len != 0) {
+            size_t need = frame - s_carry_len;
+            if (len >= need) {
+                memcpy(s_carry + s_carry_len, item, need);
+                i2s_write_locked(s_carry, frame);
+                s_carry_len = 0;
+                off = need;
+            } else {
+                memcpy(s_carry + s_carry_len, item, len);
+                s_carry_len += len;
+                off = len;
+            }
+        }
+
+        size_t avail = len - off;
+        size_t whole = avail - (avail % frame);
+        size_t rem   = avail - whole;
+        if (rem != 0) {
+            /* Keep the tail for the next pass. Dropping it would shift every
+             * sample after it, which is the whole point of this exercise. */
+            memcpy(s_carry, (const uint8_t *)item + off + whole, rem);
+            s_carry_len = rem;
+            s_partial_frames++;
+        }
+        len = whole;
 
         /* Sampled after the read, so it is what was left behind. */
         size_t free_bytes = xRingbufferGetCurFreeSize(s_ring);
@@ -164,14 +219,8 @@ static void audio_out_task(void *arg)
         if (fill < s_fill_min) { s_fill_min = fill; }
         if (fill > s_fill_max) { s_fill_max = fill; }
 
-        xSemaphoreTake(s_lock, portMAX_DELAY);
-        size_t written = 0;
-        esp_err_t err = i2s_channel_write(s_tx, item, len, &written, pdMS_TO_TICKS(AUDIO_WRITE_TIMEOUT_MS));
-        xSemaphoreGive(s_lock);
-
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "write failed: %s (%u of %u bytes)", esp_err_to_name(err),
-                     (unsigned)written, (unsigned)len);
+        if (len != 0) {
+            i2s_write_locked(item + off, len);
         }
         vRingbufferReturnItem(s_ring, item);
     }
@@ -282,7 +331,7 @@ void audio_out_write(const uint8_t *pcm, size_t len)
         const int32_t *src = (const int32_t *)(const void *)pcm;
         size_t n = len / sizeof(int32_t);
         int16_t conv[AUDIO_CONV_BYTES / sizeof(int16_t)];
-        const size_t batch = sizeof(conv) / sizeof(conv[0]);
+        const size_t batch = (sizeof(conv) / sizeof(conv[0])) & ~(size_t)1;
         for (size_t i = 0; i < n; i += batch) {
             size_t take = (n - i < batch) ? (n - i) : batch;
             for (size_t j = 0; j < take; j++) {
@@ -297,7 +346,9 @@ void audio_out_write(const uint8_t *pcm, size_t len)
         const int16_t *src = (const int16_t *)(const void *)pcm;
         size_t n = len / sizeof(int16_t);
         int32_t conv[AUDIO_CONV_BYTES / sizeof(int32_t)];
-        const size_t batch = sizeof(conv) / sizeof(conv[0]);
+        /* Even, so a batch is always a whole number of stereo frames: an odd one
+         * would hand the writer half a frame and shift everything after it. */
+        const size_t batch = (sizeof(conv) / sizeof(conv[0])) & ~(size_t)1;
         for (size_t i = 0; i < n; i += batch) {
             size_t take = (n - i < batch) ? (n - i) : batch;
             for (size_t j = 0; j < take; j++) {
@@ -397,6 +448,11 @@ uint8_t audio_out_slot_bits(void)
     return s_slot_bits;
 }
 
+uint32_t audio_out_rate_hz(void)
+{
+    return s_rate_hz;
+}
+
 void audio_out_set_source_bits(uint8_t bits)
 {
     if (bits != 16 && bits != 32) {
@@ -421,6 +477,8 @@ void audio_out_flush(void)
     while ((item = xRingbufferReceiveUpTo(s_ring, &len, 0, AUDIO_CHUNK_BYTES)) != NULL) {
         vRingbufferReturnItem(s_ring, item);
     }
+    /* And the half frame held back from the old format, which belongs to it. */
+    s_carry_len = 0;
 }
 
 void audio_out_set_codec_name(const char *name)

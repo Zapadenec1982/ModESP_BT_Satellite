@@ -650,6 +650,21 @@ static int log_bridge(const char *fmt, va_list args)
 /* ------------------------------------------------------------------- startup */
 
 bool link_host_present(void) { return s_host_present; }
+bool link_wait_for_host(uint32_t timeout_ms)
+{
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (!s_host_present && !s_peer_incompatible) {
+        if ((int32_t)(xTaskGetTickCount() - deadline) >= 0) {
+            ESP_LOGW(TAG, "no host greeting in %" PRIu32 " ms; coming up with the "
+                          "conservative answer to everything it would have told us",
+                     timeout_ms);
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return true;
+}
+
 uint32_t link_host_caps(void) { return s_host_caps; }
 
 void link_get_stats(link_stats_t *out)

@@ -1044,13 +1044,37 @@ esp_err_t bt_av_start(const char *device_name)
      * way round to be wrong: 44.1 kHz in 16-bit slots is what every host can take,
      * and a host that wanted more will get it after the next restart.
      */
+    /* Wait for the greeting before reading it. Everything below is decided once
+     * and never revisited, so reading capabilities that have not arrived yet does
+     * not degrade gracefully -- it silently picks the wrong answer for the whole
+     * session. Half a second is generous: on this bench the host answers in
+     * twenty milliseconds, and a host that is not there does not become there. */
+    link_wait_for_host(500);
     uint32_t host_caps = link_host_caps();
 
     A2DP_SinkAllow48kHz((host_caps & SATLINK_HOST_CAP_RELOCK) != 0);
     A2DP_SinkOfferAptxHd(BT_AV_OFFER_APTX_HD);
     A2DP_SinkOfferAptx(BT_AV_OFFER_APTX);
     A2DP_SinkOfferAac(BT_AV_OFFER_AAC);
+
     if (host_caps & SATLINK_HOST_CAP_WIDE) {
+        /*
+         * Announce, then be quiet, then widen. PROTOCOL.md 1.2 asks for exactly
+         * this and it asks because of this: the previous build widened the slots
+         * here, at startup, with no A2DP connection in sight and therefore no
+         * STREAM_FMT to trigger. BCLK went from 32 clocks a frame to 64 while the
+         * host was still reading 16-bit words, and the speakers made noise.
+         *
+         * There is no negotiated rate yet, so what is announced is what the clock
+         * is actually doing: the I2S default, in the width it is about to take.
+         * That is not a guess, it is a description.
+         */
+        s_now.rate_hz  = audio_out_rate_hz();
+        s_now.bits     = 32;
+        s_now.channels = 2;
+        bt_av_report_stream_fmt();
+        vTaskDelay(pdMS_TO_TICKS(BT_AV_FMT_SILENCE_MS));
+
         audio_out_set_slot_bits(32);
     }
     ESP_LOGI(TAG, "endpoints: SBC%s%s%s, %s, %u-bit slots",

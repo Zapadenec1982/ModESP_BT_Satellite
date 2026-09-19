@@ -41,6 +41,17 @@ static void on_hello(const satlink_hello_t *hello)
      * telemetry. A limit rather than a one-shot because a host that restarts
      * greets us again and has every right to be told everything a second time.
      */
+    /*
+     * The format goes out on every greeting, rate limit or not.
+     *
+     * PROTOCOL.md 1.2 lets the host refuse to play until it has been told the
+     * format, which is the right thing for it to do -- a guessed slot width is
+     * noise, not silence, and nobody can tell it from a bad codec by ear. A host
+     * that restarts must not then wait ten seconds to learn it. The message is six
+     * bytes; the state dump behind it is not, and that keeps its limit.
+     */
+    bt_av_report_stream_fmt();
+
     static int64_t next_announce_us;
     int64_t now = esp_timer_get_time();
     if (now < next_announce_us) {
@@ -49,7 +60,6 @@ static void on_hello(const satlink_hello_t *hello)
     next_announce_us = now + (10 * 1000 * 1000);
 
     bt_av_report_state();
-    bt_av_report_stream_fmt();
 #endif
 }
 

@@ -10,7 +10,9 @@
 #include <stdint.h>
 
 #define SATLINK_PROTO_MAJOR   1
-#define SATLINK_PROTO_MINOR   0
+/* 1.2: STREAM_FMT before any format change, not only at the start of a
+ * connection; repeated in answer to HELLO; forgotten on disconnect. */
+#define SATLINK_PROTO_MINOR   2
 
 /* The largest decoded frame: type | seq | payload | crc16. */
 #define SATLINK_FRAME_MAX     1040

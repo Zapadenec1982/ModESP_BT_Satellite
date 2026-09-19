@@ -40,6 +40,20 @@ bool link_host_present(void);
  * never move. */
 uint32_t link_host_caps(void);
 
+/*
+ * Blocks until the host has greeted us, or the timeout runs out.
+ *
+ * Capabilities decide things that are fixed once and cannot be revisited: which
+ * sample rates the stream endpoints advertise, and how wide the I2S slots are.
+ * Reading them at whatever moment startup happens to reach is a race, and it was
+ * one -- two boots of the same build, one at 32-bit slots and 48 kHz on offer,
+ * the other at 16 and 44.1, decided by whether HELLO had arrived yet.
+ *
+ * Returns true if a greeting arrived. False is not a failure: a device with no
+ * host still has to come up, and it comes up conservative.
+ */
+bool link_wait_for_host(uint32_t timeout_ms);
+
 /* Device to host. All non-blocking; all safe to call before a host exists. */
 void link_send_bt_state(uint8_t state, uint8_t codec, const uint8_t addr[6], const char *name);
 void link_send_track_meta(const char *title, const char *artist, const char *album);
