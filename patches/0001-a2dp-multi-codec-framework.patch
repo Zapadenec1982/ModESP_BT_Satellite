@@ -2988,7 +2988,7 @@
  /*******************************************************************************
 --- a/host/bluedroid/stack/a2dp/a2d_sbc.c
 +++ b/host/bluedroid/stack/a2dp/a2d_sbc.c
-@@ -29,10 +29,77 @@
+@@ -29,10 +29,80 @@
  #include "stack/a2d_api.h"
  #include "a2d_int.h"
  #include "stack/a2d_sbc.h"
@@ -3008,7 +3008,10 @@
 +/* SBC SRC codec capabilities */
 +const tA2D_SBC_CIE a2dp_sbc_src_caps = {
 +    (A2D_SBC_IE_SAMP_FREQ_44), /* samp_freq */
-+    (A2D_SBC_IE_CH_MD_MONO | A2D_SBC_IE_CH_MD_STEREO | A2D_SBC_IE_CH_MD_JOINT | A2D_SBC_IE_CH_MD_DUAL), /* ch_mode */
++    /* Stereo and joint stereo only. The I2S bus is two channels and STREAM_FMT
++     * tells the host so; mono and dual channel would decode to something else
++     * and be announced as stereo anyway. No phone chooses them. */
++    (A2D_SBC_IE_CH_MD_STEREO | A2D_SBC_IE_CH_MD_JOINT), /* ch_mode */
 +    (A2D_SBC_IE_BLOCKS_16 | A2D_SBC_IE_BLOCKS_12 | A2D_SBC_IE_BLOCKS_8 | A2D_SBC_IE_BLOCKS_4), /* block_len */
 +    (A2D_SBC_IE_SUBBAND_4 | A2D_SBC_IE_SUBBAND_8), /* num_subbands */
 +    (A2D_SBC_IE_ALLOC_MD_L | A2D_SBC_IE_ALLOC_MD_S), /* alloc_mthd */
@@ -3066,7 +3069,7 @@
  /******************************************************************************
  **
  ** Function         A2D_BldSbcInfo
-@@ -222,4 +289,237 @@
+@@ -222,4 +292,237 @@
      }
  }
  
