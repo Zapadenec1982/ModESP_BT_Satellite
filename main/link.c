@@ -426,7 +426,10 @@ static void handle_hello(const uint8_t *payload, size_t len)
 
     s_peer_incompatible = false;
     s_host_present = true;
-    __atomic_store_n(&s_host_caps, fmt_ack_capable(h.minor, h.caps) ? h.caps : (h.caps & ~FMT_HOST_CAP), __ATOMIC_SEQ_CST);
+    uint32_t caps = fmt_ack_capable(h.minor, h.caps) ? h.caps : (h.caps & ~FMT_HOST_CAP);
+    if (h.minor < 4 || !(caps & FMT_HOST_CAP) || !(caps & SATLINK_HOST_CAP_RELOCK))
+        caps &= ~SATLINK_HOST_CAP_96KHZ;
+    __atomic_store_n(&s_host_caps, caps, __ATOMIC_SEQ_CST);
     ESP_LOGI(TAG, "host %u.%u, caps 0x%08" PRIx32 ", build \"%.*s\"",
              h.major, h.minor, h.caps, (int)h.build.len, h.build.ptr);
 

@@ -26,6 +26,7 @@
 #include "stack/a2dp_vendor.h"
 #include "stack/a2dp_vendor_aptx.h"
 #include "stack/a2dp_vendor_aptx_hd.h"
+#include "stack/a2dp_vendor_lhdcv5.h"
 
 tA2D_STATUS A2DP_VendorParseInfo(uint8_t* p_ie, const uint8_t* p_codec_info,
                                  bool is_capability) {
@@ -44,6 +45,12 @@ tA2D_STATUS A2DP_VendorParseInfo(uint8_t* p_ie, const uint8_t* p_codec_info,
     return A2DP_ParseInfoAptxHd((tA2DP_APTX_HD_CIE*)p_ie, p_codec_info, is_capability);
   }
 #endif /* defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE) */
+#if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
+  if (vendor_id == A2DP_LHDCV5_VENDOR_ID && codec_id == A2DP_LHDCV5_CODEC_ID) {
+    return A2DP_ParseInfoLhdcV5((tA2DP_LHDCV5_CIE*)p_ie, p_codec_info, is_capability);
+  }
+#endif
+
 
 
 
@@ -71,6 +78,12 @@ bool A2DP_IsVendorPeerSinkCodecValid(const uint8_t* p_codec_info) {
     return A2DP_IsVendorPeerSinkCodecValidAptxHd(p_codec_info);
   }
 #endif /* defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE) */
+#if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
+  if (vendor_id == A2DP_LHDCV5_VENDOR_ID && codec_id == A2DP_LHDCV5_CODEC_ID) {
+    return A2DP_IsVendorPeerSinkCodecValidLhdcV5(p_codec_info);
+  }
+#endif
+
 
 
 
@@ -111,6 +124,12 @@ tA2D_STATUS A2DP_IsVendorPeerSourceCodecSupported(const uint8_t* p_codec_info) {
     return A2DP_IsVendorPeerSourceCodecValidAptxHd(p_codec_info);
   }
 #endif /* defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE) */
+#if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
+  if (vendor_id == A2DP_LHDCV5_VENDOR_ID && codec_id == A2DP_LHDCV5_CODEC_ID) {
+    return A2DP_IsVendorPeerSourceCodecSupportedLhdcV5(p_codec_info);
+  }
+#endif
+
 
 
 
@@ -159,6 +178,12 @@ btav_a2dp_codec_index_t A2DP_VendorSinkCodecIndex(
     return A2DP_VendorSinkCodecIndexAptxHd(p_codec_info);
   }
 #endif /* defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE) */
+#if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
+  if (vendor_id == A2DP_LHDCV5_VENDOR_ID && codec_id == A2DP_LHDCV5_CODEC_ID) {
+    return A2DP_VendorSinkCodecIndexLhdcV5(p_codec_info);
+  }
+#endif
+
 
 
 
@@ -187,6 +212,12 @@ btav_a2dp_codec_index_t A2DP_VendorSourceCodecIndex(
     return A2DP_VendorSourceCodecIndexAptxHd(p_codec_info);
   }
 #endif /* defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE) */
+#if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
+  if (vendor_id == A2DP_LHDCV5_VENDOR_ID && codec_id == A2DP_LHDCV5_CODEC_ID) {
+    return A2DP_VendorSourceCodecIndexLhdcV5(p_codec_info);
+  }
+#endif
+
 
 
 
@@ -210,6 +241,10 @@ bool A2DP_VendorInitCodecConfig(btav_a2dp_codec_index_t codec_index, UINT8 *p_re
     return true;
   }
 #endif /* defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE) */
+#if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
+  if (A2DP_VendorInitCodecConfigLhdcV5(codec_index, p_result)) return true;
+#endif
+
 
 
 
@@ -237,6 +272,12 @@ bool A2DP_VendorBuildCodecConfig(UINT8 *p_src_cap, UINT8 *p_result) {
     return A2DP_VendorBuildCodecConfigAptxHd(p_src_cap, p_result);
   }
 #endif /* defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE) */
+#if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
+  if (vendor_id == A2DP_LHDCV5_VENDOR_ID && codec_id == A2DP_LHDCV5_CODEC_ID) {
+    return A2DP_VendorBuildCodecConfigLhdcV5(p_src_cap, p_result);
+  }
+#endif
+
 
 
 
@@ -264,6 +305,12 @@ const char* A2DP_VendorCodecName(const uint8_t* p_codec_info) {
     return A2DP_VendorCodecNameAptxHd(p_codec_info);
   }
 #endif /* defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE) */
+#if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
+  if (vendor_id == A2DP_LHDCV5_VENDOR_ID && codec_id == A2DP_LHDCV5_CODEC_ID) {
+    return A2DP_VendorCodecNameLhdcV5(p_codec_info);
+  }
+#endif
+
 
 
 
@@ -304,6 +351,12 @@ bool A2DP_VendorCodecTypeEquals(const uint8_t* p_codec_info_a,
     return A2DP_VendorCodecTypeEqualsAptxHd(p_codec_info_a, p_codec_info_b);
   }
 #endif /* defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE) */
+#if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
+  if (vendor_id_a == A2DP_LHDCV5_VENDOR_ID && codec_id_a == A2DP_LHDCV5_CODEC_ID) {
+    return A2DP_VendorCodecTypeEqualsLhdcV5(p_codec_info_a, p_codec_info_b);
+  }
+#endif
+
 
 
 
@@ -333,6 +386,12 @@ const tA2DP_DECODER_INTERFACE* A2DP_GetVendorDecoderInterface(
     return A2DP_GetVendorDecoderInterfaceAptxHd(p_codec_info);
   }
 #endif /* defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE) */
+#if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
+  if (vendor_id == A2DP_LHDCV5_VENDOR_ID && codec_id == A2DP_LHDCV5_CODEC_ID) {
+    return A2DP_GetVendorDecoderInterfaceLhdcV5(p_codec_info);
+  }
+#endif
+
 
 
 

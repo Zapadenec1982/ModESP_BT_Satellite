@@ -87,4 +87,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # A live PING/PONG link must recover a dropped startup capability greeting.
 & $Python (Join-Path $repoRoot 'tools\run_hello_tests.py') --cc $Cc
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+& $Python (Join-Path $repoRoot 'tools\run_lhdc_tests.py') --cc $Cc
 exit $LASTEXITCODE

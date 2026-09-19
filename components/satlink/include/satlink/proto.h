@@ -13,7 +13,7 @@
 #define SATLINK_PROTO_MAJOR   1
 /* 1.3: optional correlated STREAM_PREPARE / STREAM_READY transitions.
  * Legacy STREAM_FMT layouts remain unchanged. */
-#define SATLINK_PROTO_MINOR   3
+#define SATLINK_PROTO_MINOR   4
 
 /* The largest decoded frame: type | seq | payload | crc16. */
 #define SATLINK_FRAME_MAX     1040
@@ -59,6 +59,7 @@ typedef enum {
 
 /* HELLO capability bits, host side. */
 #define SATLINK_HOST_CAP_RELOCK   (1u << 0)  /* can follow STREAM_FMT mid-flight */
+#define SATLINK_HOST_CAP_96KHZ    (1u << 5)  /* protocol 1.4; requires RELOCK + FORMAT_READY */
 #define SATLINK_HOST_CAP_COVER    (1u << 1)
 #define SATLINK_HOST_CAP_EXPANDER (1u << 2)
 #define SATLINK_HOST_CAP_WIDE     (1u << 3)  /* can take 32-bit slots; STREAM_FMT.bits says which */
@@ -80,6 +81,7 @@ typedef enum {
     SATLINK_CODEC_AAC     = 2,
     SATLINK_CODEC_APTX    = 3,
     SATLINK_CODEC_APTX_HD = 4,
+    SATLINK_CODEC_LHDC_V5 = 5,
 } satlink_codec_t;
 
 /* TRACK_POS.state */

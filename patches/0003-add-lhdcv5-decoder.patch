@@ -1,0 +1,93 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -70,6 +70,7 @@
+ endif()
+ 
+ set(bt_priv_requires
++    lhdcv5_decoder
+     nvs_flash
+     soc
+     esp_pm
+--- a/Kconfig
++++ b/Kconfig
+@@ -82,6 +82,13 @@
+                 with libfreeaptx. The wrapper is public domain or CC0; the decoder
+                 core is LGPL-2.1.
+ 
++        config BT_A2DP_LHDCV5_DECODER
++            bool "LHDC V5 (44.1/48/96 kHz)"
++            default n
++            help
++                Apache-2.0 decoder pinned in components/lhdcv5_decoder.
++                96 kHz requires an acknowledged, capable satellite host.
++
+         config BT_A2DP_AAC_DECODER
+             bool "AAC-LC"
+             default n
+--- a/host/bluedroid/CMakeLists.txt
++++ b/host/bluedroid/CMakeLists.txt
+@@ -454,6 +454,12 @@
+         "${CMAKE_CURRENT_LIST_DIR}/stack/a2dp/a2dp_aac_decoder_custom.c")
+ endif()
+ 
++if(CONFIG_BT_A2DP_LHDCV5_DECODER)
++    list(APPEND bluedroid_host_srcs
++        "${CMAKE_CURRENT_LIST_DIR}/stack/a2dp/a2dp_vendor_lhdcv5.c"
++        "${CMAKE_CURRENT_LIST_DIR}/stack/a2dp/a2dp_vendor_lhdcv5_decoder.c")
++endif()
++
+ # Export the variables to the parent scope
+ set(bluedroid_host_srcs "${bluedroid_host_srcs}" PARENT_SCOPE)
+ set(bluedroid_host_include_dirs "${bluedroid_host_include_dirs}" PARENT_SCOPE)
+--- a/host/bluedroid/common/include/common/bt_target.h
++++ b/host/bluedroid/common/include/common/bt_target.h
+@@ -98,6 +98,9 @@
+ #if (UC_BT_A2DP_AAC_DECODER_ENABLED == TRUE)
+ #define AAC_DEC_INCLUDED           TRUE
+ #endif /* (UC_BT_A2DP_AAC_DECODER_ENABLED == TRUE) */
++#ifdef CONFIG_BT_A2DP_LHDCV5_DECODER
++#define LHDCV5_DEC_INCLUDED         TRUE
++#endif
+ #define BTC_AV_SRC_INCLUDED         TRUE
+ #if (UC_BT_A2DP_USE_EXTERNAL_CODEC == TRUE)
+ #define BTC_AV_EXT_CODEC            TRUE
+@@ -2306,7 +2309,13 @@
+ #  define AVDT_AAC_SEPS	(0)
+ # endif /* CONFIG_BT_A2DP_AAC_DECODER */
+ 
+-#define AVDT_NUM_SEPS      (3 \
++#ifdef CONFIG_BT_A2DP_LHDCV5_DECODER
++#define AVDT_LHDCV5_SEPS (1)
++#else
++#define AVDT_LHDCV5_SEPS (0)
++#endif
++
++#define AVDT_NUM_SEPS      (3 + AVDT_LHDCV5_SEPS \
+ 							+ AVDT_APTX_SEPS \
+ 							+ AVDT_AAC_SEPS \
+ 							)
+--- a/host/bluedroid/btc/profile/std/a2dp/bta_av_co.c
++++ b/host/bluedroid/btc/profile/std/a2dp/bta_av_co.c
+@@ -27,6 +27,8 @@
+ #include "stack/a2d_api.h"
+ #include "stack/a2d_sbc.h"
+ #include "stack/a2dp_codec_api.h"
++#include "stack/a2dp_vendor.h"
++#include "stack/a2dp_vendor_lhdcv5.h"
+ #include "bta/bta_sys.h"
+ #include "bta/bta_av_api.h"
+ #include "bta/bta_av_co.h"
+@@ -655,6 +657,13 @@
+     if (status == A2D_SUCCESS) {
+         if (AVDT_TSEP_SNK == t_local_sep) {
+             codec_cfg_status = A2DP_IsPeerSourceCodecSupported(p_codec_info);
++#if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
++            /* Discovery accepts masks; SET_CONFIGURATION must select one format. */
++            if (A2DP_GetCodecType(p_codec_info) == A2D_MEDIA_CT_NON_A2DP &&
++                A2DP_VendorCodecGetVendorId(p_codec_info) == A2DP_LHDCV5_VENDOR_ID &&
++                A2DP_VendorCodecGetCodecId(p_codec_info) == A2DP_LHDCV5_CODEC_ID)
++                codec_cfg_status = A2DP_IsVendorPeerSourceCodecValidLhdcV5(p_codec_info);
++#endif
+             APPL_TRACE_DEBUG(" Peer is  A2DP SRC ");
+         }
+         if (AVDT_TSEP_SRC == t_local_sep) {

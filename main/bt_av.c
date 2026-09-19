@@ -26,13 +26,13 @@
  * says what is true of this build rather than what was true of the first one. The
  * two Kconfig options come from patches/0001; see docs/BASE.md. */
 #if defined(CONFIG_BT_A2DP_APTX_DECODER) && defined(CONFIG_BT_A2DP_AAC_DECODER)
-#define BT_AV_CODEC_LIST    ", SBC, AAC, aptX, aptX HD"
+#define BT_AV_BASE_CODEC_LIST    ", SBC, AAC, aptX, aptX HD"
 #elif defined(CONFIG_BT_A2DP_APTX_DECODER)
-#define BT_AV_CODEC_LIST    ", SBC, aptX, aptX HD"
+#define BT_AV_BASE_CODEC_LIST    ", SBC, aptX, aptX HD"
 #elif defined(CONFIG_BT_A2DP_AAC_DECODER)
-#define BT_AV_CODEC_LIST    ", SBC, AAC"
+#define BT_AV_BASE_CODEC_LIST    ", SBC, AAC"
 #else
-#define BT_AV_CODEC_LIST    ", SBC"
+#define BT_AV_BASE_CODEC_LIST    ", SBC"
 #endif
 
 /*
@@ -44,7 +44,15 @@
  * more patch surface in a header Espressif owns, for one call made once at
  * startup. See bt_overlay/host/bluedroid/stack/a2dp/a2dp_codec_config.c.
  */
+#ifdef CONFIG_BT_A2DP_LHDCV5_DECODER
+#define BT_AV_LHDC_NAME " LHDC-V5"
+#else
+#define BT_AV_LHDC_NAME ""
+#endif
+#define BT_AV_CODEC_LIST BT_AV_BASE_CODEC_LIST BT_AV_LHDC_NAME
+
 extern void A2DP_SinkAllow48kHz(bool allow);
+extern void A2DP_SinkAllow96kHz(bool allow);
 extern void A2DP_SinkOfferAptxHd(bool offer);
 extern void A2DP_SinkOfferAptx(bool offer);
 extern void A2DP_SinkOfferAac(bool offer);
@@ -264,7 +272,7 @@ static uint8_t aptx_channels(const uint8_t *cie)
 
 static void announce_format(void)
 {
-    if (s_now.rate_hz && s_format.request.generation)
+    if (s_now.rate_hz && fmt_valid(&s_format.request))
         link_send_format(&s_format.request, s_format.require_ack);
 }
 
@@ -278,6 +286,10 @@ static void begin_format(uint32_t rate, uint8_t bits, uint8_t channels, uint8_t 
     if (!s_nonce || ++s_generation == 0) {
         do { s_nonce = esp_random(); } while (!s_nonce);
         s_generation = 1;
+    }
+    if (rate == 96000 && !(link_host_caps() & SATLINK_HOST_CAP_96KHZ)) {
+        ESP_LOGE(TAG, "host cannot accept 96 kHz; PCM stays gated");
+        rate = 0;
     }
     fmt_request_t r = {s_nonce, s_generation, rate, bits, channels};
     fmt_begin(&s_format, r, (link_host_caps() & FMT_HOST_CAP) != 0);
@@ -307,7 +319,8 @@ static void poll_format(void)
         uint32_t caps = link_host_caps();
         bool ack = (caps & FMT_HOST_CAP) != 0;
         uint8_t bits = fmt_slot_bits(s_decoder_bits, (caps & SATLINK_HOST_CAP_WIDE) != 0, ack);
-        if (bits != s_now.bits || ack != s_format.require_ack)
+        if (!fmt_valid(&s_format.request) || bits != s_now.bits || ack != s_format.require_ack ||
+            (s_now.rate_hz == 96000 && !(caps & SATLINK_HOST_CAP_96KHZ)))
             begin_format(s_now.rate_hz, bits, s_now.channels, s_decoder_bits);
         else announce_format(); // a restarted host must relearn the current transaction
     }
@@ -629,7 +642,17 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
              * audio_out with dither rather than here by truncation. */
             src_bits = 32;
 
-            if (vendor == 0x0000004F && codec == 0x0001) {
+            if (vendor == 0x0000053a && codec == 0x4c35) {
+                _Static_assert(sizeof(mcc->cie) >= 11, "LHDC V5 CIE must fit");
+                const uint8_t frequency = cie[6] & 0x35;
+                rate = frequency == 0x04 ? 96000 : frequency == 0x10 ? 48000 :
+                       frequency == 0x20 ? 44100 : 0;
+                src_bits = (cie[7] & 7) == 2 ? 32 : 16;
+                channels = 2;
+                s_now.codec = SATLINK_CODEC_LHDC_V5;
+                audio_out_set_codec_name("LHDC V5");
+                ESP_LOGI(TAG, "codec LHDC V5, %" PRIu32 " Hz, %u-bit PCM", rate, src_bits);
+            } else if (vendor == 0x0000004F && codec == 0x0001) {
                 s_now.codec = SATLINK_CODEC_APTX;
                 audio_out_set_codec_name("aptX");
                 ESP_LOGI(TAG, "codec aptX, %" PRIu32 " Hz, %u channel(s)", rate, channels);
@@ -1149,15 +1172,17 @@ esp_err_t bt_av_start(const char *device_name)
     uint32_t host_caps = link_host_caps();
 
     A2DP_SinkAllow48kHz((host_caps & SATLINK_HOST_CAP_RELOCK) != 0);
+    A2DP_SinkAllow96kHz((host_caps & SATLINK_HOST_CAP_96KHZ) != 0);
     A2DP_SinkOfferAptxHd(BT_AV_OFFER_APTX_HD);
     A2DP_SinkOfferAptx(BT_AV_OFFER_APTX);
     A2DP_SinkOfferAac(BT_AV_OFFER_AAC);
 
     bt_av_apply_host_caps();
-    ESP_LOGI(TAG, "endpoints: SBC%s%s%s, %s, %u-bit slots",
+    ESP_LOGI(TAG, "endpoints: SBC%s%s%s" BT_AV_LHDC_NAME ", %s, %u-bit slots",
              BT_AV_OFFER_AAC ? " AAC" : "",
              BT_AV_OFFER_APTX ? " aptX" : "",
              BT_AV_OFFER_APTX_HD ? " aptX-HD" : "",
+             (host_caps & SATLINK_HOST_CAP_96KHZ) ? "44.1/48 kHz + LHDC 96 kHz" :
              (host_caps & SATLINK_HOST_CAP_RELOCK) ? "44.1 and 48 kHz" : "44.1 kHz only",
              audio_out_slot_bits());
 

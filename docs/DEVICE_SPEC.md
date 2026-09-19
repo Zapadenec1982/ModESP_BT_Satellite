@@ -35,7 +35,7 @@ WROOM, а не WROVER, і не тільки через PSRAM, якої тут н
 ## Bluetooth
 
 - **A2DP sink** і **AVRCP controller**.
-- Кодеки: **SBC, AAC, aptX, aptX HD**. LDAC не переноситься: єдиний декодер, який є в
+- Кодеки: **SBC, AAC, aptX, aptX HD, LHDC V5**. LDAC не переноситься: єдиний декодер, який є в
   мережі, не має ліцензії, а Sony публікує лише кодер.
 - Парування, автоперепідключення після ввімкнення, одне активне з'єднання.
 
@@ -45,13 +45,14 @@ WROOM, а не WROVER, і не тільки через PSRAM, якої тут н
 
 - **Пристрій — майстер.** Він генерує `BCLK` і `WS`, хост їх приймає.
 - Лінії: `BCLK`, `WS`, `DOUT`. **MCLK не потрібен і не виводиться.**
-- Стерео, 44,1 або 48 кГц, слоти 16 або 32 біти, формат Philips I2S.
+- Стерео, 44,1 / 48 кГц; LHDC V5 також 96 кГц за HELLO 1.4 capability bit 5, слоти 16 або 32 біти, формат Philips I2S.
 - Частота і розрядність оголошуються по UART **до першого семпла**, а не вгадуються хостом.
 - Rate and width may change within an A2DP connection. Announce every transition
   using the negotiated protocol in `PROTOCOL.md`; never assume a lifetime format.
   Without host RELOCK capability, A2DP still advertises only 44.1 kHz.
 - With protocol 1.3 FORMAT_READY and WIDE, use native decoder widths: SBC/AAC 16;
-  aptX/aptX HD 32-bit containers (24 significant bits). WIDE is a capability,
+  aptX/aptX HD 32-bit containers (24 significant bits); LHDC V5 uses 16-bit
+  slots for 16-bit content and 32-bit containers for 24-bit content. WIDE is a capability,
   not an instruction to widen all samples. Legacy width policy remains compatible.
 - A negotiated transition stays silent until correlated host readiness and the
   minimum 50 ms after completed UART transmission; lost ACK is retried, not ignored.
@@ -184,3 +185,11 @@ GPIO, і задає напрямки через `GPIO_CFG`.
 ## Відкриті питання до замовника
 
 Жодного, що блокує.
+
+## LHDC V5 extension (customer request, 2026-09-19)
+
+Pinned Apache-2.0 decoder and local adapter: see `LHDC_V5_2026-09-19.md`.
+Rates: 44.1/48/96 kHz; stereo, 16/24 source bits, 5 ms framing. No 192 kHz,
+lossless, LL or spatial features are advertised. 96 kHz needs host HELLO 1.4
+with RELOCK, FORMAT_READY and 96KHZ; no resampling or forced widening is added.
+Runtime performance and audio fidelity need bench verification with an LHDC V5 source.

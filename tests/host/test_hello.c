@@ -74,6 +74,11 @@ int main(void) {
     receive_hello(1, 2, SATLINK_HOST_CAP_WIDE | FMT_HOST_CAP);
     CHECK(s_host_present); CHECK(s_host_caps == SATLINK_HOST_CAP_WIDE);
     beat(); CHECK(hellos == 7);
+    // 96 kHz needs protocol 1.4 and both transition prerequisites.
+    receive_hello(1, 3, 0x39); CHECK(s_host_caps == 0x19);
+    receive_hello(1, 4, 0x39); CHECK(s_host_caps == 0x39);
+    receive_hello(1, 4, 0x29); CHECK(s_host_caps == 0x09);
+    receive_hello(1, 4, 0x38); CHECK(s_host_caps == 0x18);
     // A known incompatible host is not a lost greeting; do not retry forever.
     reset_case(); answer_hello(); receive_hello(2, 0, 0);
     CHECK(s_peer_incompatible); CHECK(!s_host_present); CHECK(callbacks == 0);

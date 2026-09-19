@@ -13,9 +13,10 @@
 
 Доповнює `DEVICE_SPEC.md`. Тут розкладки, яких там бракувало.
 
-Ця версія **1.3** і вона узгоджена з другою реалізацією. Міняти можна, але правкою тут і
+Ця версія **1.4** і вона узгоджена з другою реалізацією. Міняти можна, але правкою тут і
 підняттям `proto_minor`.
 
+- **1.4** — LHDC V5 codec ID 5; host capability bit 5 authorizes 96 kHz.
 - **1.3** — optional acknowledged format transitions (`STREAM_PREPARE` / `STREAM_READY`),
   host capability bit 4; native decoder slot widths for capable hosts. Legacy layouts unchanged.
 - **1.2** — `STREAM_FMT` обов'язковий перед **будь-якою** зміною формату, не лише на початку
@@ -90,6 +91,15 @@ I2S від лінка не залежить, і пристрій, який гр�
 | 2 | керує розширювачем |
 | 3 | **приймає 32-бітні слоти** (`proto_minor` >= 1) |
 | 4 | FORMAT_READY: acknowledges prepared formats (`proto_minor` >= 3) |
+| 5 | accepts 96 kHz in 16/32-bit stereo slots (`proto_minor` >= 4; requires bits 0 and 4) |
+
+**Bit 5 is an explicit frequency capability.** RELOCK alone authorizes only
+44.1/48 kHz. Offer LHDC V5 at 96 kHz only after HELLO 1.4 with bits 0, 4 and 5;
+missing, older or incomplete HELLO keeps the endpoint at 44.1/48 kHz.
+96 kHz transitions use STREAM_PREPARE/READY and the existing 50 ms guard.
+A 96 kHz stream must remain gated if a replacement host lacks this capability.
+LHDC V5 carries native 16-bit PCM or 24 significant bits in 32-bit containers.
+The endpoint does not offer 192 kHz, LL, spatial processing or lossless modes.
 
 **Біт 3 додано у версії 1.1.** Він каже, що `STREAM_FMT.bits = 32` хост переживе: вхідний
 канал переналаштовується під оголошену ширину, а не читає 32-бітний потік конфігурацією на 16.
@@ -123,7 +133,7 @@ u32  own_ms           // час роботи того, хто відповіда
 
 ```
 u8   state            // 0 off, 1 idle, 2 discoverable, 3 connecting, 4 connected, 5 streaming
-u8   codec            // 0 none, 1 SBC, 2 AAC, 3 aptX, 4 aptX HD
+u8   codec            // 0 none, 1 SBC, 2 AAC, 3 aptX, 4 aptX HD, 5 LHDC V5
 u8   addr[6]          // BD_ADDR партнера, нулі коли не підключено
 str  name             // ім'я партнера, порожнє коли невідоме
 ```

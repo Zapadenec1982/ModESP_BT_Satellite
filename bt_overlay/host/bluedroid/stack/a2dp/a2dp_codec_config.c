@@ -11,6 +11,7 @@
 #include "stack/a2dp_aac.h"
 #include "stack/a2dp_vendor.h"
 #include "stack/a2dp_vendor_aptx_hd.h"
+#include "stack/a2dp_vendor_lhdcv5.h"
 #include "bta/bta_av_api.h"
 #include "bta/bta_av_ci.h"
 #include "bta/bta_av_co.h"
@@ -69,7 +70,18 @@ void A2DP_SinkOfferAac(bool offer) {
 #endif
 }
 
+void A2DP_SinkAllow96kHz(bool allow) {
+#if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
+  A2DP_LhdcV5SinkAllow96kHz(allow);
+#else
+  (void)allow;
+#endif
+}
+
 void A2DP_SinkAllow48kHz(bool allow) {
+#if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
+  A2DP_LhdcV5SinkAllow48kHz(allow);
+#endif
   A2DP_SbcSinkAllow48kHz(allow);
 #if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)
   A2DP_AacSinkAllow48kHz(allow);
