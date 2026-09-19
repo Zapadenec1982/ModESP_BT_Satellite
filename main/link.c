@@ -19,7 +19,9 @@
 
 static const char *TAG = "sat.link";
 
-#define LINK_RX_BUF          (SATLINK_WIRE_MAX * 2)
+/* Four frames rather than two: at 460800 baud this is about ninety milliseconds
+ * of wire, which is the margin the receiver has if something delays it. */
+#define LINK_RX_BUF          (SATLINK_WIRE_MAX * 4)
 #define LINK_TX_BUF          (SATLINK_WIRE_MAX * 2)
 #define LINK_READ_CHUNK      256
 #define LINK_EVENT_QUEUE     16
@@ -36,8 +38,25 @@ static const char *TAG = "sat.link";
 #define LINK_Q_BULK          14
 
 #define LINK_TASK_STACK      3584
-#define LINK_RX_PRIO         (configMAX_PRIORITIES - 6)
-#define LINK_TX_PRIO         (configMAX_PRIORITIES - 7)
+/*
+ * The receiver runs above the audio path, and that is deliberate.
+ *
+ * It used to sit at configMAX-6, below the I2S writer at -3 and the A2DP handler
+ * at -4, so while music played it was the last thing the scheduler got to. Its
+ * work is tiny -- drain a UART and reassemble -- but the driver's buffer holds
+ * only about forty-five milliseconds of wire at 460800 baud, and forty-five
+ * milliseconds is nothing when a codec is busy. The bytes went in the bin, the
+ * host saw a quarter of its traffic vanish, and the counter that should have said
+ * so was being overwritten.
+ *
+ * Short bounded work at high priority is the right shape for draining an
+ * interface. It blocks on the driver's event queue and runs only when there is
+ * something to take, so it cannot starve anything by spinning.
+ *
+ * The sender can wait: a late PONG costs latency, a late read costs data.
+ */
+#define LINK_RX_PRIO         (configMAX_PRIORITIES - 2)
+#define LINK_TX_PRIO         (configMAX_PRIORITIES - 5)
 
 #define LINK_PING_PERIOD_US  1000000
 
@@ -304,10 +323,17 @@ static void send_hello(void)
     };
     uint8_t payload[LINK_BUF_HELLO];
     size_t len = satlink_enc_hello(payload, sizeof(payload), &m);
-    if (len != 0) {
-        s_last_hello_us = esp_timer_get_time();
-        tx_push(SATLINK_MSG_HELLO, payload, len);
+    if (len == 0) {
+        /* Never observed, but it would have been invisible if it happened: the
+         * link would simply never come up and each side would blame the other. */
+        ESP_LOGE(TAG, "HELLO will not encode into %u bytes", (unsigned)sizeof(payload));
+        return;
     }
+    s_last_hello_us = esp_timer_get_time();
+    s_stats.hello_sent++;
+    ESP_LOGI(TAG, "HELLO out: %u.%u, caps 0x%08" PRIx32 ", %u bytes",
+             SATLINK_PROTO_MAJOR, SATLINK_PROTO_MINOR, s_own_caps, (unsigned)len);
+    tx_push(SATLINK_MSG_HELLO, payload, len);
 }
 
 /* The reply half of the greeting. Without it a peer that started first never
@@ -445,7 +471,10 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
 
     default:
         /* A message we do not implement is not a protocol error: the other side
-         * may be newer within the same major. */
+         * may be newer within the same major. Worth counting, though -- "the peer
+         * sends something we ignore" and "the peer sends nothing" are different
+         * faults that used to look identical from here. */
+        s_stats.rx_unknown++;
         ESP_LOGD(TAG, "ignoring message 0x%02x", type);
         break;
     }
@@ -512,7 +541,11 @@ static void link_rx_task(void *arg)
             uart_flush_input(BOARD_LINK_UART_NUM);
             xQueueReset(s_uart_events);
             satlink_rx_init(&s_rx);
-            s_stats.rx_bad++;
+            /* Its own counter. This used to increment rx_bad, which the next data
+             * event overwrote from the reassembler's totals -- so the one number
+             * that said "we were too slow" was reliably erased by the one that
+             * says "the wire was noisy". */
+            s_stats.rx_overruns++;
             break;
 
         default:
@@ -540,12 +573,14 @@ static void report_stats(void)
         return;
     }
 
-    ESP_LOGI(TAG, "tx %" PRIu32 " (dropped %" PRIu32 "/%" PRIu32 "), rx %" PRIu32 " bytes "
-                  "%" PRIu32 " frames (bad %" PRIu32 ", gaps %" PRIu32 "), "
+    ESP_LOGI(TAG, "tx %" PRIu32 " (dropped %" PRIu32 "/%" PRIu32 ", hello %" PRIu32 "), "
+                  "rx %" PRIu32 " bytes %" PRIu32 " frames "
+                  "(bad %" PRIu32 ", gaps %" PRIu32 ", unknown %" PRIu32 ", overrun %" PRIu32 "), "
                   "pings unanswered %" PRIu32,
              s_stats.tx_frames, s_stats.tx_dropped_bulk, s_stats.tx_dropped_critical,
+             s_stats.hello_sent,
              s_stats.rx_bytes, s_stats.rx_frames, s_stats.rx_bad, s_stats.rx_seq_gaps,
-             s_stats.pings_unanswered);
+             s_stats.rx_unknown, s_stats.rx_overruns, s_stats.pings_unanswered);
     if (s_host_present) {
         ESP_LOGI(TAG, "round trip %" PRIu32 " ms", s_stats.rtt_ms);
     }

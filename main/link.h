@@ -64,6 +64,20 @@ typedef struct {
     uint32_t rx_frames;
     uint32_t rx_bad;
     uint32_t rx_seq_gaps;
+    /* Frames of a type this build does not implement. A peer that is newer within
+     * the same major may send some, which is legal; a count that climbs while
+     * nothing else arrives means the two sides disagree about what they speak,
+     * and that used to be indistinguishable from silence. */
+    uint32_t rx_unknown;
+    /* Times the receiver was not run often enough and the UART driver threw bytes
+     * away. Distinct from rx_bad, which counts frames that arrived and did not
+     * decode: an overrun is our fault, a bad frame is the wire's. Keeping them in
+     * one number hid the first behind the second. */
+    uint32_t rx_overruns;
+    /* How many greetings we have actually put on the wire. "We never answered"
+     * and "we answered and it was lost" are different faults with the same
+     * symptom, and this is what tells them apart. */
+    uint32_t hello_sent;
     uint32_t pings_unanswered;
     uint32_t rtt_ms;               /* last round trip, from our PING to its PONG */
 } link_stats_t;
