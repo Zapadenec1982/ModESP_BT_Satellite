@@ -7,6 +7,8 @@
 #include "stack/a2dp_vendor_aptx_hd.h"
 #include "stack/a2dp_vendor_aptx_decoder.h"
 #include "stack/a2dp_decoder.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 
 #if (defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE)
@@ -64,6 +66,7 @@ typedef struct {
   tA2DP_APTX_TYPE aptx_type;
   decoded_data_callback_t decode_callback;
   uint32_t decode_failures;
+  uint32_t next_warn_tick;
 } tA2DP_APTX_DECODER_CB;
 
 static tA2DP_APTX_DECODER_CB a2dp_aptx_decoder_cb;
@@ -103,6 +106,7 @@ bool a2dp_aptx_decoder_reset(void) {
      * cached, which would otherwise be prepended to the next stream. */
     aptx_decode_sync_finish(decoder_context);
     a2dp_aptx_decoder_cb.decode_failures = 0;
+    a2dp_aptx_decoder_cb.next_warn_tick = 0;
     return true;
 }
 
@@ -180,14 +184,19 @@ bool a2dp_aptx_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf, size_t b
         }
 
         if (dropped > 0) {
-            /* Bytes thrown away while hunting for the next valid frame. A burst
-             * at stream start is normal -- we joined mid-stream. A steady trickle
-             * means packets are being lost somewhere upstream. */
+            /* Bytes thrown away while hunting for the next valid frame. A burst at
+             * stream start is normal -- we joined mid-stream. A steady trickle means
+             * packets are being lost somewhere upstream.
+             *
+             * Throttled by time, not by count: when this goes wrong it goes wrong on
+             * every packet, and a line per packet out of a 115200 baud console blocks
+             * this very task long enough to cause the packet loss it is reporting. */
             a2dp_aptx_decoder_cb.decode_failures += dropped;
-            if (a2dp_aptx_decoder_cb.decode_failures <= 3 ||
-                (a2dp_aptx_decoder_cb.decode_failures % 4096) < dropped) {
-                APPL_TRACE_WARNING("%s: resynchronised, %u bytes dropped (%u total)",
-                                   __func__, (unsigned)dropped,
+            uint32_t now = (uint32_t)xTaskGetTickCount();
+            if ((int32_t)(now - a2dp_aptx_decoder_cb.next_warn_tick) >= 0) {
+                a2dp_aptx_decoder_cb.next_warn_tick = now + pdMS_TO_TICKS(2000);
+                APPL_TRACE_WARNING("%s: resynchronising, %u bytes dropped so far",
+                                   __func__,
                                    (unsigned)a2dp_aptx_decoder_cb.decode_failures);
             }
         }

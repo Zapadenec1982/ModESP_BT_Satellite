@@ -36,3 +36,19 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # UART0 on GPIO1/3, which is the CH9102 bridge on the DevKitC. The link to the
 # host is UART2 on GPIO17/16 and has nothing to do with this.
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# --- CPU --------------------------------------------------------------------
+# 240 MHz, not the 160 MHz default. The aptX decoder is a fixed-point DSP loop
+# and it is the single hottest thing in this firmware: with the console storm
+# throttled, the task watchdog showed A2DP_DECODER holding CPU 1 at 100% while
+# CPU 0 sat idle. A single task cannot be spread across cores, so the only
+# lever is to make its core faster.
+#
+# Costs about 20-30 mA more. DEVICE_SPEC.md budgets a 0.5 A regulator against
+# transmit peaks near 130 mA, so there is room.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# -O2 rather than the -Og the project had been building with all along. Debug
+# optimisation on a codec inner loop is the difference between decoding in real
+# time and not.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y

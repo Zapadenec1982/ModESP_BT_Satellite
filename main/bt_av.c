@@ -489,10 +489,10 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
                 ESP_LOGI(TAG, "codec aptX, %" PRIu32 " Hz, %u channel(s)", rate, channels);
             } else if (vendor == 0x000000D7 && codec == 0x0024) {
                 s_now.codec = SATLINK_CODEC_APTX_HD;
-                /* The decoder truncates aptX HD's 24-bit samples to 16: this
-                 * device hands the host 16-bit slots and only those. */
-                ESP_LOGI(TAG, "codec aptX HD, %" PRIu32 " Hz, %u channel(s), 24-bit truncated to 16",
-                         rate, channels);
+                /* aptX HD carries 24 bits. They reach the host intact in 32-bit
+                 * slots; in 16-bit ones audio_out narrows them with dither. */
+                ESP_LOGI(TAG, "codec aptX HD, %" PRIu32 " Hz, %u channel(s), 24-bit into %u-bit slots",
+                         rate, channels, audio_out_slot_bits());
             } else {
                 ESP_LOGE(TAG, "vendor codec %08" PRIx32 ":%04x negotiated, which this "
                               "build cannot name to the host", vendor, codec);
