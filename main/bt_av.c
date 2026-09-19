@@ -43,6 +43,22 @@
  * startup. See bt_overlay/host/bluedroid/stack/a2dp/a2dp_codec_config.c.
  */
 extern void A2DP_SinkAllow48kHz(bool allow);
+extern void A2DP_SinkOfferAptxHd(bool offer);
+
+/*
+ * Whether to offer aptX HD at all.
+ *
+ * True, normally. It exists because a phone takes the best endpoint the sink
+ * advertises and cannot be asked for less: Android 17 has no codec picker in
+ * developer options, and its HD audio toggle drops all the way to SBC rather than
+ * one step down. Withdrawing this endpoint is the only way left to make a phone
+ * choose plain aptX.
+ *
+ * That is not only a test convenience. If a link ever turns out not to carry aptX
+ * HD reliably, this is the one knob that moves the phone down a step instead of
+ * all the way to SBC.
+ */
+#define BT_AV_OFFER_APTX_HD     true
 
 static const char *TAG = "sat.bt";
 
@@ -462,6 +478,7 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
             rate = sbc_rate_hz(&mcc->cie.sbc_info);
             src_bits = 16;
             s_now.codec = SATLINK_CODEC_SBC;
+            audio_out_set_codec_name("SBC");
             ESP_LOGI(TAG, "codec SBC, %" PRIu32 " Hz, bitpool %u..%u",
                      rate, mcc->cie.sbc_info.min_bitpool, mcc->cie.sbc_info.max_bitpool);
             break;
@@ -471,6 +488,7 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
             channels = aac_channels(cie);
             src_bits = 16;
             s_now.codec = SATLINK_CODEC_AAC;
+            audio_out_set_codec_name("AAC");
             ESP_LOGI(TAG, "codec AAC, %" PRIu32 " Hz, %u channel(s)", rate, channels);
             break;
 
@@ -486,9 +504,11 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
 
             if (vendor == 0x0000004F && codec == 0x0001) {
                 s_now.codec = SATLINK_CODEC_APTX;
+                audio_out_set_codec_name("aptX");
                 ESP_LOGI(TAG, "codec aptX, %" PRIu32 " Hz, %u channel(s)", rate, channels);
             } else if (vendor == 0x000000D7 && codec == 0x0024) {
                 s_now.codec = SATLINK_CODEC_APTX_HD;
+                audio_out_set_codec_name("aptX HD");
                 /* aptX HD carries 24 bits. They reach the host intact in 32-bit
                  * slots; in 16-bit ones audio_out narrows them with dither. */
                 ESP_LOGI(TAG, "codec aptX HD, %" PRIu32 " Hz, %u channel(s), 24-bit into %u-bit slots",
@@ -497,6 +517,7 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
                 ESP_LOGE(TAG, "vendor codec %08" PRIx32 ":%04x negotiated, which this "
                               "build cannot name to the host", vendor, codec);
                 s_now.codec = SATLINK_CODEC_NONE;
+                audio_out_set_codec_name("unknown vendor codec");
                 rate = 0;
             }
             break;
@@ -506,6 +527,7 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
             /* An endpoint we never registered. Say so rather than stream noise. */
             ESP_LOGE(TAG, "unexpected codec type %d", mcc->type);
             s_now.codec = SATLINK_CODEC_NONE;
+            audio_out_set_codec_name("unsupported");
             break;
         }
 
@@ -1015,12 +1037,14 @@ esp_err_t bt_av_start(const char *device_name)
     uint32_t host_caps = link_host_caps();
 
     A2DP_SinkAllow48kHz((host_caps & SATLINK_HOST_CAP_RELOCK) != 0);
+    A2DP_SinkOfferAptxHd(BT_AV_OFFER_APTX_HD);
     if (host_caps & SATLINK_HOST_CAP_WIDE) {
         audio_out_set_slot_bits(32);
     }
-    ESP_LOGI(TAG, "endpoints offer %s, %u-bit slots",
+    ESP_LOGI(TAG, "endpoints offer %s, %u-bit slots%s",
              (host_caps & SATLINK_HOST_CAP_RELOCK) ? "44.1 and 48 kHz" : "44.1 kHz only",
-             audio_out_slot_bits());
+             audio_out_slot_bits(),
+             BT_AV_OFFER_APTX_HD ? "" : ", aptX HD withheld");
 
     ESP_RETURN_ON_ERROR(esp_a2d_register_callback(a2d_cb), TAG, "a2d_register");
     ESP_RETURN_ON_ERROR(esp_a2d_sink_init(), TAG, "a2d_sink_init");

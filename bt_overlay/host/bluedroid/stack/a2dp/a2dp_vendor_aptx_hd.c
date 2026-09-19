@@ -292,7 +292,24 @@ void A2DP_AptxHdSinkAllow48kHz(bool allow) {
   }
 }
 
+/* Whether an aptX HD endpoint is offered at all.
+ *
+ * A phone picks the best of what the sink advertises, and there is no way to ask
+ * it for less. Newer Android has no codec picker in developer options either, so
+ * the only way to make a phone choose plain aptX -- to test that path, or because
+ * the link will not carry HD reliably -- is to stop offering aptX HD. Declining
+ * here means no stream endpoint is registered for it, so it never appears in the
+ * capability list the phone reads. */
+static bool a2dp_aptx_hd_sink_offered = true;
+
+void A2DP_AptxHdSinkOffer(bool offer) {
+  a2dp_aptx_hd_sink_offered = offer;
+}
+
 bool A2DP_VendorInitCodecConfigAptxHdSink(uint8_t* p_codec_info) {
+  if (!a2dp_aptx_hd_sink_offered) {
+    return false;
+  }
   tA2D_STATUS sts = A2D_FAIL;
   sts = A2DP_BuildInfoAptxHd(A2D_MEDIA_TYPE_AUDIO, &a2dp_aptx_hd_sink_caps, p_codec_info);
   return sts == A2D_SUCCESS;

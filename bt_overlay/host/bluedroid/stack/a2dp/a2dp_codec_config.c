@@ -37,6 +37,15 @@
  * Call before esp_a2d_sink_init(): the capabilities are read when the endpoints
  * are registered and not looked at again.
  */
+/* Offer aptX HD, or do not. See a2dp_vendor_aptx_hd.c for why this exists. */
+void A2DP_SinkOfferAptxHd(bool offer) {
+#if (defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE)
+  A2DP_AptxHdSinkOffer(offer);
+#else
+  (void)offer;
+#endif
+}
+
 void A2DP_SinkAllow48kHz(bool allow) {
   A2DP_SbcSinkAllow48kHz(allow);
 #if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)

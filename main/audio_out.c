@@ -49,6 +49,7 @@ static volatile bool      s_streaming;   /* an empty ring only matters while pla
 static volatile uint32_t  s_peak;
 static uint8_t            s_slot_bits = AUDIO_BITS_DEFAULT;   /* on the wire */
 static uint8_t            s_src_bits  = 16;                   /* out of the decoder */
+static const char        *s_codec_name = "?";
 
 /*
  * Dither, for the one case that needs it: 24-bit aptX HD samples going out on a
@@ -117,9 +118,19 @@ static void audio_report(void)
      * says whether the signal is loud without anyone reaching for a calculator. */
     unsigned peak_permille = (unsigned)((st.peak * 1000u) / 32768u);
 
-    ESP_LOGI(TAG, "ring %u..%u of %u bytes, underruns %" PRIu32 ", dropped %" PRIu32
-                  ", peak %" PRIu32 "/32768 (%u.%u%% of full scale), free dma %u",
-             (unsigned)st.fill_min, (unsigned)st.fill_max, (unsigned)AUDIO_RING_BYTES,
+    /* Milliseconds of audio standing in the ring, which is the latency this device
+     * is adding and the number that says whether the buffer is healthy or merely
+     * full. Bytes alone do not, because the same count means different things at
+     * different rates and widths. */
+    unsigned frame_bytes = (unsigned)(s_slot_bits / 8) * 2u;
+    unsigned fill_ms = (frame_bytes && s_rate_hz)
+                     ? (unsigned)((uint64_t)st.fill_max * 1000u / (frame_bytes * s_rate_hz))
+                     : 0u;
+
+    ESP_LOGI(TAG, "%s %" PRIu32 " Hz %u-bit slots: ring %u..%u of %u (%u ms), underruns %" PRIu32
+                  ", dropped %" PRIu32 ", peak %" PRIu32 "/32768 (%u.%u%%), free dma %u",
+             s_codec_name, s_rate_hz, s_slot_bits,
+             (unsigned)st.fill_min, (unsigned)st.fill_max, (unsigned)AUDIO_RING_BYTES, fill_ms,
              st.underruns, st.dropped_bytes, st.peak,
              peak_permille / 10, peak_permille % 10,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
@@ -410,6 +421,11 @@ void audio_out_flush(void)
     while ((item = xRingbufferReceiveUpTo(s_ring, &len, 0, AUDIO_CHUNK_BYTES)) != NULL) {
         vRingbufferReturnItem(s_ring, item);
     }
+}
+
+void audio_out_set_codec_name(const char *name)
+{
+    s_codec_name = (name != NULL) ? name : "?";
 }
 
 void audio_out_set_streaming(bool streaming)

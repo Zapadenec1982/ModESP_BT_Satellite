@@ -83,6 +83,17 @@ void audio_out_get_stats(audio_out_stats_t *out);
  */
 void audio_out_flush(void);
 
+/*
+ * What is playing, for the periodic report.
+ *
+ * The output stage knows the rate and the slot width but not which codec produced
+ * the samples, and the codec was only ever logged at the moment it was negotiated
+ * -- so ten minutes into a session there was no way to find out what was playing
+ * short of reconnecting the phone. The caller owns the string and must keep it
+ * alive; a string literal is the expected argument.
+ */
+void audio_out_set_codec_name(const char *name);
+
 /* Tells the output whether a stream is running, so that an empty ring can be told
  * from the silence between tracks. */
 void audio_out_set_streaming(bool streaming);
