@@ -97,3 +97,12 @@ typedef struct {
 } link_stats_t;
 
 void link_get_stats(link_stats_t *out);
+
+/*
+ * How many droppable messages are still waiting to go out.
+ *
+ * Exists for the cover art sender, which is the only producer that can generate
+ * more messages in one burst than the queue holds. Everything else emits one
+ * message per event and cannot outrun the wire.
+ */
+uint32_t link_bulk_pending(void);

@@ -179,14 +179,30 @@ tA2DP_STATUS A2DP_ParseInfoAptxHd(tA2DP_APTX_HD_CIE* p_ie,
 tA2D_STATUS A2DP_IsVendorPeerSourceCodecValidAptxHd(const uint8_t* p_codec_info) {
   tA2DP_APTX_HD_CIE cfg_cie;
 
-  /* Use a liberal check when parsing the codec info */
-  tA2D_STATUS status;
-  status = A2DP_ParseInfoAptxHd(&cfg_cie, p_codec_info, true);
-  if (status == A2D_SUCCESS) {
+  /* Parse first, then check the rate against what this device offers.
+   *
+   * This used to return success for anything that parsed, which made
+   * A2DP_SinkAllow48kHz advertise-only for the two vendor codecs: the
+   * capability said 44.1 alone and SET_CONFIGURATION at 48 kHz was accepted
+   * anyway. SBC and AAC were gated here all along, through
+   * A2DP_CodecInfoMatchesCapability*; the aptX equivalents existed and had no
+   * caller. A peer that cached our capabilities from an earlier session, or
+   * simply does not re-read them, would have walked straight through. */
+  tA2D_STATUS status = A2DP_ParseInfoAptxHd(&cfg_cie, p_codec_info, true);
+  if (status != A2D_SUCCESS) {
+    status = A2DP_ParseInfoAptxHd(&cfg_cie, p_codec_info, false);
+  }
+  if (status != A2D_SUCCESS) {
     return status;
   }
 
-  return A2DP_ParseInfoAptxHd(&cfg_cie, p_codec_info, false);
+  if ((cfg_cie.sampleRate & a2dp_aptx_hd_sink_caps.sampleRate) == 0) {
+    APPL_TRACE_WARNING("%s: rate 0x%x is not one of the 0x%x this device offers",
+                       __func__, cfg_cie.sampleRate, a2dp_aptx_hd_sink_caps.sampleRate);
+    return A2D_NS_SAMP_FREQ;
+  }
+
+  return A2D_SUCCESS;
 }
 
 bool A2DP_IsVendorPeerSinkCodecValidAptxHd(const uint8_t* p_codec_info) {
@@ -325,9 +341,15 @@ bool A2DP_VendorBuildCodecConfigAptxHd(UINT8 *p_src_cap, UINT8 *p_result) {
     return false;
   }
 
-  if (src_cap.sampleRate & A2DP_APTX_HD_SAMPLERATE_48000) {
+  /* Intersect with what this device actually offers before choosing. The peer's
+   * capability says what it can do; ours says what we may accept. Taking the
+   * peer's highest without consulting our own is how a host locked at 44.1 kHz
+   * ends up being handed 48: A2DP_SinkAllow48kHz clears the bit in the sink
+   * capability, and this path never looked at it. */
+  uint8_t allowed = src_cap.sampleRate & a2dp_aptx_hd_sink_caps.sampleRate;
+  if (allowed & A2DP_APTX_HD_SAMPLERATE_48000) {
     pref_cap.sampleRate = A2DP_APTX_HD_SAMPLERATE_48000;
-  } else if (src_cap.sampleRate & A2DP_APTX_HD_SAMPLERATE_44100) {
+  } else if (allowed & A2DP_APTX_HD_SAMPLERATE_44100) {
     pref_cap.sampleRate = A2DP_APTX_HD_SAMPLERATE_44100;
   } else {
     APPL_TRACE_ERROR("%s: Unsupported sample rate 0x%x", __func__,

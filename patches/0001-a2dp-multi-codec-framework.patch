@@ -3114,7 +3114,7 @@
  /******************************************************************************
  **
  ** Function         A2D_BldSbcInfo
-@@ -222,4 +292,245 @@
+@@ -222,4 +292,259 @@
      }
  }
  
@@ -3298,17 +3298,31 @@
 +        return false;
 +    }
 +
-+    if (src_cap.samp_freq & A2D_SBC_IE_SAMP_FREQ_48) {
++    /* Intersect with what this device actually offers before choosing. The peer's
++     * capability says what it can do; ours says what we may accept. Taking the
++     * peer's highest without consulting our own is how a host locked at 44.1 kHz
++     * ends up being handed 48: A2DP_SinkAllow48kHz clears the bit in the sink
++     * capability, and this path never looked at it. */
++    UINT8 allowed_freq = src_cap.samp_freq & a2dp_sbc_sink_caps.samp_freq;
++    UINT8 allowed_mode = src_cap.ch_mode  & a2dp_sbc_sink_caps.ch_mode;
++    if (allowed_freq == 0 || allowed_mode == 0) {
++        APPL_TRACE_ERROR("%s: no common rate (0x%x vs 0x%x) or channel mode (0x%x vs 0x%x)",
++                         __func__, src_cap.samp_freq, a2dp_sbc_sink_caps.samp_freq,
++                         src_cap.ch_mode, a2dp_sbc_sink_caps.ch_mode);
++        return false;
++    }
++
++    if (allowed_freq & A2D_SBC_IE_SAMP_FREQ_48) {
 +        pref_cap.samp_freq = A2D_SBC_IE_SAMP_FREQ_48;
-+    } else if (src_cap.samp_freq & A2D_SBC_IE_SAMP_FREQ_44) {
++    } else if (allowed_freq & A2D_SBC_IE_SAMP_FREQ_44) {
 +        pref_cap.samp_freq = A2D_SBC_IE_SAMP_FREQ_44;
 +    }
 +
-+    if (src_cap.ch_mode & A2D_SBC_IE_CH_MD_JOINT) {
++    if (allowed_mode & A2D_SBC_IE_CH_MD_JOINT) {
 +        pref_cap.ch_mode = A2D_SBC_IE_CH_MD_JOINT;
-+    } else if (src_cap.ch_mode & A2D_SBC_IE_CH_MD_STEREO) {
++    } else if (allowed_mode & A2D_SBC_IE_CH_MD_STEREO) {
 +        pref_cap.ch_mode = A2D_SBC_IE_CH_MD_STEREO;
-+    } else if (src_cap.ch_mode & A2D_SBC_IE_CH_MD_DUAL) {
++    } else if (allowed_mode & A2D_SBC_IE_CH_MD_DUAL) {
 +        pref_cap.ch_mode = A2D_SBC_IE_CH_MD_DUAL;
 +    } else if (src_cap.ch_mode & A2D_SBC_IE_CH_MD_MONO) {
 +        pref_cap.ch_mode = A2D_SBC_IE_CH_MD_MONO;

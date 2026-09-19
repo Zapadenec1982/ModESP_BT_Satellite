@@ -667,6 +667,11 @@ bool link_wait_for_host(uint32_t timeout_ms)
 
 uint32_t link_host_caps(void) { return s_host_caps; }
 
+uint32_t link_bulk_pending(void)
+{
+    return (s_q_bulk != NULL) ? (uint32_t)uxQueueMessagesWaiting(s_q_bulk) : 0;
+}
+
 void link_get_stats(link_stats_t *out)
 {
     if (out != NULL) { *out = s_stats; }

@@ -13,6 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/portmacro.h"
 #include "freertos/ringbuf.h"
 
 static const char *TAG = "sat.i2s";
@@ -47,6 +48,12 @@ static volatile uint32_t  s_fill_min = UINT32_MAX;
 static volatile uint32_t  s_fill_max;
 static volatile bool      s_streaming;   /* an empty ring only matters while playing */
 static volatile uint32_t  s_peak;
+/* Raised on the decoder task, cleared on the reporting task. Both are read-
+ * modify-write and neither is atomic on its own: the clear landing between the
+ * other's read and its write-back is simply undone, and the figure can stay
+ * pinned to an old transient for many windows. A spinlock costs nothing here --
+ * it is taken once per packet, not once per sample. */
+static portMUX_TYPE       s_peak_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t            s_slot_bits = AUDIO_BITS_DEFAULT;   /* on the wire */
 static uint8_t            s_src_bits  = 16;                   /* out of the decoder */
 static const char        *s_codec_name = "?";
@@ -303,7 +310,7 @@ void audio_out_write(const uint8_t *pcm, size_t len)
     /* Peak is measured here, on what the decoder produced, and reported on a
      * 0..32768 scale whatever the width -- so that the number in the log means
      * the same thing before and after anyone changes the wire. */
-    uint32_t peak = s_peak;
+    uint32_t peak = 0;
     if (s_src_bits == 32) {
         const int32_t *s = (const int32_t *)(const void *)pcm;
         for (size_t i = 0; i < len / sizeof(int32_t); i++) {
@@ -320,7 +327,11 @@ void audio_out_write(const uint8_t *pcm, size_t len)
             if (mag > peak) { peak = mag; }
         }
     }
-    s_peak = peak;
+    /* Merge rather than overwrite, under the lock, so a concurrent reset is
+     * either before this or after it and never lost inside it. */
+    portENTER_CRITICAL(&s_peak_lock);
+    if (peak > s_peak) { s_peak = peak; }
+    portEXIT_CRITICAL(&s_peak_lock);
 
     if (s_src_bits == s_slot_bits) {
         audio_ring_put(pcm, len);           /* the common case: nothing to do */
@@ -500,8 +511,10 @@ void audio_out_get_stats(audio_out_stats_t *out)
     out->underruns     = s_underruns;
     out->fill_min      = (s_fill_min == UINT32_MAX) ? 0 : s_fill_min;
     out->fill_max      = s_fill_max;
-    out->peak          = s_peak;
+    portENTER_CRITICAL(&s_peak_lock);
+    out->peak = s_peak;
+    s_peak = 0;
+    portEXIT_CRITICAL(&s_peak_lock);
     s_fill_min = UINT32_MAX;
     s_fill_max = 0;
-    s_peak = 0;
 }

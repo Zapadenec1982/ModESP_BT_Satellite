@@ -357,8 +357,35 @@ bool A2DP_InitCodecConfigAacSink(uint8_t* p_codec_info) {
 }
 
 bool A2DP_BuildCodecConfigAac(UINT8 *p_src_cap, UINT8 *p_result) {
-  UNUSED(p_src_cap);
-  tA2D_STATUS sts = A2D_FAIL;
-  sts = A2DP_BuildInfoAac(A2D_MEDIA_TYPE_AUDIO, &a2dp_aac_sink_caps, p_result);
-  return sts == A2D_SUCCESS;
+  /* This used to hand the capability struct out as if it were a configuration,
+   * ignoring the peer entirely. A capability may carry several sampling
+   * frequency bits; a configuration must carry exactly one, and with 48 kHz
+   * enabled this emitted two. It also never consulted the peer, so it could
+   * propose a rate the peer had not offered.
+   *
+   * Intersect, then choose one bit. */
+  tA2DP_AAC_CIE src_cap;
+  tA2D_STATUS status = A2DP_ParseInfoAac(&src_cap, p_src_cap, true);
+  if (status != A2D_SUCCESS) {
+    APPL_TRACE_ERROR("%s: cannot parse source capability, %d", __func__, status);
+    return false;
+  }
+
+  uint16_t allowed_rate = src_cap.sampleRate & a2dp_aac_sink_caps.sampleRate;
+  uint8_t  allowed_mode = src_cap.channelMode & a2dp_aac_sink_caps.channelMode;
+  if (allowed_rate == 0 || allowed_mode == 0) {
+    APPL_TRACE_ERROR("%s: no common rate (0x%x vs 0x%x) or channel mode (0x%x vs 0x%x)",
+                     __func__, src_cap.sampleRate, a2dp_aac_sink_caps.sampleRate,
+                     src_cap.channelMode, a2dp_aac_sink_caps.channelMode);
+    return false;
+  }
+
+  tA2DP_AAC_CIE cfg = a2dp_aac_sink_caps;
+  cfg.sampleRate  = (allowed_rate & A2DP_AAC_SAMPLING_FREQ_48000)
+                  ? A2DP_AAC_SAMPLING_FREQ_48000 : A2DP_AAC_SAMPLING_FREQ_44100;
+  cfg.channelMode = (allowed_mode & A2DP_AAC_CHANNEL_MODE_STEREO)
+                  ? A2DP_AAC_CHANNEL_MODE_STEREO : A2DP_AAC_CHANNEL_MODE_MONO;
+  cfg.objectType  = A2DP_AAC_OBJECT_TYPE_MPEG2_LC;
+
+  return A2DP_BuildInfoAac(A2D_MEDIA_TYPE_AUDIO, &cfg, p_result) == A2D_SUCCESS;
 }

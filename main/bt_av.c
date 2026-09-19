@@ -96,6 +96,10 @@ static const char *TAG = "sat.bt";
  */
 #define BT_COVER_MAX_BYTES  (48 * 1024)
 
+/* Leave room in the droppable queue for the telemetry that shares it, so a cover
+ * transfer does not evict a TRACK_POS or a LOG on its way past. */
+#define LINK_BULK_COVER_HEADROOM   4
+
 /* Transaction labels. AVRCP allows sixteen; giving each conversation its own
  * makes a packet capture readable. */
 #define TL_META         0
@@ -363,7 +367,31 @@ static void cover_send(void)
     ESP_LOGI(TAG, "cover art: %u bytes, %u chunks, mime %u",
              (unsigned)s_now.art_len, total, mime);
 
+    /*
+     * Paced, because this is the one producer that can outrun the wire.
+     *
+     * A 48 KB image is 48 chunks and the droppable queue holds fourteen; when it
+     * is full the oldest entry is discarded, which is precisely the chunks the
+     * host needs first. Pushing the lot without pacing delivered images with
+     * their heads missing -- and quietly evicted whatever TRACK_POS or LOG was
+     * queued behind them. A kilobyte is about twenty-three milliseconds of wire
+     * at 460800 baud, so waiting is the honest thing to do.
+     *
+     * The wait is bounded: if the link is not draining, giving up beats blocking
+     * this task for ever, and a cover is the most droppable thing there is.
+     */
     for (uint16_t i = 0; i < total; i++) {
+        int waited_ms = 0;
+        while (link_bulk_pending() > (LINK_BULK_COVER_HEADROOM) && waited_ms < 2000) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            waited_ms += 10;
+        }
+        if (waited_ms >= 2000) {
+            ESP_LOGW(TAG, "cover art: link not draining, abandoning at chunk %u of %u",
+                     i, total);
+            return;
+        }
+
         size_t offset = (size_t)i * SATLINK_COVER_CHUNK_MAX;
         size_t n = s_now.art_len - offset;
         if (n > SATLINK_COVER_CHUNK_MAX) { n = SATLINK_COVER_CHUNK_MAX; }
