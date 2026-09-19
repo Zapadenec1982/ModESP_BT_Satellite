@@ -47,9 +47,11 @@ extern size_t aptx_decode32(struct aptx_context *ctx,
                             size_t output_size,
                             size_t *written);
 
-/* One aptX frame decodes to 4 samples per channel; at 24 bits and two
- * channels that is 24 bytes of output per frame. */
+/* One aptX frame decodes to 4 samples per channel, two channels: 24 bytes as
+ * libfreeaptx writes it at 24 bits, 32 once widened to the int32 samples this
+ * decoder hands out. */
 #define APTX_BYTES_PER_FRAME_24     24
+#define APTX_BYTES_PER_FRAME_32     32
 
 typedef enum
 {
@@ -111,26 +113,37 @@ ssize_t a2dp_aptx_decoder_decode_packet_header(BT_HDR* p_buf) {
     return a2dp_rtp_strip_header(p_buf);
 }
 
-/* aptx_decode_sync writes 24-bit samples, three bytes each, little endian. The
- * I2S bus wants 16. Narrowing in place is safe because the destination index
- * always trails the source: 2i <= 3i, and both bytes of each sample are read
- * before either is written. */
-static size_t aptx_pack24_to_pcm16(uint8_t *p, size_t bytes24)
+/* aptx_decode_sync writes 24-bit samples, three bytes each, little endian. This
+ * widens them to int32 with the 24 bits left aligned and the low byte zero, which
+ * is the widest thing anything downstream can use and loses nothing.
+ *
+ * Narrowing to whatever the wire actually takes belongs to main/audio_out.c, which
+ * knows the slot width and dithers when it has to. Doing it here, as the code this
+ * was ported from did, threw away eight bits before anyone could decide whether
+ * they were wanted.
+ *
+ * In place and back to front: the destination of sample i is 4i, the source is
+ * 3i, and 4i is never below 3i, so descending order never overwrites a byte that
+ * has not been read yet. */
+static size_t aptx_widen24_to_s32(uint8_t *p, size_t bytes24)
 {
     size_t samples = bytes24 / 3;
-    for (size_t i = 0; i < samples; i++) {
-        uint8_t lo = p[3 * i + 1];
-        uint8_t hi = p[3 * i + 2];
-        p[2 * i + 0] = lo;
-        p[2 * i + 1] = hi;
+    for (size_t i = samples; i-- > 0; ) {
+        uint8_t b0 = p[3 * i + 0];
+        uint8_t b1 = p[3 * i + 1];
+        uint8_t b2 = p[3 * i + 2];
+        p[4 * i + 0] = 0;
+        p[4 * i + 1] = b0;
+        p[4 * i + 2] = b1;
+        p[4 * i + 3] = b2;
     }
-    return samples * 2;
+    return samples * 4;
 }
 
 bool a2dp_aptx_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf, size_t buf_len) {
     struct aptx_context* ctx = a2dp_aptx_decoder_cb.decoder_context;
 
-    if (!ctx || !buf || buf_len < APTX_BYTES_PER_FRAME_24) {
+    if (!ctx || !buf || buf_len < APTX_BYTES_PER_FRAME_32) {
         return false;
     }
 
@@ -141,8 +154,11 @@ bool a2dp_aptx_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf, size_t b
     /* Hand aptx_decode_sync no more input per call than its output can hold.
      * If the output fills mid-call it stops early, and the sync layer reads a
      * short return as a parity failure and throws the frame away -- silent,
-     * self-inflicted packet loss. Capping the input makes that unreachable. */
-    const size_t max_in = (buf_len / APTX_BYTES_PER_FRAME_24) *
+     * self-inflicted packet loss. Capping the input makes that unreachable.
+     *
+     * The cap is computed against the widened size, not the 24-bit size, because
+     * the widening happens in the same buffer and needs the room. */
+    const size_t max_in = (buf_len / APTX_BYTES_PER_FRAME_32) *
                           (a2dp_aptx_decoder_cb.aptx_type == APTX_HD ? 6 : 4);
 
     while (taken < src_len) {
@@ -157,7 +173,7 @@ bool a2dp_aptx_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf, size_t b
                                        buf, buf_len, &written24, &synced, &dropped);
 
         if (written24 > 0) {
-            size_t pcm_len = aptx_pack24_to_pcm16((uint8_t *)buf, written24);
+            size_t pcm_len = aptx_widen24_to_s32((uint8_t *)buf, written24);
             if (pcm_len > 0) {
                 a2dp_aptx_decoder_cb.decode_callback((uint8_t *)buf, pcm_len);
             }

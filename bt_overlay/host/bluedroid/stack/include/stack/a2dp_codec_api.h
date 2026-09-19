@@ -235,4 +235,16 @@ const char* A2DP_CodecName(const uint8_t* p_codec_info);
 bool A2DP_CodecTypeEquals(const uint8_t* p_codec_info_a,
                           const uint8_t* p_codec_info_b);
 
+
+/* See a2dp_codec_config.c. Call before the endpoints are registered. */
+void A2DP_SinkAllow48kHz(bool allow);
+void A2DP_SbcSinkAllow48kHz(bool allow);
+#if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)
+void A2DP_AacSinkAllow48kHz(bool allow);
+#endif
+#if (defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE)
+void A2DP_AptxSinkAllow48kHz(bool allow);
+void A2DP_AptxHdSinkAllow48kHz(bool allow);
+#endif
+
 #endif  // A2DP_CODEC_API_H

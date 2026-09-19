@@ -3030,8 +3030,8 @@
 + * dropouts and looks like nothing at all in this firmware's own counters.
 + *
 + * When a host appears that can relock, this is where 48 kHz comes back. */
-+static const tA2D_SBC_CIE a2dp_sbc_sink_caps = {
-+    A2D_SBC_IE_SAMP_FREQ_44, /* samp_freq -- see the note above */
++static tA2D_SBC_CIE a2dp_sbc_sink_caps = {
++    A2D_SBC_IE_SAMP_FREQ_44, /* samp_freq -- A2DP_SinkAllow48kHz may add 48 */
 +    (A2D_SBC_IE_CH_MD_MONO | A2D_SBC_IE_CH_MD_STEREO | A2D_SBC_IE_CH_MD_JOINT | A2D_SBC_IE_CH_MD_DUAL), /* ch_mode */
 +    (A2D_SBC_IE_BLOCKS_16 | A2D_SBC_IE_BLOCKS_12 | A2D_SBC_IE_BLOCKS_8 | A2D_SBC_IE_BLOCKS_4), /* block_len */
 +    (A2D_SBC_IE_SUBBAND_4 | A2D_SBC_IE_SUBBAND_8), /* num_subbands */
@@ -3069,7 +3069,7 @@
  /******************************************************************************
  **
  ** Function         A2D_BldSbcInfo
-@@ -222,4 +292,237 @@
+@@ -222,4 +292,245 @@
      }
  }
  
@@ -3213,6 +3213,14 @@
 +  }
 +
 +  return false;
++}
++
++void A2DP_SbcSinkAllow48kHz(bool allow) {
++  if (allow) {
++    a2dp_sbc_sink_caps.samp_freq |= A2D_SBC_IE_SAMP_FREQ_48;
++  } else {
++    a2dp_sbc_sink_caps.samp_freq &= ~A2D_SBC_IE_SAMP_FREQ_48;
++  }
 +}
 +
 +bool A2DP_InitCodecConfigSbcSink(uint8_t* p_codec_info) {

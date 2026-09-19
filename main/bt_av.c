@@ -33,6 +33,17 @@
 #define BT_AV_CODEC_LIST    ", SBC"
 #endif
 
+/*
+ * Declared here rather than by including the Bluedroid stack header.
+ *
+ * A2DP_SinkAllow48kHz is ours -- it arrives with patches/0001 -- but it lives in
+ * the stack's private include path, which the application component cannot see,
+ * and it is not part of esp_a2dp_api.h. Adding it to the public API would mean
+ * more patch surface in a header Espressif owns, for one call made once at
+ * startup. See bt_overlay/host/bluedroid/stack/a2dp/a2dp_codec_config.c.
+ */
+extern void A2DP_SinkAllow48kHz(bool allow);
+
 static const char *TAG = "sat.bt";
 
 #define BT_TASK_STACK       3584
@@ -438,10 +449,12 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
         const uint8_t *cie = (const uint8_t *)&mcc->cie;
         uint32_t rate = 0;
         uint8_t  channels = 2;
+        uint8_t  src_bits = 16;
 
         switch (mcc->type) {
         case ESP_A2D_MCT_SBC:
             rate = sbc_rate_hz(&mcc->cie.sbc_info);
+            src_bits = 16;
             s_now.codec = SATLINK_CODEC_SBC;
             ESP_LOGI(TAG, "codec SBC, %" PRIu32 " Hz, bitpool %u..%u",
                      rate, mcc->cie.sbc_info.min_bitpool, mcc->cie.sbc_info.max_bitpool);
@@ -450,6 +463,7 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
         case ESP_A2D_MCT_M24:
             rate = aac_rate_hz(cie);
             channels = aac_channels(cie);
+            src_bits = 16;
             s_now.codec = SATLINK_CODEC_AAC;
             ESP_LOGI(TAG, "codec AAC, %" PRIu32 " Hz, %u channel(s)", rate, channels);
             break;
@@ -459,6 +473,10 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
             uint16_t codec  = aptx_codec_id(cie);
             rate     = aptx_rate_hz(cie);
             channels = aptx_channels(cie);
+            /* Both aptX variants come out of libfreeaptx at 24 bits, widened to
+             * int32 by the decoder. Narrowing, if the wire needs it, happens in
+             * audio_out with dither rather than here by truncation. */
+            src_bits = 32;
 
             if (vendor == 0x0000004F && codec == 0x0001) {
                 s_now.codec = SATLINK_CODEC_APTX;
@@ -498,11 +516,13 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
                               "device must not offer", rate);
             }
             audio_out_set_rate(rate);
-            /* Sixteen-bit slots, whatever the codec: that is what the I2S master
-             * is configured for and what a counter on the pins measures, BCLK
-             * divided by WS being exactly 32. */
+            audio_out_set_source_bits(src_bits);
+            /* The slot width is fixed at startup from what the host said it can
+             * take, not per codec: the host locks to it once. STREAM_FMT reports
+             * the slot, which is what a counter on the pins measures -- BCLK over
+             * WS is twice this number. */
             s_now.rate_hz  = rate;
-            s_now.bits     = 16;
+            s_now.bits     = audio_out_slot_bits();
             s_now.channels = channels;
             /* Before the first sample, which is the one hard promise this message
              * makes to the host. */
@@ -953,6 +973,26 @@ esp_err_t bt_av_start(const char *device_name)
                                        ESP_AVRC_RN_VOLUME_CHANGE);
     ESP_RETURN_ON_ERROR(esp_avrc_tg_set_rn_evt_cap(&evt_set), TAG, "avrc_tg_rn_cap");
     s_now.volume = 127;    /* full scale until the phone says otherwise */
+
+    /*
+     * Two decisions the host makes for us, both read from HELLO and both taken
+     * here because the endpoints are about to be registered and their advertised
+     * capabilities are never looked at again.
+     *
+     * If HELLO has not arrived yet -- the host booting later than us, say -- caps
+     * read as zero and both answers are the conservative one. That is the right
+     * way round to be wrong: 44.1 kHz in 16-bit slots is what every host can take,
+     * and a host that wanted more will get it after the next restart.
+     */
+    uint32_t host_caps = link_host_caps();
+
+    A2DP_SinkAllow48kHz((host_caps & SATLINK_HOST_CAP_RELOCK) != 0);
+    if (host_caps & SATLINK_HOST_CAP_WIDE) {
+        audio_out_set_slot_bits(32);
+    }
+    ESP_LOGI(TAG, "endpoints offer %s, %u-bit slots",
+             (host_caps & SATLINK_HOST_CAP_RELOCK) ? "44.1 and 48 kHz" : "44.1 kHz only",
+             audio_out_slot_bits());
 
     ESP_RETURN_ON_ERROR(esp_a2d_register_callback(a2d_cb), TAG, "a2d_register");
     ESP_RETURN_ON_ERROR(esp_a2d_sink_init(), TAG, "a2d_sink_init");

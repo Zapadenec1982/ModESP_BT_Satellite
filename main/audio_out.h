@@ -23,6 +23,31 @@ void audio_out_write(const uint8_t *pcm, size_t len);
  * which is before the first sample arrives. */
 esp_err_t audio_out_set_rate(uint32_t rate_hz);
 
+/*
+ * Slot width on the wire: 16 or 32 bits, two channels either way.
+ *
+ * Sixteen is the default and the only width a host gets unless it says in HELLO
+ * that it can take thirty-two. Thirty-two exists for one reason: aptX HD carries
+ * 24-bit samples, and narrowing them to 16 throws away eight bits that the codec
+ * went to some trouble to deliver.
+ *
+ * Must be set before the first sample, and it changes what STREAM_FMT announces.
+ * BCLK follows: 32 clocks per frame at 16-bit slots, 64 at 32-bit.
+ */
+esp_err_t audio_out_set_slot_bits(uint8_t bits);
+uint8_t   audio_out_slot_bits(void);
+
+/*
+ * What the decoder is about to start handing to audio_out_write(): 16-bit
+ * samples, or 32-bit ones carrying 24 significant bits in the top.
+ *
+ * SBC and AAC decode to 16. aptX and aptX HD decode to 24, widened to 32 on the
+ * way out of the decoder so that nothing is lost before this point. Set it when
+ * the codec is known and before the stream starts; the output stage converts to
+ * whatever the wire is, dithering when it has to narrow.
+ */
+void audio_out_set_source_bits(uint8_t bits);
+
 /* Samples dropped since boot because the ring was full. Zero is the only good value;
  * anything else means the host is not taking the data fast enough. */
 uint32_t audio_out_dropped_bytes(void);

@@ -40,7 +40,7 @@ static const tA2DP_APTX_HD_CIE a2dp_aptx_hd_source_caps = {
  * dropouts and looks like nothing at all in this firmware's own counters.
  *
  * When a host appears that can relock, this is where 48 kHz comes back. */
-static const tA2DP_APTX_HD_CIE a2dp_aptx_hd_sink_caps = {
+static tA2DP_APTX_HD_CIE a2dp_aptx_hd_sink_caps = {
     A2DP_APTX_HD_VENDOR_ID,          /* vendorId */
     A2DP_APTX_HD_CODEC_ID_BLUETOOTH, /* codecId */
     (A2DP_APTX_HD_SAMPLERATE_44100 |
@@ -282,6 +282,14 @@ bool A2DP_VendorInitCodecConfigAptxHd(btav_a2dp_codec_index_t codec_index, UINT8
       break;
   }
   return false;
+}
+
+void A2DP_AptxHdSinkAllow48kHz(bool allow) {
+  if (allow) {
+    a2dp_aptx_hd_sink_caps.sampleRate |= A2DP_APTX_HD_SAMPLERATE_48000;
+  } else {
+    a2dp_aptx_hd_sink_caps.sampleRate &= ~A2DP_APTX_HD_SAMPLERATE_48000;
+  }
 }
 
 bool A2DP_VendorInitCodecConfigAptxHdSink(uint8_t* p_codec_info) {

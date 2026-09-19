@@ -25,6 +25,29 @@
 
 #if (A2D_INCLUDED == TRUE)
 
+/*
+ * Whether the stream endpoints may offer 48 kHz as well as 44.1.
+ *
+ * This is not a codec question, it is a question about the far end of the I2S
+ * bus. The host says in HELLO whether it can follow a rate change; if it cannot,
+ * offering 48 kHz means a phone will take it -- aptX HD picks 48 given the choice
+ * -- and the host will then read a 48 kHz stream at 44.1. That sounds like
+ * distortion with dropouts and shows up in no counter this firmware keeps.
+ *
+ * Call before esp_a2d_sink_init(): the capabilities are read when the endpoints
+ * are registered and not looked at again.
+ */
+void A2DP_SinkAllow48kHz(bool allow) {
+  A2DP_SbcSinkAllow48kHz(allow);
+#if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)
+  A2DP_AacSinkAllow48kHz(allow);
+#endif
+#if (defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE)
+  A2DP_AptxSinkAllow48kHz(allow);
+  A2DP_AptxHdSinkAllow48kHz(allow);
+#endif
+}
+
 tA2D_CODEC_TYPE A2DP_GetCodecType(const uint8_t* p_codec_info) {
   return (tA2D_CODEC_TYPE)(p_codec_info[AVDT_CODEC_TYPE_INDEX]);
 }

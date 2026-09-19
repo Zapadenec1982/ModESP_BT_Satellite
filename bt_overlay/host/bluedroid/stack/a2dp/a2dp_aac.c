@@ -51,7 +51,7 @@ static const tA2DP_AAC_CIE a2dp_aac_cbr_source_caps = {
  * dropouts and looks like nothing at all in this firmware's own counters.
  *
  * When a host appears that can relock, this is where 48 kHz comes back. */
-static const tA2DP_AAC_CIE a2dp_aac_sink_caps = {
+static tA2DP_AAC_CIE a2dp_aac_sink_caps = {
     // objectType
     A2DP_AAC_OBJECT_TYPE_MPEG2_LC | A2DP_AAC_OBJECT_TYPE_MPEG2_LC,
     // sampleRate -- see the note above
@@ -329,6 +329,14 @@ bool A2DP_InitCodecConfigAac(btav_a2dp_codec_index_t codec_index, UINT8 *p_resul
 // #endif
 
   return false;
+}
+
+void A2DP_AacSinkAllow48kHz(bool allow) {
+  if (allow) {
+    a2dp_aac_sink_caps.sampleRate |= A2DP_AAC_SAMPLING_FREQ_48000;
+  } else {
+    a2dp_aac_sink_caps.sampleRate &= ~A2DP_AAC_SAMPLING_FREQ_48000;
+  }
 }
 
 bool A2DP_InitCodecConfigAacSink(uint8_t* p_codec_info) {

@@ -58,6 +58,7 @@ typedef enum {
 #define SATLINK_HOST_CAP_RELOCK   (1u << 0)  /* can follow STREAM_FMT mid-flight */
 #define SATLINK_HOST_CAP_COVER    (1u << 1)
 #define SATLINK_HOST_CAP_EXPANDER (1u << 2)
+#define SATLINK_HOST_CAP_WIDE     (1u << 3)  /* can take 32-bit slots; STREAM_FMT.bits says which */
 
 /* BT_STATE.state */
 typedef enum {
