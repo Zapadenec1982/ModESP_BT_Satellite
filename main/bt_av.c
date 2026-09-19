@@ -15,6 +15,8 @@
 #include "esp_gap_bt_api.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_random.h"
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -125,20 +127,25 @@ static const char *TAG = "sat.bt";
  */
 #define POS_NOTIFY_INTERVAL_S  5
 
-/* Silence between announcing a format and clocking it, per PROTOCOL.md,
- * "Частота: одна на з'єднання". The host needs it to stop its channel and
- * bring it back up on the new width; the width is the part that fails
- * silently if it does not get the chance. */
-#define BT_AV_FMT_SILENCE_MS   50
-
 /* A2DP events arrive on the Bluetooth stack's own task. Anything that can block —
  * retuning the I2S clock, for one — is handed to this task instead. */
 typedef struct {
     uint16_t             event;
     esp_a2d_cb_param_t   param;
+    fmt_ready_t ready;
+    uint32_t codec_epoch;
 } bt_a2d_msg_t;
 
 static QueueHandle_t s_queue;
+#define BT_EVENT_FORMAT_READY 0xff00
+static atomic_bool s_caps_pending;
+static atomic_uint s_latest_codec_epoch;
+static uint32_t s_codec_epoch;
+static fmt_barrier_t s_format;
+static uint32_t s_nonce, s_generation, s_gate_token, s_retry_ms;
+static uint8_t s_decoder_bits = 16;
+static bool s_format_pending;
+
 
 /* Everything the host is ever told about, in one place. */
 static struct {
@@ -255,35 +262,75 @@ static uint8_t aptx_channels(const uint8_t *cie)
     return (cie[APTX_CIE_FREQ_CHAN] & 0x01) ? 1 : 2;    /* 0x01 mono, 0x02 stereo */
 }
 
+static void announce_format(void)
+{
+    if (s_now.rate_hz && s_format.request.generation)
+        link_send_format(&s_format.request, s_format.require_ack);
+}
+
+static void begin_format(uint32_t rate, uint8_t bits, uint8_t channels, uint8_t source_bits)
+{
+    s_decoder_bits = source_bits;
+    s_now.rate_hz = rate; s_now.bits = bits; s_now.channels = channels;
+    s_format_pending = false;
+    esp_err_t err = audio_out_begin_format(&s_gate_token);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "cannot silence I2S: %s", esp_err_to_name(err)); return; }
+    if (!s_nonce || ++s_generation == 0) {
+        do { s_nonce = esp_random(); } while (!s_nonce);
+        s_generation = 1;
+    }
+    fmt_request_t r = {s_nonce, s_generation, rate, bits, channels};
+    fmt_begin(&s_format, r, (link_host_caps() & FMT_HOST_CAP) != 0);
+    if (!fmt_valid(&r)) { ESP_LOGE(TAG, "unsupported stream format; PCM stays gated"); return; }
+    s_format_pending = true;
+    s_retry_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    announce_format();
+}
+
 void bt_av_apply_host_caps(void)
 {
-    uint8_t want = (link_host_caps() & SATLINK_HOST_CAP_WIDE) ? 32 : 16;
-    if (want == audio_out_slot_bits()) {
-        return;
+    atomic_store(&s_caps_pending, true);
+}
+
+void bt_av_format_ready(const fmt_ready_t *ready)
+{
+    if (!s_queue) return;
+    bt_a2d_msg_t msg = { .event = BT_EVENT_FORMAT_READY, .ready = *ready };
+    // Losing an ACK is safe: PREPARE retries and the host repeats READY.
+    xQueueSend(s_queue, &msg, 0);
+}
+
+static void poll_format(void)
+{
+    const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (atomic_exchange(&s_caps_pending, false) && s_now.rate_hz) {
+        uint32_t caps = link_host_caps();
+        bool ack = (caps & FMT_HOST_CAP) != 0;
+        uint8_t bits = fmt_slot_bits(s_decoder_bits, (caps & SATLINK_HOST_CAP_WIDE) != 0, ack);
+        if (bits != s_now.bits || ack != s_format.require_ack)
+            begin_format(s_now.rate_hz, bits, s_now.channels, s_decoder_bits);
+        else announce_format(); // a restarted host must relearn the current transaction
     }
-
-    /*
-     * Announce, then be quiet, then change. PROTOCOL.md 1.2 asks for exactly this
-     * and it asks because of this: an earlier build widened the slots at startup,
-     * with no A2DP connection in sight and therefore no STREAM_FMT to trigger.
-     * BCLK went from 32 clocks a frame to 64 while the host was still reading
-     * 16-bit words, and the speakers made noise.
-     *
-     * If nothing has been negotiated yet, what is announced is what the clock is
-     * actually doing: the I2S rate, in the width it is about to take. That is not
-     * a guess, it is a description.
-     */
-    if (s_now.rate_hz == 0) {
-        s_now.rate_hz = audio_out_rate_hz();
+    if (!s_format_pending) return;
+    uint32_t sent_ms;
+    if (!s_format.transmitted && link_format_sent(&s_format.request, &sent_ms))
+        fmt_sent(&s_format, sent_ms);
+    if (s_format.transmitted && !s_format.configured && !s_format.refused) {
+        esp_err_t err = audio_out_configure(s_format.request.rate_hz, s_format.request.bits, s_decoder_bits);
+        if (err != ESP_OK) {
+            s_format.refused = true;
+            ESP_LOGE(TAG, "I2S format failed; PCM stays gated: %s", esp_err_to_name(err));
+        } else s_format.configured = true;
     }
-    s_now.bits     = want;
-    s_now.channels = 2;
-    bt_av_report_stream_fmt();
-
-    audio_out_flush();
-    vTaskDelay(pdMS_TO_TICKS(BT_AV_FMT_SILENCE_MS));
-
-    audio_out_set_slot_bits(want);
+    if (fmt_can_resume_source(&s_format, now, s_codec_epoch, atomic_load(&s_latest_codec_epoch)) &&
+        audio_out_resume(s_gate_token)) {
+        s_format_pending = false;
+        ESP_LOGI(TAG, "format ready: %" PRIu32 " Hz / %u-bit, generation %" PRIu32,
+                 s_now.rate_hz, s_now.bits, s_generation);
+    } else if (!s_format.refused && now - s_retry_ms >= FMT_RETRY_MS) {
+        s_retry_ms = now;
+        announce_format();
+    }
 }
 
 void bt_av_report_state(void)
@@ -293,12 +340,7 @@ void bt_av_report_state(void)
 
 void bt_av_report_stream_fmt(void)
 {
-    if (s_now.rate_hz == 0) {
-        return;     /* nothing negotiated yet; there is no format to announce */
-    }
-    link_send_stream_fmt(s_now.rate_hz, s_now.bits, s_now.channels);
-    ESP_LOGI(TAG, "announced %" PRIu32 " Hz, %u-bit slots, %u channels",
-             s_now.rate_hz, s_now.bits, s_now.channels);
+    atomic_store(&s_caps_pending, true);
 }
 
 static void send_track_meta(void *arg)
@@ -496,6 +538,16 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
     const esp_a2d_cb_param_t *p = &msg->param;
 
     switch (msg->event) {
+    case BT_EVENT_FORMAT_READY: {
+        const bool refused_before = s_format.refused;
+        fmt_ack(&s_format, &msg->ready);
+        if (!refused_before && s_format.refused) {
+            uint32_t ignored_token;
+            audio_out_begin_format(&ignored_token);
+            ESP_LOGE(TAG, "host refused format generation %" PRIu32 "; PCM stays gated", s_generation);
+        }
+        break;
+    }
     case ESP_A2D_CONNECTION_STATE_EVT: {
         const uint8_t *bda = p->conn_stat.remote_bda;
         ESP_LOGI(TAG, "a2dp %s, %02x:%02x:%02x:%02x:%02x:%02x",
@@ -515,6 +567,11 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
             s_now.name[0] = '\0';
             s_now.codec = SATLINK_CODEC_NONE;
             s_now.rate_hz = 0;
+            s_format_pending = false;
+            memset(&s_format, 0, sizeof s_format);
+            uint32_t ignored_token;
+            audio_out_begin_format(&ignored_token);
+            audio_out_set_streaming(false);
             s_now.state = SATLINK_BT_DISCOVERABLE;
             s_now.play_state = SATLINK_PLAY_STOPPED;
             s_now.title[0] = s_now.artist[0] = s_now.album[0] = '\0';
@@ -536,6 +593,7 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
     }
 
     case ESP_A2D_AUDIO_CFG_EVT: {
+        s_codec_epoch = msg->codec_epoch;
         const esp_a2d_mcc_t *mcc = &p->audio_cfg.mcc;
         const uint8_t *cie = (const uint8_t *)&mcc->cie;
         uint32_t rate = 0;
@@ -612,40 +670,10 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
                               "and cannot relock: an endpoint is advertising a rate this "
                               "device must not offer", rate);
             }
-            /* The slot width is fixed at startup from what the host said it can
-             * take, not per codec: the host locks to it once. STREAM_FMT reports
-             * the slot, which is what a counter on the pins measures -- BCLK over
-             * WS is twice this number. */
-            s_now.rate_hz  = rate;
-            s_now.bits     = audio_out_slot_bits();
-            s_now.channels = channels;
-
-            /*
-             * Announce, then go quiet, then move the clock. In that order.
-             *
-             * PROTOCOL.md asks for STREAM_FMT, then at least 50 ms of silence on
-             * I2S, then samples at the new format. This used to retune first and
-             * announce afterwards, which worked only because nothing is streaming
-             * yet when a codec is configured -- the ring is empty and the wire is
-             * carrying zeros. On a renegotiation mid-connection it would not have
-             * worked, and the failure is the silent kind: the host reframes to a
-             * rate it has not been told about yet.
-             *
-             * The host counts slot width in BCLK ticks from its own configuration,
-             * so a receiver still set to the old width against the new stream
-             * gathers one frame out of two and welds the channels into one word.
-             * Nothing downstream can detect that; only this ordering prevents it.
-             *
-             * Blocking here is fine and is why this task exists: A2DP events arrive
-             * on the Bluetooth stack's task and are handed over precisely so that
-             * the slow parts can be slow.
-             */
-            bt_av_report_stream_fmt();
-            audio_out_flush();
-            vTaskDelay(pdMS_TO_TICKS(BT_AV_FMT_SILENCE_MS));
-
-            audio_out_set_rate(rate);
-            audio_out_set_source_bits(src_bits);
+            uint32_t caps = link_host_caps();
+            bool acknowledged = (caps & FMT_HOST_CAP) != 0;
+            uint8_t bits = fmt_slot_bits(src_bits, (caps & SATLINK_HOST_CAP_WIDE) != 0, acknowledged);
+            begin_format(rate, bits, channels, src_bits);
         }
         bt_av_report_state();
         break;
@@ -663,15 +691,24 @@ static void bt_av_task(void *arg)
 
     bt_a2d_msg_t msg;
     for (;;) {
-        if (xQueueReceive(s_queue, &msg, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(s_queue, &msg, pdMS_TO_TICKS(10)) == pdTRUE) {
             handle_a2d_event(&msg);
         }
+        poll_format();
     }
 }
 
 static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 {
+    // Invalidate old control work before the next decoder callback. The epoch
+    // also covers a newer CFG queued while an older event is still being handled.
     bt_a2d_msg_t msg = { .event = (uint16_t)event };
+    if (event == ESP_A2D_AUDIO_CFG_EVT ||
+        (event == ESP_A2D_CONNECTION_STATE_EVT && param &&
+         param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED)) {
+        msg.codec_epoch = atomic_fetch_add(&s_latest_codec_epoch, 1) + 1;
+        audio_out_gate();
+    }
     if (param != NULL) {
         memcpy(&msg.param, param, sizeof(msg.param));
     }

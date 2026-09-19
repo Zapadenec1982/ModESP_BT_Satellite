@@ -1,9 +1,8 @@
 /*
  * Framing: 0x00 | COBS( type | seq | payload | crc16 ) | 0x00
  *
- * The encoder emits the trailing delimiter only. Frames sent back to back then
- * share one, which is what the spec allows, and a receiver treats anything
- * between two delimiters as a frame — an empty one is simply ignored.
+ * The encoder emits both delimiters, matching the host implementation.
+ * A receiver also accepts shared delimiters and ignores empty frames.
  */
 
 #pragma once
@@ -23,7 +22,7 @@ typedef enum {
     SATLINK_FRAME_TOO_LONG,
 } satlink_frame_result_t;
 
-/* Encodes one frame, trailing delimiter included. `out` needs SATLINK_WIRE_MAX
+/* Encodes one frame, both delimiters included. `out` needs SATLINK_WIRE_MAX
  * for the largest payload. */
 bool satlink_frame_encode(uint8_t type, uint8_t seq,
                           const uint8_t *payload, size_t payload_len,

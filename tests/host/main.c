@@ -17,6 +17,7 @@ static void run(const char *group, const test_case_t *tests, size_t count)
 
 int main(void)
 {
+    run("format negotiation", format_tests, format_test_count);
     run("framing", frame_tests, frame_test_count);
     run("messages", message_tests, message_test_count);
     run("golden vectors from the host", golden_tests, golden_test_count);

@@ -32,6 +32,7 @@ New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
 $sources = @(
     (Join-Path $repoRoot 'tests\host\main.c'),
+    (Join-Path $repoRoot 'tests\host\test_format_sync.c'),
     (Join-Path $repoRoot 'tests\host\test_satlink.c'),
     (Join-Path $repoRoot 'tests\host\test_messages.c'),
     (Join-Path $repoRoot 'tests\host\test_golden.c'),

@@ -11,6 +11,8 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "satlink/format_sync.h"
+void bt_av_format_ready(const fmt_ready_t *ready);
 
 #include "esp_err.h"
 

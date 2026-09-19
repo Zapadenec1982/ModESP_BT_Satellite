@@ -6,13 +6,14 @@
  */
 
 #pragma once
+#include "format_sync.h"
 
 #include <stdint.h>
 
 #define SATLINK_PROTO_MAJOR   1
-/* 1.2: STREAM_FMT before any format change, not only at the start of a
- * connection; repeated in answer to HELLO; forgotten on disconnect. */
-#define SATLINK_PROTO_MINOR   2
+/* 1.3: optional correlated STREAM_PREPARE / STREAM_READY transitions.
+ * Legacy STREAM_FMT layouts remain unchanged. */
+#define SATLINK_PROTO_MINOR   3
 
 /* The largest decoded frame: type | seq | payload | crc16. */
 #define SATLINK_FRAME_MAX     1040
@@ -139,3 +140,7 @@ typedef enum {
 #define SATLINK_PIN_HAS_PULL    (1u << 3)
 
 #define SATLINK_GPIO_MAX        32     /* GPIO_IN and GPIO_OUT carry u32 masks */
+
+#define SATLINK_MSG_STREAM_PREPARE FMT_PREPARE
+#define SATLINK_MSG_STREAM_READY FMT_READY
+#define SATLINK_HOST_CAP_FORMAT_READY FMT_HOST_CAP

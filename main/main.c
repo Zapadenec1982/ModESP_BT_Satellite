@@ -117,6 +117,9 @@ void app_main(void)
 
     const link_handlers_t handlers = {
         .on_hello     = on_hello,
+#if !CONFIG_SAT_LINK_ONLY
+        .on_format_ready = bt_av_format_ready,
+#endif
         .on_transport = on_transport,
         .on_volume    = on_volume,
         .on_radio     = on_radio,

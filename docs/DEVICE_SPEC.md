@@ -47,11 +47,14 @@ WROOM, а не WROVER, і не тільки через PSRAM, якої тут н
 - Лінії: `BCLK`, `WS`, `DOUT`. **MCLK не потрібен і не виводиться.**
 - Стерео, 44,1 або 48 кГц, слоти 16 або 32 біти, формат Philips I2S.
 - Частота і розрядність оголошуються по UART **до першого семпла**, а не вгадуються хостом.
-- **Частота одна на все з'єднання A2DP.** Якщо хост у HELLO не сказав, що вміє перелочитись
-  на льоту, пристрій анонсує телефону тільки 44,1 кГц, щоб тому не було з чого вибирати.
-- **Ширина слота одна на весь час роботи**, і теж береться з HELLO. Без відповідного біта
-  пристрій шле 16 біт. Хост лочиться на неї один раз, тому вона не змінюється між
-  з'єднаннями A2DP, на відміну від частоти.
+- Rate and width may change within an A2DP connection. Announce every transition
+  using the negotiated protocol in `PROTOCOL.md`; never assume a lifetime format.
+  Without host RELOCK capability, A2DP still advertises only 44.1 kHz.
+- With protocol 1.3 FORMAT_READY and WIDE, use native decoder widths: SBC/AAC 16;
+  aptX/aptX HD 32-bit containers (24 significant bits). WIDE is a capability,
+  not an instruction to widen all samples. Legacy width policy remains compatible.
+- A negotiated transition stays silent until correlated host readiness and the
+  minimum 50 ms after completed UART transmission; lost ACK is retried, not ignored.
 - **Кодек може нести більше, ніж пройде в слот.** aptX HD дає 24 біти; у 16-бітних слотах
   вони звужуються з трикутним дизером, а не відкиданням молодшого байта. Відкидання зміщує
   кожен відлік в один бік і лишає помилку, корельовану з сигналом, що на тихому чути як
@@ -92,9 +95,11 @@ D = пристрій, H = хост.
 | `0x13` STREAM_FMT | D → H | частота, розрядність, канали. **До першого семпла** |
 | `0x14` COVER | D → H | обкладинка з AVRCP, шматками до 1024 байтів |
 | `0x15` VOLUME_STATE | D → H | гучність змінилась, і ким саме |
+| `0x16` STREAM_PREPARE | D → H | transaction identity and next format (1.3) |
 | `0x20` CMD_TRANSPORT | H → D | play, pause, stop, next, prev |
 | `0x21` CMD_VOLUME | H → D | абсолютна гучність AVRCP, 0..127 |
 | `0x22` CMD_RADIO | H → D | радіо увімк/вимк, видимість для парування |
+| `0x23` STREAM_READY | H → D | matching identity and preparation result (1.3) |
 | `0x30` GPIO_IN | D → H | стан входів і маска змінених |
 | `0x31` GPIO_OUT | H → D | значення і маска виходів |
 | `0x32` GPIO_CFG | H → D | напрямок і підтяжка, один раз на старті |
@@ -129,6 +134,8 @@ GPIO, і задає напрямки через `GPIO_CFG`.
 2. **Аудіо важливіше за телеметрію.** Жодна робота на лінку не має права викликати розрив у
    потоці I2S.
 3. **Мовчазний хост не є аварією.** Немає `PONG` — продовжувати грати й накопичувати стан.
+   Exception: a pending FORMAT_READY transition remains silent until confirmed;
+   missing PONG/READY never authorizes a new format to resume.
 4. **Стан після скидання визначений.** Виходи GPIO піднімаються в те, що задав хост, і не
    раніше. До `GPIO_CFG` усі свої лінії тримати входами.
 5. Логи йдуть у `LOG`, а не тільки в UART консоль.

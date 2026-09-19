@@ -19,39 +19,15 @@ esp_err_t audio_out_init(void);
  * writer must not be allowed to stall the Bluetooth stack. */
 void audio_out_write(const uint8_t *pcm, size_t len);
 
-/* Retunes the output clock. A2DP tells us the rate when the stream is configured,
- * which is before the first sample arrives. */
-esp_err_t audio_out_set_rate(uint32_t rate_hz);
-
-/*
- * Slot width on the wire: 16 or 32 bits, two channels either way.
- *
- * Sixteen is the default and the only width a host gets unless it says in HELLO
- * that it can take thirty-two. Thirty-two exists for one reason: aptX HD carries
- * 24-bit samples, and narrowing them to 16 throws away eight bits that the codec
- * went to some trouble to deliver.
- *
- * Must be set before the first sample, and it changes what STREAM_FMT announces.
- * BCLK follows: 32 clocks per frame at 16-bit slots, 64 at 32-bit.
- */
-esp_err_t audio_out_set_slot_bits(uint8_t bits);
-uint8_t   audio_out_slot_bits(void);
-
-/* What the master clock is actually producing. Needed to announce the format
- * before changing it, which is what PROTOCOL.md 1.2 requires and what this
- * firmware failed to do when it switched slot width at startup. */
-uint32_t  audio_out_rate_hz(void);
-
-/*
- * What the decoder is about to start handing to audio_out_write(): 16-bit
- * samples, or 32-bit ones carrying 24 significant bits in the top.
- *
- * SBC and AAC decode to 16. aptX and aptX HD decode to 24, widened to 32 on the
- * way out of the decoder so that nothing is lost before this point. Set it when
- * the codec is known and before the stream starts; the output stage converts to
- * whatever the wire is, dithering when it has to narrow.
- */
-void audio_out_set_source_bits(uint8_t bits);
+/* Close the callback-side PCM gate without waiting; invalidates old resume tokens. */
+uint32_t audio_out_gate(void);
+/* Control task only: exclude producer/writer, drain ring/carry, clear DMA to silence. */
+esp_err_t audio_out_begin_format(uint32_t *token);
+/* After the announcement was transmitted; stay gated if any step fails. */
+esp_err_t audio_out_configure(uint32_t rate_hz, uint8_t bits, uint8_t source_bits);
+bool audio_out_resume(uint32_t token);
+uint8_t audio_out_slot_bits(void);
+uint32_t audio_out_rate_hz(void);
 
 /* Samples dropped since boot because the ring was full. Zero is the only good value;
  * anything else means the host is not taking the data fast enough. */
@@ -84,15 +60,6 @@ typedef struct {
 
 /* Reads the counters and resets the high and low water marks. */
 void audio_out_get_stats(audio_out_stats_t *out);
-
-/*
- * Throws away whatever is still queued.
- *
- * Used when the format is about to change: samples captured under the old rate
- * or the old width are not merely late, they are wrong, and playing them out
- * after the clock has moved is worse than dropping them.
- */
-void audio_out_flush(void);
 
 /*
  * What is playing, for the periodic report.

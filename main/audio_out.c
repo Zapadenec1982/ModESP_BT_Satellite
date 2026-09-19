@@ -2,6 +2,7 @@
 
 #include <inttypes.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #include "board.h"
 
@@ -33,7 +34,7 @@ static const char *TAG = "sat.i2s";
  * Bluetooth task, shallow enough that latency stays sane. */
 #define AUDIO_RING_BYTES        (24 * 1024)
 #define AUDIO_CHUNK_BYTES       1024
-#define AUDIO_WRITE_TIMEOUT_MS  200
+#define AUDIO_WRITE_TIMEOUT_MS  20
 
 #define AUDIO_TASK_STACK        3072
 #define AUDIO_TASK_PRIO         (configMAX_PRIORITIES - 3)
@@ -59,6 +60,11 @@ static const char *TAG = "sat.i2s";
 static i2s_chan_handle_t  s_tx;
 static RingbufHandle_t    s_ring;
 static SemaphoreHandle_t  s_lock;       /* guards the channel against retune-while-writing */
+static SemaphoreHandle_t  s_producer_lock;
+static atomic_uint       s_gate = 1; /* bit 0 closed; upper bits invalidate old resumes */
+static bool              s_running;
+static bool              s_fault;
+static void flush_ring(void);
 static uint32_t           s_rate_hz = AUDIO_RATE_DEFAULT;
 static volatile uint32_t  s_dropped;
 static volatile uint32_t  s_underruns;
@@ -221,10 +227,8 @@ static uint32_t audio_wire_peak(const uint8_t *p, size_t len)
 
 static void i2s_write_locked(const void *data, size_t len)
 {
-    xSemaphoreTake(s_lock, portMAX_DELAY);
     size_t written = 0;
-    esp_err_t err = i2s_channel_write(s_tx, data, len, &written, pdMS_TO_TICKS(AUDIO_WRITE_TIMEOUT_MS));
-    xSemaphoreGive(s_lock);
+    esp_err_t err = i2s_channel_write(s_tx, data, len, &written, AUDIO_WRITE_TIMEOUT_MS);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "write failed: %s (%u of %u bytes)", esp_err_to_name(err),
                  (unsigned)written, (unsigned)len);
@@ -289,23 +293,40 @@ static void audio_out_task(void *arg)
     /* Never returns: with the tone on, nothing else reaches the pins. */
     static uint8_t tone_buf[AUDIO_CHUNK_BYTES];
     for (;;) {
-        size_t n = audio_tone_fill(tone_buf, sizeof(tone_buf));
-        i2s_write_locked(tone_buf, n);
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        if (!(atomic_load(&s_gate) & 1u)) {
+            size_t n = audio_tone_fill(tone_buf, sizeof(tone_buf));
+            i2s_write_locked(tone_buf, n);
+        }
+        xSemaphoreGive(s_lock);
+        vTaskDelay(1);
     }
 #endif
 
     for (;;) {
         audio_report();
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        if (atomic_load(&s_gate) & 1u) {
+            xSemaphoreGive(s_lock);
+            vTaskDelay(1);
+            continue;
+        }
         size_t len = 0;
-        uint8_t *item = xRingbufferReceiveUpTo(s_ring, &len, pdMS_TO_TICKS(100), AUDIO_CHUNK_BYTES);
+        uint8_t *item = xRingbufferReceiveUpTo(s_ring, &len, 0, AUDIO_CHUNK_BYTES);
         if (item == NULL) {
             /* Nothing to send. Between tracks that is silence and correct; during
              * a stream it is a hole in the music, because the DMA fills it with
              * zeros and says nothing. */
-            if (s_streaming) {
+            // Preserve the existing 100 ms starvation diagnostic cadence.
+            static TickType_t last_empty;
+            const TickType_t now = xTaskGetTickCount();
+            if (s_streaming && now - last_empty >= pdMS_TO_TICKS(100)) {
                 s_underruns++;
                 s_fill_min = 0;
+                last_empty = now;
             }
+            xSemaphoreGive(s_lock);
+            vTaskDelay(1);
             continue;
         }
 
@@ -366,13 +387,15 @@ static void audio_out_task(void *arg)
             i2s_write_locked(wire, len);
         }
         vRingbufferReturnItem(s_ring, item);
+        xSemaphoreGive(s_lock);
     }
 }
 
 esp_err_t audio_out_init(void)
 {
     s_lock = xSemaphoreCreateMutex();
-    if (s_lock == NULL) {
+    s_producer_lock = xSemaphoreCreateMutex();
+    if (s_lock == NULL || s_producer_lock == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -410,6 +433,7 @@ esp_err_t audio_out_init(void)
 
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_tx, &std_cfg), TAG, "init_std_mode");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(s_tx), TAG, "channel_enable");
+    s_running = true;
 
 #if AUDIO_TEST_TONE_HZ
     audio_tone_init();
@@ -447,7 +471,7 @@ static void audio_ring_put(const void *data, size_t len)
     }
 }
 
-void audio_out_write(const uint8_t *pcm, size_t len)
+static void audio_write_packet(const uint8_t *pcm, size_t len)
 {
     if (s_ring == NULL || pcm == NULL || len == 0) {
         return;
@@ -509,7 +533,7 @@ void audio_out_write(const uint8_t *pcm, size_t len)
         for (size_t i = 0; i < n; i += batch) {
             size_t take = (n - i < batch) ? (n - i) : batch;
             for (size_t j = 0; j < take; j++) {
-                conv[j] = (int32_t)src[i + j] << 16;    /* left aligned, low bits zero */
+                conv[j] = (int32_t)((uint32_t)(uint16_t)src[i + j] << 16);    /* left aligned, low bits zero */
             }
             audio_ring_put(conv, take * sizeof(int32_t));
         }
@@ -521,83 +545,99 @@ void audio_out_write(const uint8_t *pcm, size_t len)
              s_src_bits, s_slot_bits);
 }
 
-esp_err_t audio_out_set_rate(uint32_t rate_hz)
+/* Nonblocking callback-side gate. A token names this exact closed interval. */
+uint32_t audio_out_gate(void)
 {
-    if (s_tx == NULL) {
-        return ESP_ERR_INVALID_STATE;
+    unsigned old = atomic_load(&s_gate), next;
+    do { next = (old + 2u) | 1u; }
+    while (!atomic_compare_exchange_weak(&s_gate, &old, next));
+    return next;
+}
+
+void audio_out_write(const uint8_t *pcm, size_t len)
+{
+    if (!s_producer_lock || (atomic_load(&s_gate) & 1u)) return;
+    if (xSemaphoreTake(s_producer_lock, 0) != pdTRUE) return;
+    if (!(atomic_load(&s_gate) & 1u)) audio_write_packet(pcm, len);
+    xSemaphoreGive(s_producer_lock);
+}
+
+/* IDF 5.5.5 preload visits every descriptor while READY. Disabling resets its
+ * cursor; clearing only the application ring would leave old audio in DMA. */
+static esp_err_t clear_dma(void)
+{
+    static const uint8_t zeros[1024];
+    size_t loaded;
+    do {
+        esp_err_t err = i2s_channel_preload_data(s_tx, zeros, sizeof zeros, &loaded);
+        if (err != ESP_OK) return err;
+    } while (loaded == sizeof zeros);
+    return ESP_OK;
+}
+
+esp_err_t audio_out_begin_format(uint32_t *token)
+{
+    *token = audio_out_gate();
+    if (s_fault) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_producer_lock, portMAX_DELAY); // finish any old decoder packet
+    xSemaphoreTake(s_lock, portMAX_DELAY);          // finish and return any old ring item
+    flush_ring();
+    esp_err_t err = ESP_OK;
+    if (s_running) {
+        err = i2s_channel_disable(s_tx);
+        if (err == ESP_OK) s_running = false;
     }
-    if (rate_hz == s_rate_hz) {
-        return ESP_OK;
-    }
-
-    ESP_LOGI(TAG, "retune %" PRIu32 " -> %" PRIu32 " Hz", s_rate_hz, rate_hz);
-
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-
-    esp_err_t err = i2s_channel_disable(s_tx);
+    if (err == ESP_OK) err = clear_dma();
     if (err == ESP_OK) {
-        i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(rate_hz);
-        clk_cfg.clk_src = I2S_CLK_SRC_APLL;
-        err = i2s_channel_reconfig_std_clock(s_tx, &clk_cfg);
-        if (err == ESP_OK) {
-            s_rate_hz = rate_hz;
-        }
-        esp_err_t en = i2s_channel_enable(s_tx);
-        if (err == ESP_OK) {
-            err = en;
-        }
+        err = i2s_channel_enable(s_tx); // old-format clocks, zeros only
+        s_running = (err == ESP_OK);
     }
-
+    if (err != ESP_OK) s_fault = true;
     xSemaphoreGive(s_lock);
-
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "retune failed: %s", esp_err_to_name(err));
-    }
+    xSemaphoreGive(s_producer_lock);
     return err;
 }
 
-esp_err_t audio_out_set_slot_bits(uint8_t bits)
+esp_err_t audio_out_configure(uint32_t rate, uint8_t bits, uint8_t source_bits)
 {
-    if (bits != 16 && bits != 32) {
+    if (!rate || (bits != 16 && bits != 32) || (source_bits != 16 && source_bits != 32))
         return ESP_ERR_INVALID_ARG;
-    }
-    if (s_tx == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (bits == s_slot_bits) {
-        return ESP_OK;
-    }
-
-    ESP_LOGI(TAG, "slot width %u -> %u bits (BCLK %u per frame)",
-             s_slot_bits, bits, bits * 2u);
-
+    xSemaphoreTake(s_producer_lock, portMAX_DELAY);
     xSemaphoreTake(s_lock, portMAX_DELAY);
-
-    esp_err_t err = i2s_channel_disable(s_tx);
+    esp_err_t err = (atomic_load(&s_gate) & 1u) ? ESP_OK : ESP_ERR_INVALID_STATE;
+    if (err == ESP_OK && s_running) {
+        err = i2s_channel_disable(s_tx);
+        if (err == ESP_OK) s_running = false;
+    }
+    if (err == ESP_OK && bits != s_slot_bits) {
+        i2s_data_bit_width_t width = bits == 32 ? I2S_DATA_BIT_WIDTH_32BIT : I2S_DATA_BIT_WIDTH_16BIT;
+        i2s_std_slot_config_t slots = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(width, I2S_SLOT_MODE_STEREO);
+        err = i2s_channel_reconfig_std_slot(s_tx, &slots);
+        if (err == ESP_OK) s_slot_bits = bits;
+    }
+    if (err == ESP_OK && rate != s_rate_hz) {
+        i2s_std_clk_config_t clock = I2S_STD_CLK_DEFAULT_CONFIG(rate);
+        clock.clk_src = I2S_CLK_SRC_APLL;
+        err = i2s_channel_reconfig_std_clock(s_tx, &clock);
+        if (err == ESP_OK) s_rate_hz = rate;
+    }
+    if (err == ESP_OK) err = clear_dma();
     if (err == ESP_OK) {
-        /* Through a variable, not inline: the macro uses its argument several
-         * times, one of them in a boolean context, and a ternary there trips
-         * -Werror=int-in-bool-context. */
-        i2s_data_bit_width_t width = (bits == 32) ? I2S_DATA_BIT_WIDTH_32BIT
-                                                  : I2S_DATA_BIT_WIDTH_16BIT;
-        i2s_std_slot_config_t slot_cfg =
-            I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(width, I2S_SLOT_MODE_STEREO);
-        err = i2s_channel_reconfig_std_slot(s_tx, &slot_cfg);
-        if (err == ESP_OK) {
-            s_slot_bits = bits;
-        }
-        esp_err_t en = i2s_channel_enable(s_tx);
-        if (err == ESP_OK) {
-            err = en;
-        }
+        s_src_bits = source_bits;
+        err = i2s_channel_enable(s_tx);
+        s_running = (err == ESP_OK);
     }
-
+    // On error stay gated and never enable possibly missing DMA descriptors.
+    if (err != ESP_OK) s_fault = true;
     xSemaphoreGive(s_lock);
-
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "slot reconfigure failed: %s", esp_err_to_name(err));
-    }
+    xSemaphoreGive(s_producer_lock);
     return err;
+}
+
+bool audio_out_resume(uint32_t token)
+{
+    unsigned expected = token;
+    return s_running && atomic_compare_exchange_strong(&s_gate, &expected, token & ~1u);
 }
 
 uint8_t audio_out_slot_bits(void)
@@ -610,21 +650,12 @@ uint32_t audio_out_rate_hz(void)
     return s_rate_hz;
 }
 
-void audio_out_set_source_bits(uint8_t bits)
-{
-    if (bits != 16 && bits != 32) {
-        ESP_LOGE(TAG, "decoder claims %u-bit samples, which is not a thing here", bits);
-        return;
-    }
-    s_src_bits = bits;
-}
-
 uint32_t audio_out_dropped_bytes(void)
 {
     return s_dropped;
 }
 
-void audio_out_flush(void)
+static void flush_ring(void)
 {
     if (s_ring == NULL) {
         return;

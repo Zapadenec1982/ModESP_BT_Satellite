@@ -13,9 +13,11 @@
 
 Доповнює `DEVICE_SPEC.md`. Тут розкладки, яких там бракувало.
 
-Ця версія **1.2** і вона узгоджена з другою реалізацією. Міняти можна, але правкою тут і
+Ця версія **1.3** і вона узгоджена з другою реалізацією. Міняти можна, але правкою тут і
 підняттям `proto_minor`.
 
+- **1.3** — optional acknowledged format transitions (`STREAM_PREPARE` / `STREAM_READY`),
+  host capability bit 4; native decoder slot widths for capable hosts. Legacy layouts unchanged.
 - **1.2** — `STREAM_FMT` обов'язковий перед **будь-якою** зміною формату, не лише на початку
   з'єднання. Хост має право мовчати, поки формат не оголошений. Розділ «Формат» переписано:
   «усередині з'єднання частота не міняється» було обіцянкою, яку скасував перший же випадок,
@@ -55,7 +57,7 @@ D = пристрій, H = хост.
 
 ```
 u8   proto_major = 1
-u8   proto_minor      // версія цього документа, якої дотримується відправник; зараз 2
+u8   proto_minor      // версія цього документа, якої дотримується відправник; зараз 3
 u32  caps
 str  build            // "sat 0.1.0 a1b2c3d"
 ```
@@ -87,6 +89,7 @@ I2S від лінка не залежить, і пристрій, який гр�
 | 1 | хоче обкладинку |
 | 2 | керує розширювачем |
 | 3 | **приймає 32-бітні слоти** (`proto_minor` >= 1) |
+| 4 | FORMAT_READY: acknowledges prepared formats (`proto_minor` >= 3) |
 
 **Біт 3 додано у версії 1.1.** Він каже, що `STREAM_FMT.bits = 32` хост переживе: вхідний
 канал переналаштовується під оголошену ширину, а не читає 32-бітний потік конфігурацією на 16.
@@ -171,6 +174,9 @@ u32  total_ms         // 0 = невідомо
 
 ### `0x13` STREAM_FMT, D → H
 
+Legacy path: used when FORMAT_READY is not negotiated. For a capable 1.3 host,
+`STREAM_PREPARE` replaces this announcement; its acknowledged rules take precedence.
+
 ```
 u32  rate_hz
 u8   bits             // ширина слота на дроті: 16 або 32
@@ -227,6 +233,42 @@ u8   source           // 0 змінено локально, 1 змінено п�
 На кожну зміну. Це те, чого бракувало: коли гучність крутить телефон, абсолютна гучність
 AVRCP приходить сюди, і хост має про це дізнатись.
 
+### `0x16` STREAM_PREPARE, D → H (1.3)
+
+```
+u32  boot_nonce       // nonzero random identity for this satellite boot
+u32  generation       // nonzero, incremented for every transition/reconnect
+u32  rate_hz
+u8   bits             // I2S slot width: 16 or 32
+u8   channels         // 2
+```
+
+Exactly 14 payload bytes, little-endian. Used only if host HELLO has minor >= 3
+AND host capability bit 4. Bit 3 remains independent permission to use 32-bit slots.
+For such hosts, SBC/AAC use native 16-bit slots; the current aptX/aptX HD decoders
+use 32-bit containers for their 24 significant bits. Without bit 3, keep narrowing
+with dither. Legacy hosts keep their existing 16/always-32 capability policy.
+
+Before announcing, close the PCM producer gate, finish any in-flight writer, and
+clear application buffers, carry and TX DMA. Transmit the announcement before
+changing I2S format. Keep I2S data silent until successful local configuration,
+matching READY success AND at least 50 ms from confirmed UART transmission.
+Enqueueing a frame does not start the timer. No timeout substitutes for READY.
+Retry the same PREPARE every 250 ms while waiting; queues remain bounded.
+
+The host publishes the whole transaction immediately, independently of telemetry.
+With BT selected, fade buffered old audio, pause RX, await its last publication,
+discard old buffers and reset ASRC history, apply the supported clock/slot plan,
+and start RX before reporting success. If another source is selected, save the
+request and defer preparation/READY until BT selection. Leaving BT invalidates
+readiness; selecting it again requires preparation even for the same request.
+
+Exact duplicate IDs/tuples are idempotent; the same ID with a different tuple,
+or an older generation within the current boot, is refused. Disconnect clears
+format state. Reconnect, including the same rate/width, gets a new generation.
+On generation wrap the satellite generates a fresh nonzero boot nonce.
+HELLO triggers reannouncement so a restarted host can learn the current format.
+
 ### `0x20` CMD_TRANSPORT, H → D
 
 ```
@@ -247,6 +289,23 @@ u8   radio            // 0 вимкнути, 1 увімкнути
 u8   discoverable     // 0 ні, 1 так
 u8   disconnect       // 1 = розірвати поточне з'єднання
 ```
+
+### `0x23` STREAM_READY, H → D (1.3)
+
+```
+u32  boot_nonce       // copied from STREAM_PREPARE
+u32  generation       // copied from STREAM_PREPARE
+u8   status           // 0 prepared; 1 refused
+```
+
+Exactly 9 bytes. Unknown status, wrong length and zero identities are invalid.
+Only matching nonce AND generation can release the current stream. A refusal is
+terminal for that transaction and keeps PCM gated; a later success for the same
+ID cannot undo it. Old/duplicate READY frames cannot release a newer transition.
+The host repeats the current result at 100 ms intervals to recover a lost reply.
+I2S configuration failures remain silent; local satellite driver failures require
+restart before another attempt. An established stream survives missing liveness
+messages, but a pending acknowledged transition never falls back to timer-only.
 
 ### `0x30` GPIO_IN, D → H
 
@@ -311,7 +370,7 @@ resistors»), а вони в пулі розширювача. Хост зобо�
 просити режим 2 або 3.
 
 Якщо все ж попросив: пристрій ставить найближчий законний режим (звичайний вхід) і пише
-попередження в `LOG`. NACK у протоколі немає навмисно — тут немає пар запит-відповідь, і
+попередження в `LOG`. NACK для GPIO_CFG у протоколі немає навмисно — тут немає пар запит-відповідь, і
 заводити їх заради одного випадку непропорційно.
 
 ### `0x34` ADC_VALUE, D → H
@@ -358,6 +417,9 @@ str  text
 ---
 
 ## Формат: зазвичай один на з'єднання, але це не гарантія
+
+For a negotiated 1.3 peer, use the acknowledged 0x16/0x23 transition above.
+The STREAM_FMT + 50 ms rule below describes compatibility with legacy peers.
 
 Версія 1.0 казала тут «усередині з'єднання частота не міняється», і 1.2 це скасувала. Правило
 було написане як обіцянка, а виявилось описом звичайного випадку: 19.09.2026 пристрій змінив

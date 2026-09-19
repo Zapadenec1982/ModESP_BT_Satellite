@@ -93,6 +93,7 @@ typedef struct {
     uint8_t *payload;
     uint16_t len;
     uint8_t  type;
+    uint32_t fmt_nonce, fmt_generation;
 } tx_item_t;
 
 static QueueHandle_t     s_uart_events;
@@ -105,6 +106,8 @@ static uint8_t           s_tx_seq;
 static bool              s_host_present;
 static bool              s_peer_incompatible;
 static uint32_t          s_host_caps;
+static portMUX_TYPE s_fmt_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_fmt_nonce, s_fmt_generation, s_fmt_sent_ms;
 static uint32_t          s_own_caps;
 static uint32_t          s_ping_outstanding;
 static int64_t           s_last_hello_us;
@@ -131,7 +134,8 @@ static void tx_item_free(tx_item_t *item)
     item->payload = NULL;
 }
 
-static void tx_push(uint8_t type, const uint8_t *payload, size_t payload_len)
+static void tx_push_tagged(uint8_t type, const uint8_t *payload, size_t payload_len,
+                           uint32_t nonce, uint32_t generation)
 {
     if (s_q_critical == NULL) {
         return;
@@ -159,7 +163,8 @@ static void tx_push(uint8_t type, const uint8_t *payload, size_t payload_len)
         memcpy(buf, payload, payload_len);
     }
 
-    tx_item_t item = { .payload = buf, .len = (uint16_t)payload_len, .type = type };
+    tx_item_t item = { .payload = buf, .len = (uint16_t)payload_len, .type = type,
+                       .fmt_nonce = nonce, .fmt_generation = generation };
 
     bool bulk = type_is_droppable(type);
     QueueHandle_t q = bulk ? s_q_bulk : s_q_critical;
@@ -179,6 +184,11 @@ static void tx_push(uint8_t type, const uint8_t *payload, size_t payload_len)
         tx_item_free(&item);
         if (bulk) { s_stats.tx_dropped_bulk++; } else { s_stats.tx_dropped_critical++; }
     }
+}
+
+static void tx_push(uint8_t type, const uint8_t *payload, size_t len)
+{
+    tx_push_tagged(type, payload, len, 0, 0);
 }
 
 static void link_tx_task(void *arg)
@@ -208,8 +218,20 @@ static void link_tx_task(void *arg)
             /* There is no flow control on this link, so the transmitter always
              * drains and this wait is bounded by the baud rate. The queues in
              * front are what keep callers from ever waiting at all. */
-            uart_write_bytes(BOARD_LINK_UART_NUM, wire, wire_len);
-            s_stats.tx_frames++;
+            int sent = uart_write_bytes(BOARD_LINK_UART_NUM, wire, wire_len);
+            if (sent == (int)wire_len) {
+                s_stats.tx_frames++;
+                if (item.fmt_generation &&
+                    uart_wait_tx_done(BOARD_LINK_UART_NUM, pdMS_TO_TICKS(100)) == ESP_OK) {
+                    portENTER_CRITICAL(&s_fmt_mux);
+                    if (s_fmt_nonce != item.fmt_nonce || s_fmt_generation != item.fmt_generation) {
+                        s_fmt_nonce = item.fmt_nonce;
+                        s_fmt_generation = item.fmt_generation;
+                        s_fmt_sent_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                    }
+                    portEXIT_CRITICAL(&s_fmt_mux);
+                }
+            }
         }
         tx_item_free(&item);
     }
@@ -254,6 +276,29 @@ void link_send_stream_fmt(uint32_t rate_hz, uint8_t bits, uint8_t channels)
     uint8_t payload[16];
     size_t len = satlink_enc_stream_fmt(payload, sizeof(payload), &m);
     if (len != 0) { tx_push(SATLINK_MSG_STREAM_FMT, payload, len); }
+}
+
+void link_send_format(const fmt_request_t *r, bool acknowledged)
+{
+    uint8_t payload[14];
+    size_t len;
+    uint8_t type;
+    if (acknowledged) {
+        fmt_encode(payload, r); len = sizeof payload; type = FMT_PREPARE;
+    } else {
+        satlink_stream_fmt_t legacy = { .rate_hz=r->rate_hz, .bits=r->bits, .channels=r->channels };
+        len = satlink_enc_stream_fmt(payload, sizeof payload, &legacy); type = SATLINK_MSG_STREAM_FMT;
+    }
+    if (len) tx_push_tagged(type, payload, len, r->nonce, r->generation);
+}
+
+bool link_format_sent(const fmt_request_t *r, uint32_t *when_ms)
+{
+    portENTER_CRITICAL(&s_fmt_mux);
+    bool match = r->nonce == s_fmt_nonce && r->generation == s_fmt_generation;
+    *when_ms = s_fmt_sent_ms;
+    portEXIT_CRITICAL(&s_fmt_mux);
+    return match;
 }
 
 void link_send_volume_state(uint8_t volume, uint8_t source)
@@ -374,7 +419,7 @@ static void handle_hello(const uint8_t *payload, size_t len)
 
     s_peer_incompatible = false;
     s_host_present = true;
-    s_host_caps = h.caps;
+    __atomic_store_n(&s_host_caps, fmt_ack_capable(h.minor, h.caps) ? h.caps : (h.caps & ~FMT_HOST_CAP), __ATOMIC_SEQ_CST);
     ESP_LOGI(TAG, "host %u.%u, caps 0x%08" PRIx32 ", build \"%.*s\"",
              h.major, h.minor, h.caps, (int)h.build.len, h.build.ptr);
 
@@ -425,6 +470,13 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
         break;
     }
 
+    case FMT_READY: {
+        fmt_ready_t ready;
+        if (!fmt_decode_ready(payload, len, &ready)) { s_stats.rx_bad++; break; }
+        if (!s_peer_incompatible && (link_host_caps() & FMT_HOST_CAP) && s_handlers.on_format_ready)
+            s_handlers.on_format_ready(&ready);
+        break;
+    }
     case SATLINK_MSG_CMD_TRANSPORT: {
         satlink_cmd_transport_t m = {0};
         if (!satlink_dec_cmd_transport(payload, len, &m)) { s_stats.rx_bad++; break; }
@@ -665,7 +717,7 @@ bool link_wait_for_host(uint32_t timeout_ms)
     return true;
 }
 
-uint32_t link_host_caps(void) { return s_host_caps; }
+uint32_t link_host_caps(void) { return __atomic_load_n(&s_host_caps, __ATOMIC_SEQ_CST); }
 
 uint32_t link_bulk_pending(void)
 {

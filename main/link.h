@@ -13,11 +13,13 @@
 
 #include "esp_err.h"
 #include "satlink/messages.h"
+#include "satlink/format_sync.h"
 
 /* Everything the host can ask of us. Every one of these is called from the link's
  * own task, never from an interrupt. */
 typedef struct {
     void (*on_hello)(const satlink_hello_t *hello);
+    void (*on_format_ready)(const fmt_ready_t *ready);
     void (*on_transport)(uint8_t cmd);
     void (*on_volume)(uint8_t volume);
     void (*on_radio)(bool on, bool discoverable, bool disconnect);
@@ -43,11 +45,9 @@ uint32_t link_host_caps(void);
 /*
  * Blocks until the host has greeted us, or the timeout runs out.
  *
- * Capabilities decide things that are fixed once and cannot be revisited: which
- * sample rates the stream endpoints advertise, and how wide the I2S slots are.
- * Reading them at whatever moment startup happens to reach is a race, and it was
- * one -- two boots of the same build, one at 32-bit slots and 48 kHz on offer,
- * the other at 16 and 44.1, decided by whether HELLO had arrived yet.
+ * Wait before registering codec endpoints so supported rates reflect the host.
+ * Slot width is selected later by the serialized format transaction, per codec
+ * for an acknowledged host and by the legacy capability policy otherwise.
  *
  * Returns true if a greeting arrived. False is not a failure: a device with no
  * host still has to come up, and it comes up conservative.
@@ -59,6 +59,9 @@ void link_send_bt_state(uint8_t state, uint8_t codec, const uint8_t addr[6], con
 void link_send_track_meta(const char *title, const char *artist, const char *album);
 void link_send_track_pos(uint8_t state, uint32_t elapsed_ms, uint32_t total_ms);
 void link_send_stream_fmt(uint32_t rate_hz, uint8_t bits, uint8_t channels);
+/* Tagged completion is recorded only after UART TX is physically drained. */
+void link_send_format(const fmt_request_t *request, bool acknowledged);
+bool link_format_sent(const fmt_request_t *request, uint32_t *when_ms);
 void link_send_volume_state(uint8_t volume, uint8_t source);
 void link_send_gpio_in(uint32_t values, uint32_t changed);
 void link_send_gpio_map(const satlink_gpio_map_t *map);
