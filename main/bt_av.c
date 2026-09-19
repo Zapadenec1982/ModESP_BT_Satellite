@@ -95,6 +95,12 @@ static const char *TAG = "sat.bt";
  */
 #define POS_NOTIFY_INTERVAL_S  5
 
+/* Silence between announcing a format and clocking it, per PROTOCOL.md,
+ * "Частота: одна на з'єднання". The host needs it to stop its channel and
+ * bring it back up on the new width; the width is the part that fails
+ * silently if it does not get the chance. */
+#define BT_AV_FMT_SILENCE_MS   50
+
 /* A2DP events arrive on the Bluetooth stack's own task. Anything that can block —
  * retuning the I2S clock, for one — is handed to this task instead. */
 typedef struct {
@@ -515,8 +521,6 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
                               "and cannot relock: an endpoint is advertising a rate this "
                               "device must not offer", rate);
             }
-            audio_out_set_rate(rate);
-            audio_out_set_source_bits(src_bits);
             /* The slot width is fixed at startup from what the host said it can
              * take, not per codec: the host locks to it once. STREAM_FMT reports
              * the slot, which is what a counter on the pins measures -- BCLK over
@@ -524,9 +528,33 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
             s_now.rate_hz  = rate;
             s_now.bits     = audio_out_slot_bits();
             s_now.channels = channels;
-            /* Before the first sample, which is the one hard promise this message
-             * makes to the host. */
+
+            /*
+             * Announce, then go quiet, then move the clock. In that order.
+             *
+             * PROTOCOL.md asks for STREAM_FMT, then at least 50 ms of silence on
+             * I2S, then samples at the new format. This used to retune first and
+             * announce afterwards, which worked only because nothing is streaming
+             * yet when a codec is configured -- the ring is empty and the wire is
+             * carrying zeros. On a renegotiation mid-connection it would not have
+             * worked, and the failure is the silent kind: the host reframes to a
+             * rate it has not been told about yet.
+             *
+             * The host counts slot width in BCLK ticks from its own configuration,
+             * so a receiver still set to the old width against the new stream
+             * gathers one frame out of two and welds the channels into one word.
+             * Nothing downstream can detect that; only this ordering prevents it.
+             *
+             * Blocking here is fine and is why this task exists: A2DP events arrive
+             * on the Bluetooth stack's task and are handed over precisely so that
+             * the slow parts can be slow.
+             */
             bt_av_report_stream_fmt();
+            audio_out_flush();
+            vTaskDelay(pdMS_TO_TICKS(BT_AV_FMT_SILENCE_MS));
+
+            audio_out_set_rate(rate);
+            audio_out_set_source_bits(src_bits);
         }
         bt_av_report_state();
         break;

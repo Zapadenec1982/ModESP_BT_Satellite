@@ -74,6 +74,15 @@ typedef struct {
 /* Reads the counters and resets the high and low water marks. */
 void audio_out_get_stats(audio_out_stats_t *out);
 
+/*
+ * Throws away whatever is still queued.
+ *
+ * Used when the format is about to change: samples captured under the old rate
+ * or the old width are not merely late, they are wrong, and playing them out
+ * after the clock has moved is worse than dropping them.
+ */
+void audio_out_flush(void);
+
 /* Tells the output whether a stream is running, so that an empty ring can be told
  * from the silence between tracks. */
 void audio_out_set_streaming(bool streaming);

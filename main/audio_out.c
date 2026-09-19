@@ -400,6 +400,18 @@ uint32_t audio_out_dropped_bytes(void)
     return s_dropped;
 }
 
+void audio_out_flush(void)
+{
+    if (s_ring == NULL) {
+        return;
+    }
+    size_t len = 0;
+    void *item;
+    while ((item = xRingbufferReceiveUpTo(s_ring, &len, 0, AUDIO_CHUNK_BYTES)) != NULL) {
+        vRingbufferReturnItem(s_ring, item);
+    }
+}
+
 void audio_out_set_streaming(bool streaming)
 {
     s_streaming = streaming;
