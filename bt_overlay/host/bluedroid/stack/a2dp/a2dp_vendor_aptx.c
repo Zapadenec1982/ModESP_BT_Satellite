@@ -255,7 +255,18 @@ void A2DP_AptxSinkAllow48kHz(bool allow) {
   }
 }
 
+/* See A2DP_AptxHdSinkOffer: same reason, one codec down. Withholding both aptX
+ * endpoints is what makes a phone fall to AAC. */
+static bool a2dp_aptx_sink_offered = true;
+
+void A2DP_AptxSinkOffer(bool offer) {
+  a2dp_aptx_sink_offered = offer;
+}
+
 bool A2DP_VendorInitCodecConfigAptxSink(uint8_t* p_codec_info) {
+  if (!a2dp_aptx_sink_offered) {
+    return false;
+  }
   tA2D_STATUS sts = A2D_FAIL;
   sts = A2DP_BuildInfoAptx(A2D_MEDIA_TYPE_AUDIO, &a2dp_aptx_sink_caps, p_codec_info);
   return sts == A2D_SUCCESS;

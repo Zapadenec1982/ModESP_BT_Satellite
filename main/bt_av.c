@@ -44,21 +44,31 @@
  */
 extern void A2DP_SinkAllow48kHz(bool allow);
 extern void A2DP_SinkOfferAptxHd(bool offer);
+extern void A2DP_SinkOfferAptx(bool offer);
+extern void A2DP_SinkOfferAac(bool offer);
 
 /*
- * Whether to offer aptX HD at all.
+ * Which stream endpoints to offer.
  *
- * True, normally. It exists because a phone takes the best endpoint the sink
- * advertises and cannot be asked for less: Android 17 has no codec picker in
- * developer options, and its HD audio toggle drops all the way to SBC rather than
- * one step down. Withdrawing this endpoint is the only way left to make a phone
- * choose plain aptX.
+ * A phone takes the best endpoint the sink advertises and cannot be asked for
+ * less. Android 17 has no codec picker in developer options, and its HD audio
+ * toggle drops all the way to SBC rather than one step down, so withholding the
+ * endpoints above the one you want is the only way to reach it. The order of
+ * preference on the phone is aptX HD, then aptX, then AAC, then SBC.
  *
- * That is not only a test convenience. If a link ever turns out not to carry aptX
- * HD reliably, this is the one knob that moves the phone down a step instead of
- * all the way to SBC.
+ * Not only a test convenience: if a link ever turns out not to carry aptX HD
+ * reliably, this is the knob that moves the phone down one step instead of all
+ * the way to the floor.
+ *
+ * SBC has no switch. A2DP requires it of everyone, and it is that floor.
+ *
+ * All four are offered by default. Withholding is for reaching a specific codec:
+ * SBC, plain aptX and AAC were each verified on hardware that way, and none of
+ * them is reachable any other way on a current Android.
  */
 #define BT_AV_OFFER_APTX_HD     true
+#define BT_AV_OFFER_APTX        true
+#define BT_AV_OFFER_AAC         true
 
 static const char *TAG = "sat.bt";
 
@@ -1038,13 +1048,17 @@ esp_err_t bt_av_start(const char *device_name)
 
     A2DP_SinkAllow48kHz((host_caps & SATLINK_HOST_CAP_RELOCK) != 0);
     A2DP_SinkOfferAptxHd(BT_AV_OFFER_APTX_HD);
+    A2DP_SinkOfferAptx(BT_AV_OFFER_APTX);
+    A2DP_SinkOfferAac(BT_AV_OFFER_AAC);
     if (host_caps & SATLINK_HOST_CAP_WIDE) {
         audio_out_set_slot_bits(32);
     }
-    ESP_LOGI(TAG, "endpoints offer %s, %u-bit slots%s",
+    ESP_LOGI(TAG, "endpoints: SBC%s%s%s, %s, %u-bit slots",
+             BT_AV_OFFER_AAC ? " AAC" : "",
+             BT_AV_OFFER_APTX ? " aptX" : "",
+             BT_AV_OFFER_APTX_HD ? " aptX-HD" : "",
              (host_caps & SATLINK_HOST_CAP_RELOCK) ? "44.1 and 48 kHz" : "44.1 kHz only",
-             audio_out_slot_bits(),
-             BT_AV_OFFER_APTX_HD ? "" : ", aptX HD withheld");
+             audio_out_slot_bits());
 
     ESP_RETURN_ON_ERROR(esp_a2d_register_callback(a2d_cb), TAG, "a2d_register");
     ESP_RETURN_ON_ERROR(esp_a2d_sink_init(), TAG, "a2d_sink_init");

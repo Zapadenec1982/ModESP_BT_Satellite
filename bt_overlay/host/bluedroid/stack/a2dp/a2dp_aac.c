@@ -339,7 +339,19 @@ void A2DP_AacSinkAllow48kHz(bool allow) {
   }
 }
 
+/* Withholding AAC as well leaves only SBC, which every A2DP source must support.
+ * That is the floor, and it is how SBC gets tested deliberately rather than by
+ * accident. */
+static bool a2dp_aac_sink_offered = true;
+
+void A2DP_AacSinkOffer(bool offer) {
+  a2dp_aac_sink_offered = offer;
+}
+
 bool A2DP_InitCodecConfigAacSink(uint8_t* p_codec_info) {
+  if (!a2dp_aac_sink_offered) {
+    return false;
+  }
   return A2DP_BuildInfoAac(A2D_MEDIA_TYPE_AUDIO, &a2dp_aac_sink_caps,
                            p_codec_info) == A2D_SUCCESS;
 }

@@ -37,10 +37,33 @@
  * Call before esp_a2d_sink_init(): the capabilities are read when the endpoints
  * are registered and not looked at again.
  */
-/* Offer aptX HD, or do not. See a2dp_vendor_aptx_hd.c for why this exists. */
+/*
+ * Which stream endpoints this device offers.
+ *
+ * A phone takes the best endpoint the sink advertises and there is no way to ask
+ * it for less, so the only way to reach a particular codec is to stop offering
+ * the ones above it. SBC has no switch: A2DP requires every source and sink to
+ * support it, and it is the floor everything falls back to.
+ */
 void A2DP_SinkOfferAptxHd(bool offer) {
 #if (defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE)
   A2DP_AptxHdSinkOffer(offer);
+#else
+  (void)offer;
+#endif
+}
+
+void A2DP_SinkOfferAptx(bool offer) {
+#if (defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE)
+  A2DP_AptxSinkOffer(offer);
+#else
+  (void)offer;
+#endif
+}
+
+void A2DP_SinkOfferAac(bool offer) {
+#if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)
+  A2DP_AacSinkOffer(offer);
 #else
   (void)offer;
 #endif

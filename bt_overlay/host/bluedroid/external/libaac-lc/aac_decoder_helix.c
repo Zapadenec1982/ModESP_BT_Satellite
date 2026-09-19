@@ -1,3 +1,6 @@
+/* Note: the per-packet progress logging in this file is at ESP_LOGD.
+ * Same reason as a2dp_aac_decoder_custom.c: per-packet progress belongs at debug level, not in the log of a device that is simply playing music.
+ */
 /*
  * AAC-LC Decoder using libhelix-aac
  * 
@@ -123,7 +126,7 @@ int aac_decoder_decode(aac_decoder_t *dec, const uint8_t *data, int len,
     static uint32_t call_count = 0;
     call_count++;
     if (call_count <= 5 || call_count % 500 == 0) {
-        ESP_LOGI(TAG, "Decode #%lu: %d bytes", (unsigned long)call_count, len);
+        ESP_LOGD(TAG, "Decode #%lu: %d bytes", (unsigned long)call_count, len);
     }
     
     /* Set up input pointers */

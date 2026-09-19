@@ -1,3 +1,6 @@
+/* Note: the per-packet progress logging in this file is at ESP_LOGD.
+ * It ran roughly once a second on a live stream, from the decoder task, and every line also crossed the log bridge onto the host's control link. A console write from that task is what strangled aptX HD earlier; this was nowhere near that rate, but it is noise in a working device and the information is still there with the log level turned up.
+ */
 /*
  * SPDX-FileCopyrightText: 2024 ESP32 A2DP Project
  * SPDX-License-Identifier: Apache-2.0
@@ -241,7 +244,7 @@ bool a2dp_aac_decoder_decode_packet(BT_HDR *p_buf, unsigned char *buf, size_t bu
     }
     
     if (pkt_count % 100 == 1) {
-        ESP_LOGI(TAG, "Packet %lu: rtp_len=%d, latm_len=%d, latm bytes: %02x %02x %02x %02x",
+        ESP_LOGD(TAG, "Packet %lu: rtp_len=%d, latm_len=%d, latm bytes: %02x %02x %02x %02x",
                  (unsigned long)pkt_count, (int)data_len, (int)latm_len,
                  latm_len > 0 ? latm_data[0] : 0,
                  latm_len > 1 ? latm_data[1] : 0,
@@ -268,7 +271,7 @@ bool a2dp_aac_decoder_decode_packet(BT_HDR *p_buf, unsigned char *buf, size_t bu
     }
     
     if (pkt_count == 1) {
-        ESP_LOGI(TAG, "LATM extracted %d bytes raw AAC", (int)raw_aac_len);
+        ESP_LOGD(TAG, "LATM extracted %d bytes raw AAC", (int)raw_aac_len);
     }
     
     /* If first frame or config changed, configure from LATM */
@@ -280,7 +283,7 @@ bool a2dp_aac_decoder_decode_packet(BT_HDR *p_buf, unsigned char *buf, size_t bu
                                    audio_cfg->channel_config);
             s_decoder.sample_rate = audio_cfg->sample_rate;
             s_decoder.channels = audio_cfg->channel_config;
-            ESP_LOGI(TAG, "Auto-configured: %luHz, %dch",
+            ESP_LOGD(TAG, "Auto-configured: %luHz, %dch",
                      (unsigned long)audio_cfg->sample_rate, 
                      audio_cfg->channel_config);
         }
@@ -308,7 +311,7 @@ bool a2dp_aac_decoder_decode_packet(BT_HDR *p_buf, unsigned char *buf, size_t bu
         /* Debug: Log first few samples to verify data */
         if (s_decoder.frames_decoded < 5) {
             int16_t *pcm = s_decoder.pcm_buffer;
-            ESP_LOGI(TAG, "PCM[0..3]: %d %d %d %d (bytes=%d)", 
+            ESP_LOGD(TAG, "PCM[0..3]: %d %d %d %d (bytes=%d)", 
                      pcm[0], pcm[1], pcm[2], pcm[3], (int)pcm_bytes);
         }
         
@@ -317,7 +320,7 @@ bool a2dp_aac_decoder_decode_packet(BT_HDR *p_buf, unsigned char *buf, size_t bu
         s_decoder.frames_decoded++;
         
         if (s_decoder.frames_decoded % 100 == 1) {
-            ESP_LOGI(TAG, "Decoded %lu frames, %d samples/frame, failed=%lu",
+            ESP_LOGD(TAG, "Decoded %lu frames, %d samples/frame, failed=%lu",
                      (unsigned long)s_decoder.frames_decoded,
                      (int)samples_out,
                      (unsigned long)s_decoder.frames_failed);
