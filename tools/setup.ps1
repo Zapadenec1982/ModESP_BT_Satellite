@@ -131,7 +131,31 @@ if ($patches.Count -eq 0) {
     Write-Host "setup: $($patches.Count) patch(es) applied." -ForegroundColor Green
 }
 
-# --- 4. Say what to do next ----------------------------------------------------
+# --- 4. Lay the new files on top ------------------------------------------------
+
+# Patches carry changes to files that already exist. Files that are entirely ours
+# -- the codec framework, the decoders, libfreeaptx, Helix -- live in bt_overlay/
+# as real source and are copied in here.
+#
+# They are not in the patches on purpose. A patch that adds 15000 lines of a third
+# party codec is unreadable, and it hides the licence headers that are the whole
+# reason we care which codec came from where. As files they can be read, graded and
+# diffed against upstream.
+$overlay = Join-Path $repoRoot 'bt_overlay'
+if (Test-Path $overlay) {
+    $files = @(Get-ChildItem -Path $overlay -Recurse -File)
+    foreach ($file in $files) {
+        $rel = $file.FullName.Substring($overlay.Length + 1)
+        $dest = Join-Path $btLocal $rel
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dest) | Out-Null
+        Copy-Item -Force $file.FullName $dest
+    }
+    Write-Host "setup: $($files.Count) file(s) copied from bt_overlay." -ForegroundColor Green
+} else {
+    Write-Host 'setup: no bt_overlay - only the patches were applied.' -ForegroundColor Yellow
+}
+
+# --- 5. Say what to do next ----------------------------------------------------
 
 Write-Host ''
 Write-Host 'setup: done. Next:' -ForegroundColor Green

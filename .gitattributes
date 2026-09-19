@@ -1,0 +1,15 @@
+# This checkout runs with core.autocrlf=true, which rewrites line endings on the
+# way in and out. For most of the repository that is harmless. For two trees it is
+# not, so they are marked -text and pass through byte for byte.
+#
+# patches/ -- a patch is matched against the pinned IDF, whose files are LF. Give
+# the patch CRLF on checkout and every context line stops matching, so `git apply`
+# rejects the lot. This is not hypothetical: measuring the delta against the
+# upstream fork once reported 7522 changed lines in a file that really had 116,
+# for exactly this reason.
+#
+# bt_overlay/ -- these files are copied verbatim into components/bt and compiled.
+# They came from upstream projects and should read the same here as there.
+
+patches/*.patch  -text
+bt_overlay/**    -text

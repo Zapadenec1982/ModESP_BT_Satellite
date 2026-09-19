@@ -1,0 +1,3685 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -100,6 +100,12 @@
+     target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-implicit-fallthrough -Wno-unused-const-variable)
+     target_compile_options(${COMPONENT_LIB} PRIVATE "-Wno-format")
+ 
++    if(CONFIG_BT_A2DP_AAC_DECODER)
++        # Helix picks its integer routines by platform macro; ESP32 selects the
++        # portable C ones. Without it assembly.h falls through to no branch at all.
++        target_compile_definitions(${COMPONENT_LIB} PRIVATE "ESP32")
++    endif()
++
+     register_bt_ctrl_libs()
+     set_bluedroid_host_compile_flags()
+     set_nimble_host_compile_flags()
+--- a/host/bluedroid/CMakeLists.txt
++++ b/host/bluedroid/CMakeLists.txt
+@@ -192,6 +192,10 @@
+     "${CMAKE_CURRENT_LIST_DIR}/main/bte_main.c"
+     "${CMAKE_CURRENT_LIST_DIR}/stack/a2dp/a2d_api.c"
+     "${CMAKE_CURRENT_LIST_DIR}/stack/a2dp/a2d_sbc.c"
++    "${CMAKE_CURRENT_LIST_DIR}/stack/a2dp/a2d_sbc_decoder.c"
++    "${CMAKE_CURRENT_LIST_DIR}/stack/a2dp/a2dp_codec_config.c"
++    "${CMAKE_CURRENT_LIST_DIR}/stack/a2dp/a2dp_rtp.c"
++    "${CMAKE_CURRENT_LIST_DIR}/stack/a2dp/a2dp_vendor.c"
+     # "${CMAKE_CURRENT_LIST_DIR}/stack/a2dp/a2d_m24.c"
+     "${CMAKE_CURRENT_LIST_DIR}/stack/avct/avct_api.c"
+     "${CMAKE_CURRENT_LIST_DIR}/stack/avct/avct_ccb.c"
+@@ -403,6 +407,53 @@
+         "${CMAKE_CURRENT_LIST_DIR}/external/sbc/plc/sbc_plc.c")
+ endif()
+ 
++
++# --- Optional A2DP decoders ---------------------------------------------------
++#
++# Each codec is a Kconfig option and a set of sources; nothing else in the build
++# changes when one is turned on or off. See docs/BASE.md.
++
++if(CONFIG_BT_A2DP_APTX_DECODER)
++    # libfreeaptx: the wrapper is public domain or CC0, the decoder core is LGPL-2.1.
++    list(APPEND bluedroid_host_priv_include_dirs
++        "${CMAKE_CURRENT_LIST_DIR}/external/libfreeaptx/main")
++    list(APPEND bluedroid_host_srcs
++        "${CMAKE_CURRENT_LIST_DIR}/external/libfreeaptx/main/freeaptx.c"
++        "${CMAKE_CURRENT_LIST_DIR}/stack/a2dp/a2dp_vendor_aptx.c"
++        "${CMAKE_CURRENT_LIST_DIR}/stack/a2dp/a2dp_vendor_aptx_hd.c"
++        "${CMAKE_CURRENT_LIST_DIR}/stack/a2dp/a2dp_vendor_aptx_decoder.c")
++endif()
++
++if(CONFIG_BT_A2DP_AAC_DECODER)
++    # Helix from RealNetworks: fixed point, AAC-LC only, no SBR, which is all A2DP
++    # needs. Licensed under the RPSL or the RCSL; the terms are in each file.
++    list(APPEND bluedroid_host_priv_include_dirs
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac")
++    list(APPEND bluedroid_host_srcs
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/aacdec.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/aactabs.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/bitstream.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/buffers.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/dct4.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/decelmnt.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/dequant.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/fft.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/filefmt.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/huffman.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/hufftabs.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/imdct.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/noiseless.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/pns.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/stproc.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/tns.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/libhelix_aac/trigtabs.c"
++        "${CMAKE_CURRENT_LIST_DIR}/external/libaac-lc/aac_decoder_helix.c"
++        "${CMAKE_CURRENT_LIST_DIR}/stack/a2dp/a2dp_aac.c"
++        "${CMAKE_CURRENT_LIST_DIR}/stack/a2dp/latm_parser.c"
++        "${CMAKE_CURRENT_LIST_DIR}/stack/a2dp/a2dp_aac_decoder_custom.c")
++endif()
++
+ # Export the variables to the parent scope
+ set(bluedroid_host_srcs "${bluedroid_host_srcs}" PARENT_SCOPE)
+ set(bluedroid_host_include_dirs "${bluedroid_host_include_dirs}" PARENT_SCOPE)
+--- a/host/bluedroid/api/include/api/esp_a2dp_api.h
++++ b/host/bluedroid/api/include/api/esp_a2dp_api.h
+@@ -126,8 +126,10 @@
+     esp_a2d_mct_t type;                        /*!< A2DP media codec type */
+ #define ESP_A2D_CIE_LEN_SBC          (4)       /*!< SBC cie length */
+ #define ESP_A2D_CIE_LEN_M12          (4)       /*!< MPEG-1,2 cie length */
+-#define ESP_A2D_CIE_LEN_M24          (6)       /*!< MPEG-2,4 AAC cie length */
++#define ESP_A2D_CIE_LEN_M24          (10)       /*!< MPEG-2,4 AAC cie length */
+ #define ESP_A2D_CIE_LEN_ATRAC        (7)       /*!< ATRAC family cie length */
++#define ESP_A2D_CIE_LEN_APTX         (7)       /*!< aptX cie length */
++#define ESP_A2D_CIE_LEN_APTX_HD      (11)      /*!< aptX HD cie length */
+     union {
+         uint8_t sbc[ESP_A2D_CIE_LEN_SBC] __attribute__((deprecated));       /*!< SBC codec capabilities, deprecated, use sbc_info instead */
+         uint8_t m12[ESP_A2D_CIE_LEN_M12] __attribute__((deprecated));       /*!< MPEG-1,2 audio codec capabilities, deprecated, use m12_info instead */
+@@ -138,7 +140,10 @@
+         esp_a2d_cie_m12_t   m12_info;          /*!< MPEG-1,2 audio codec capabilities */
+         esp_a2d_cie_m24_t   m24_info;          /*!< MPEG-2, 4 AAC audio codec capabilities */
+         esp_a2d_cie_atrac_t atrac_info;        /*!< ATRAC family codec capabilities */
+-    } cie;                                     /*!< A2DP codec information element */
++        
++        uint8_t aptx[ESP_A2D_CIE_LEN_APTX];         /*!< APTX codec capabilities */
++        uint8_t aptx_hd[ESP_A2D_CIE_LEN_APTX_HD];   /*!< APTX-HD codec capabilities */
++    } cie;                                          /*!< A2DP codec information element */
+ } __attribute__((packed)) esp_a2d_mcc_t;
+ 
+ /**
+--- a/host/bluedroid/bta/av/bta_av_aact.c
++++ b/host/bluedroid/bta/av/bta_av_aact.c
+@@ -35,6 +35,7 @@
+ 
+ #include "bta_av_int.h"
+ #include "stack/avdt_api.h"
++#include "stack/a2dp_codec_api.h"
+ #include "bta/utl.h"
+ #include "stack/l2c_api.h"
+ #include "stack/l2cdefs.h"
+@@ -232,11 +233,12 @@
+ ***********************************************/
+ static UINT8 bta_av_get_scb_handle(tBTA_AV_SCB *p_scb, UINT8 local_sep)
+ {
+-    UINT8 xx = 0;
+-    for (xx = 0; xx < BTA_AV_MAX_SEPS; xx++) {
+-        if ((p_scb->seps[xx].tsep == local_sep) &&
+-                (p_scb->seps[xx].codec_type == p_scb->codec_type)) {
+-            return (p_scb->seps[xx].av_handle);
++    UINT8 i = 0;
++    for (i = 0; i < BTAV_A2DP_CODEC_INDEX_MAX; i++) {
++        if ((p_scb->seps[i].tsep == local_sep) &&
++                A2DP_CodecTypeEquals(p_scb->seps[i].codec_info,
++                                     p_scb->cfg.codec_info)) {
++            return (p_scb->seps[i].av_handle);
+         }
+     }
+     APPL_TRACE_DEBUG(" bta_av_get_scb_handle appropriate sep_type not found")
+@@ -254,10 +256,10 @@
+ ***********************************************/
+ static UINT8 bta_av_get_scb_sep_type(tBTA_AV_SCB *p_scb, UINT8 tavdt_handle)
+ {
+-    UINT8 xx = 0;
+-    for (xx = 0; xx < BTA_AV_MAX_SEPS; xx++) {
+-        if (p_scb->seps[xx].av_handle == tavdt_handle) {
+-            return (p_scb->seps[xx].tsep);
++    UINT8 i = 0;
++    for (i = 0; i < BTAV_A2DP_CODEC_INDEX_MAX; i++) {
++        if (p_scb->seps[i].av_handle == tavdt_handle) {
++            return (p_scb->seps[i].tsep);
+         }
+     }
+     APPL_TRACE_DEBUG(" bta_av_get_scb_sep_type appropriate handle not found")
+@@ -752,14 +754,17 @@
+ *******************************************************************************/
+ static void bta_av_adjust_seps_idx(tBTA_AV_SCB *p_scb, UINT8 avdt_handle)
+ {
+-    int xx;
+-    APPL_TRACE_DEBUG("bta_av_adjust_seps_idx codec_type: %d", p_scb->codec_type);
+-    for (xx = 0; xx < BTA_AV_MAX_SEPS; xx++) {
+-        APPL_TRACE_DEBUG("av_handle: %d codec_type: %d",
+-                         p_scb->seps[xx].av_handle, p_scb->seps[xx].codec_type);
+-        if ((p_scb->seps[xx].av_handle) && (p_scb->seps[xx].av_handle == avdt_handle)) {
+-            p_scb->sep_idx      = xx;
+-            p_scb->avdt_handle  = p_scb->seps[xx].av_handle;
++    int i;
++    APPL_TRACE_DEBUG("%s: codec: %s", __func__,
++                     A2DP_CodecName(p_scb->cfg.codec_info));
++
++    for (i = 0; i < BTAV_A2DP_CODEC_INDEX_MAX; i++) {
++        APPL_TRACE_DEBUG("av_handle: %d codec: %s",
++                         p_scb->seps[i].av_handle,
++                         A2DP_CodecName(p_scb->seps[i].codec_info));
++        if (p_scb->seps[i].av_handle && (p_scb->seps[i].av_handle == avdt_handle)) {
++            p_scb->sep_idx      = i;
++            p_scb->avdt_handle  = p_scb->seps[i].av_handle;
+             break;
+         }
+     }
+@@ -1054,7 +1059,7 @@
+     bta_sys_stop_timer(&p_scb->timer);
+     if (p_scb->deregistring) {
+         /* remove stream */
+-        for (xx = 0; xx < BTA_AV_MAX_SEPS; xx++) {
++        for (xx = 0; xx < BTAV_A2DP_CODEC_INDEX_MAX; xx++) {
+             if (p_scb->seps[xx].av_handle) {
+                 AVDT_RemoveStream(p_scb->seps[xx].av_handle);
+             }
+@@ -1146,7 +1151,6 @@
+     local_sep = bta_av_get_scb_sep_type(p_scb, p_msg->handle);
+     p_scb->avdt_label = p_data->str_msg.msg.hdr.label;
+     memcpy(p_scb->cfg.codec_info, p_evt_cfg->codec_info, AVDT_CODEC_SIZE);
+-    p_scb->codec_type = p_evt_cfg->codec_info[BTA_AV_CODEC_TYPE_IDX];
+     bta_av_save_addr(p_scb, p_data->str_msg.bd_addr);
+ 
+     /* Clear collision mask */
+@@ -1187,7 +1191,7 @@
+         APPL_TRACE_DEBUG("bta_av_config_ind: SEID: %d use_rc: %d cur_psc_mask:0x%x", p_info->seid, p_scb->use_rc, p_scb->cur_psc_mask);
+         /*  in case of A2DP SINK this is the first time peer data is being sent to co functions */
+         if (local_sep == AVDT_TSEP_SNK) {
+-            p_scb->p_cos->setcfg(p_scb->hndl, p_scb->codec_type,
++            p_scb->p_cos->setcfg(p_scb->hndl,
+                                  p_evt_cfg->codec_info,
+                                  p_info->seid,
+                                  p_scb->peer_addr,
+@@ -1196,7 +1200,7 @@
+                                  AVDT_TSEP_SNK,
+                                  p_msg->handle);
+         } else {
+-            p_scb->p_cos->setcfg(p_scb->hndl, p_scb->codec_type,
++            p_scb->p_cos->setcfg(p_scb->hndl,
+                                  p_evt_cfg->codec_info,
+                                  p_info->seid,
+                                  p_scb->peer_addr,
+@@ -1299,8 +1303,9 @@
+ 
+     if ((p_data->ci_setconfig.err_code == AVDT_SUCCESS) &&
+         (p_scb->seps[p_scb->sep_idx].p_app_data_cback != NULL)) {
+-            p_scb->seps[p_scb->sep_idx].p_app_data_cback(BTA_AV_MEDIA_CFG_EVT,
+-                    (tBTA_AV_MEDIA *)p_scb->cfg.codec_info);
++            tBTA_AV_MEDIA arg;
++            arg.codec_info = p_scb->cfg.codec_info;
++            p_scb->seps[p_scb->sep_idx].p_app_data_cback(BTA_AV_MEDIA_CFG_EVT, &arg);
+     }
+ 
+     if (AVDT_TSEP_SNK == local_sep) {
+@@ -1331,7 +1336,8 @@
+         }
+ 
+ 
+-        if (p_scb->codec_type == BTA_AV_CODEC_SBC || num > 1) {
++        if (A2DP_GetCodecType(p_scb->cfg.codec_info) == A2D_MEDIA_CT_SBC ||
++            num > 1) {
+             /* if SBC is used by the SNK as INT, discover req is not sent in bta_av_config_ind.
+                        * call cfg_res now */
+             /* this is called in A2DP SRC path only, In case of SINK we don't need it  */
+@@ -1407,8 +1413,7 @@
+     memset(&p_scb->q_info, 0, sizeof(tBTA_AV_Q_INFO));
+ 
+     p_scb->l2c_bufs = 0;
+-    p_scb->p_cos->open(p_scb->hndl,
+-                       p_scb->codec_type, p_scb->cfg.codec_info, mtu);
++    p_scb->p_cos->open(p_scb->hndl, p_scb->cfg.codec_info, mtu);
+ 
+     {
+         /* TODO check if other audio channel is open.
+@@ -1750,11 +1755,22 @@
+ 
+     APPL_TRACE_DEBUG("bta_av_save_caps num_seps:%d sep_info_idx:%d wait:x%x",
+                      p_scb->num_seps, p_scb->sep_info_idx, p_scb->wait);
++
++    /* Check if p_cap is allocated */
++    if (p_scb->p_cap == NULL) {
++        APPL_TRACE_ERROR("bta_av_save_caps: p_cap is NULL, allocating");
++        p_scb->p_cap = (tAVDT_CFG *) osi_malloc(sizeof(tAVDT_CFG));
++        if (p_scb->p_cap == NULL) {
++            APPL_TRACE_ERROR("bta_av_save_caps: failed to allocate p_cap");
++            return;
++        }
++        memset(p_scb->p_cap, 0, sizeof(tAVDT_CFG));
++    }
++
+     memcpy(&cfg, p_scb->p_cap, sizeof(tAVDT_CFG));
+     /* let application know the capability of the SNK */
+-    p_scb->p_cos->getcfg(p_scb->hndl, cfg.codec_info[BTA_AV_CODEC_TYPE_IDX],
+-                         cfg.codec_info, &p_scb->sep_info_idx, p_info->seid,
+-                         &cfg.num_protect, cfg.protect_info);
++    p_scb->p_cos->getcfg(p_scb->hndl, cfg.codec_info, &p_scb->sep_info_idx,
++                         p_info->seid, &cfg.num_protect, cfg.protect_info);
+ 
+     p_scb->sep_info_idx++;
+     if (p_scb->num_seps > p_scb->sep_info_idx) {
+@@ -1811,7 +1827,7 @@
+ 
+     mtu = bta_av_chk_mtu(p_scb, BTA_AV_MAX_A2DP_MTU);
+ 
+-    p_scb->p_cos->close(p_scb->hndl, p_scb->codec_type, mtu);
++    p_scb->p_cos->close(p_scb->hndl, mtu);
+ }
+ 
+ /*******************************************************************************
+@@ -1910,15 +1926,14 @@
+     /* if codec present and we get a codec configuration */
+     if ((p_scb->p_cap->num_codec != 0) &&
+             (media_type == p_scb->media_type) &&
+-            (p_scb->p_cos->getcfg(p_scb->hndl, p_scb->p_cap->codec_info[BTA_AV_CODEC_TYPE_IDX],
+-                                  cfg.codec_info, &p_scb->sep_info_idx, p_info->seid,
++            (p_scb->p_cos->getcfg(p_scb->hndl, cfg.codec_info,
++                                  &p_scb->sep_info_idx, p_info->seid,
+                                   &cfg.num_protect, cfg.protect_info) == 0)) {
+ #if AVDT_MULTIPLEXING == TRUE
+         cfg.mux_mask &= p_scb->p_cap->mux_mask;
+         APPL_TRACE_DEBUG("mux_mask used x%x", cfg.mux_mask);
+ #endif
+         /* save copy of codec type and configuration */
+-        p_scb->codec_type = cfg.codec_info[BTA_AV_CODEC_TYPE_IDX];
+         memcpy(&p_scb->cfg, &cfg, sizeof(tAVDT_CFG));
+ 
+         uuid_int = p_scb->uuid_int;
+@@ -1935,8 +1950,9 @@
+ 
+         if (p_scb->seps[p_scb->sep_idx].p_app_data_cback != NULL) {
+             APPL_TRACE_DEBUG(" Configure Deoder for A2DP Connection ");
+-            p_scb->seps[p_scb->sep_idx].p_app_data_cback(BTA_AV_MEDIA_CFG_EVT,
+-                    (tBTA_AV_MEDIA *)p_scb->cfg.codec_info);
++            tBTA_AV_MEDIA arg;
++            arg.codec_info = p_scb->cfg.codec_info;
++            p_scb->seps[p_scb->sep_idx].p_app_data_cback(BTA_AV_MEDIA_CFG_EVT, &arg);
+         }
+ 
+         if (uuid_int == UUID_SERVCLASS_AUDIO_SINK) {
+@@ -2098,7 +2114,7 @@
+         bta_av_stream_chg(p_scb, FALSE);
+         p_scb->co_started = FALSE;
+ 
+-        p_scb->p_cos->stop(p_scb->hndl, p_scb->codec_type);
++        p_scb->p_cos->stop(p_scb->hndl);
+         L2CA_SetFlushTimeout(p_scb->peer_addr, L2CAP_DEFAULT_FLUSH_TO);
+     }
+ 
+@@ -2237,7 +2253,7 @@
+     UINT32  data_len;
+     UINT32  timestamp;
+     BOOLEAN new_buf = FALSE;
+-    UINT8   m_pt = 0x60 | p_scb->codec_type;
++    UINT8   m_pt = 0x60 | A2DP_GetCodecType(p_scb->cfg.codec_info);
+     tAVDT_DATA_OPT_MASK     opt;
+     UNUSED(p_data);
+ 
+@@ -2259,7 +2275,7 @@
+     } else {
+         new_buf = TRUE;
+         /* a2d_list empty, call co_data, dup data to other channels */
+-        p_buf = (BT_HDR *)p_scb->p_cos->data(p_scb->codec_type, &data_len,
++        p_buf = (BT_HDR *)p_scb->p_cos->data(p_scb->cfg.codec_info, &data_len,
+                                              &timestamp);
+ 
+         if (p_buf) {
+@@ -2448,7 +2464,7 @@
+         p_scb->role &= ~BTA_AV_ROLE_SUSPEND_OPT;
+ 
+         p_scb->no_rtp_hdr = FALSE;
+-        p_scb->p_cos->start(p_scb->hndl, p_scb->codec_type, p_scb->cfg.codec_info, &p_scb->no_rtp_hdr);
++        p_scb->p_cos->start(p_scb->hndl, p_scb->cfg.codec_info, &p_scb->no_rtp_hdr);
+         p_scb->co_started = TRUE;
+ 
+         APPL_TRACE_DEBUG("bta_av_start_ok suspending: %d, role:x%x, init %d",
+@@ -2465,7 +2481,7 @@
+             p_scb->role |= BTA_AV_ROLE_SUSPEND;
+             p_scb->cong = TRUE;  /* do not allow the media data to go through */
+             /* do not duplicate the media packets to this channel */
+-            p_scb->p_cos->stop(p_scb->hndl, p_scb->codec_type);
++            p_scb->p_cos->stop(p_scb->hndl);
+             p_scb->co_started = FALSE;
+             stop.flush   = FALSE;
+             stop.suspend = TRUE;
+@@ -2551,7 +2567,7 @@
+         mtu = bta_av_chk_mtu(p_scb, BTA_AV_MAX_A2DP_MTU);
+ 
+         {
+-            p_scb->p_cos->close(p_scb->hndl, p_scb->codec_type, mtu);
++            p_scb->p_cos->close(p_scb->hndl, mtu);
+             data.close.chnl = p_scb->chnl;
+             data.close.hndl = p_scb->hndl;
+             data.close.disc_rsn = p_scb->disc_rsn;
+@@ -2644,7 +2660,7 @@
+ 
+         {
+             p_scb->co_started = FALSE;
+-            p_scb->p_cos->stop(p_scb->hndl, p_scb->codec_type);
++            p_scb->p_cos->stop(p_scb->hndl);
+         }
+         L2CA_SetFlushTimeout(p_scb->peer_addr, L2CAP_DEFAULT_FLUSH_TO);
+     }
+@@ -2888,12 +2904,11 @@
+ 
+     if (p_scb->num_disc_snks == 0) {
+         /* Need to update call-out module so that it will be ready for discover */
+-        p_scb->p_cos->stop(p_scb->hndl, p_scb->codec_type);
++        p_scb->p_cos->stop(p_scb->hndl);
+ 
+         /* send avdtp discover request */
+         AVDT_DiscoverReq(p_scb->peer_addr, p_scb->sep_info, BTA_AV_NUM_SEPS, bta_av_dt_cback[p_scb->hdi]);
+     } else {
+-        p_scb->codec_type = p_scb->p_cap->codec_info[BTA_AV_CODEC_TYPE_IDX];
+         memcpy(p_scb->cfg.codec_info, p_scb->p_cap->codec_info, AVDT_CODEC_SIZE);
+         /* we may choose to use a different SEP at reconfig.
+          * adjust the sep_idx now */
+--- a/host/bluedroid/bta/av/bta_av_main.c
++++ b/host/bluedroid/bta/av/bta_av_main.c
+@@ -32,6 +32,7 @@
+ #if defined(BTA_AV_INCLUDED) && (BTA_AV_INCLUDED == TRUE)
+ #include "bta_av_int.h"
+ #include "bta/utl.h"
++#include "stack/a2dp_codec_api.h"
+ #include "stack/l2c_api.h"
+ #include "stack/l2cdefs.h"
+ #include "bta/bta_av_co.h"
+@@ -544,7 +545,6 @@
+     char            *p_service_name;
+     tBTA_UTL_COD    cod;
+ #if (BTA_AV_EXT_CODEC == FALSE)
+-    tBTA_AV_CODEC   codec_type;
+     UINT8           index = 0;
+ #endif
+     char p_avk_service_name[BTA_SERVICE_NAME_LEN + 1];
+@@ -670,9 +670,27 @@
+             /* keep the configuration in the stream control block */
+             memcpy(&p_scb->cfg, &cs.cfg, sizeof(tAVDT_CFG));
+ #if (BTA_AV_EXT_CODEC == FALSE)
+-            while (index < BTA_AV_MAX_SEPS &&
+-                    (p_scb->p_cos->init)(&codec_type, cs.cfg.codec_info,
+-                                         &cs.cfg.num_protect, cs.cfg.protect_info, p_data->api_reg.tsep) == TRUE) {
++            btav_a2dp_codec_index_t codec_index_min = BTAV_A2DP_CODEC_INDEX_MIN;
++            btav_a2dp_codec_index_t codec_index_max = BTAV_A2DP_CODEC_INDEX_MAX;
++
++            if (p_data->api_reg.tsep == AVDT_TSEP_SRC) {
++                codec_index_min = BTAV_A2DP_CODEC_INDEX_SOURCE_MIN;
++                codec_index_max = BTAV_A2DP_CODEC_INDEX_SOURCE_MAX;
++            } else if (p_data->api_reg.tsep == AVDT_TSEP_SNK) {
++                codec_index_min = BTAV_A2DP_CODEC_INDEX_SINK_MIN;
++                codec_index_max = BTAV_A2DP_CODEC_INDEX_SINK_MAX;
++            }
++
++            index = codec_index_min;
++            for (;index < codec_index_max; index++) {
++                btav_a2dp_codec_index_t codec_index = (btav_a2dp_codec_index_t) index;
++
++                if (!(p_scb->p_cos->init)(codec_index, cs.cfg.codec_info,
++                                          &cs.cfg.num_protect, cs.cfg.protect_info,
++                                          p_data->api_reg.tsep))
++                {
++                    continue;
++                }
+ 
+ #if (BTA_AV_SINK_INCLUDED == TRUE)
+                 if (p_data->api_reg.tsep == AVDT_TSEP_SNK) {
+@@ -681,7 +699,9 @@
+                 APPL_TRACE_DEBUG(" SEP Type = %d\n", cs.tsep);
+ #endif
+                 if (AVDT_CreateStream(&p_scb->seps[index].av_handle, &cs) == AVDT_SUCCESS) {
+-                    p_scb->seps[index].codec_type = codec_type;
++                    /* Save a copy of the codec */
++                    memcpy(p_scb->seps[codec_index].codec_info,
++                           cs.cfg.codec_info, AVDT_CODEC_SIZE);
+ 
+ #if (BTA_AV_SINK_INCLUDED == TRUE)
+                     p_scb->seps[index].tsep = cs.tsep;
+@@ -693,9 +713,9 @@
+ #endif
+                     p_scb->seps[index].p_app_data_cback = p_data->api_reg.p_app_data_cback;
+ 
+-                    APPL_TRACE_DEBUG("audio[%d] av_handle: %d codec_type: %d\n",
+-                                     index, p_scb->seps[index].av_handle, p_scb->seps[index].codec_type);
+-                    index++;
++                    APPL_TRACE_DEBUG("audio[%d] av_handle: %d codec: %s\n",
++                                     index, p_scb->seps[index].av_handle,
++                                     A2DP_CodecName(p_scb->seps[index].codec_info));
+                 } else {
+                     break;
+                 }
+--- a/host/bluedroid/bta/av/bta_av_ssm.c
++++ b/host/bluedroid/bta/av/bta_av_ssm.c
+@@ -135,7 +135,7 @@
+     /* STR_START_OK_EVT */      {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
+     /* STR_START_FAIL_EVT */    {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
+     /* STR_CLOSE_EVT */         {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
+-    /* STR_CONFIG_IND_EVT */    {BTA_AV_SETCONFIG_REJ,  BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
++    /* STR_CONFIG_IND_EVT */    {BTA_AV_CONFIG_IND,     BTA_AV_SIGNORE,        BTA_AV_INCOMING_SST },
+     /* STR_SECURITY_IND_EVT */  {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
+     /* STR_SECURITY_CFM_EVT */  {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
+     /* STR_WRITE_CFM_EVT */     {BTA_AV_SIGNORE,        BTA_AV_SIGNORE,        BTA_AV_INIT_SST },
+--- a/host/bluedroid/bta/av/include/bta_av_int.h
++++ b/host/bluedroid/bta/av/include/bta_av_int.h
+@@ -358,7 +358,7 @@
+ /* type for SEP control block */
+ typedef struct {
+     UINT8               av_handle;         /* AVDTP handle */
+-    tBTA_AV_CODEC       codec_type;        /* codec type */
++    uint8_t codec_info[AVDT_CODEC_SIZE]; /* Codec info */
+     UINT8               tsep;              /* SEP type of local SEP */
+     tBTA_AV_DATA_CBACK  *p_app_data_cback; /* Application callback for media packets */
+ } tBTA_AV_SEP;
+@@ -506,7 +506,7 @@
+     const tBTA_AV_ACT   *p_act_tbl;     /* the action table for stream state machine */
+     const tBTA_AV_CO_FUNCTS *p_cos;     /* the associated callout functions */
+     tSDP_DISCOVERY_DB   *p_disc_db;     /* pointer to discovery database */
+-    tBTA_AV_SEP         seps[BTA_AV_MAX_SEPS];
++    tBTA_AV_SEP         seps[BTAV_A2DP_CODEC_INDEX_MAX];
+     tAVDT_CFG           *p_cap;         /* buffer used for get capabilities */
+     list_t              *a2d_list;      /* used for audio channels only */
+     tBTA_AV_Q_INFO      q_info;
+@@ -518,7 +518,6 @@
+     UINT16              stream_mtu;     /* MTU of stream */
+     UINT16              avdt_version;   /* the avdt version of peer device */
+     tBTA_SEC            sec_mask;       /* security mask */
+-    tBTA_AV_CODEC       codec_type;     /* codec type */
+     UINT8               media_type;     /* Media type */
+     BOOLEAN             cong;           /* TRUE if AVDTP congested */
+     tBTA_AV_STATUS      open_status;    /* open failure status */
+--- a/host/bluedroid/bta/include/bta/bta_av_api.h
++++ b/host/bluedroid/bta/include/bta/bta_av_api.h
+@@ -26,6 +26,7 @@
+ #ifndef BTA_AV_API_H
+ #define BTA_AV_API_H
+ 
++#include "bt_av.h"
+ #include "stack/avrc_api.h"
+ #include "stack/avdt_api.h"
+ #include "stack/a2d_api.h"
+@@ -119,7 +120,7 @@
+ #define BTA_AV_CODEC_MPEG4      VDP_MEDIA_CT_MPEG4      /* MPEG-4 Visual Simple Profile */
+ #define BTA_AV_CODEC_H263_P3    VDP_MEDIA_CT_H263_P3    /* H.263 profile 3 */
+ #define BTA_AV_CODEC_H263_P8    VDP_MEDIA_CT_H263_P8    /* H.263 profile 8 */
+-#define BTA_AV_CODEC_VEND       VDP_MEDIA_CT_VEND       /* Non-VDP */
++#define BTA_AV_CODEC_VEND       A2D_MEDIA_CT_NON_A2DP   /* Non-VDP */
+ 
+ typedef UINT8 tBTA_AV_CODEC;
+ 
+@@ -257,6 +258,7 @@
+ #define BTA_AV_REJECT_EVT       18      /* incoming connection rejected */
+ #define BTA_AV_RC_FEAT_EVT      19      /* remote control channel peer supported features update */
+ #define BTA_AV_MEDIA_CFG_EVT    20      /* command to configure codec */
++#define BTA_AV_MEDIA_SINK_CFG_EVT  BTA_AV_MEDIA_CFG_EVT  /* Compatibility alias for 5.1.4 code */
+ #define BTA_AV_MEDIA_DATA_EVT   21      /* sending data to Media Task */
+ #define BTA_AV_SET_DELAY_VALUE_EVT   22      /* set delay reporting value */
+ #define BTA_AV_GET_DELAY_VALUE_EVT   23      /* get delay reporting value */
+@@ -277,26 +279,22 @@
+ 
+ 
+ /* function types for call-out functions */
+-typedef BOOLEAN (*tBTA_AV_CO_INIT) (UINT8 *p_codec_type, UINT8 *p_codec_info,
++typedef BOOLEAN (*tBTA_AV_CO_INIT) (btav_a2dp_codec_index_t codec_index, UINT8 *p_codec_info,
+                                     UINT8 *p_num_protect, UINT8 *p_protect_info, UINT8 tsep);
+ typedef void (*tBTA_AV_CO_DISC_RES) (tBTA_AV_HNDL hndl, UINT8 num_seps,
+                                      UINT8 num_snk, UINT8 num_src, BD_ADDR addr, UINT16 uuid_local);
+ typedef void (*tBTA_AV_CO_CFG_RES) (tBTA_AV_HNDL hndl, UINT8 num_seps,
+                                      UINT8 num_snk, UINT8 num_src, BD_ADDR addr, UINT16 uuid_local);
+-typedef UINT8 (*tBTA_AV_CO_GETCFG) (tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type,
+-                                    UINT8 *p_codec_info, UINT8 *p_sep_info_idx, UINT8 seid,
+-                                    UINT8 *p_num_protect, UINT8 *p_protect_info);
+-typedef void (*tBTA_AV_CO_SETCFG) (tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type,
+-                                   UINT8 *p_codec_info, UINT8 seid, BD_ADDR addr,
++typedef UINT8 (*tBTA_AV_CO_GETCFG) (tBTA_AV_HNDL hndl,UINT8 *p_codec_info, UINT8 *p_sep_info_idx,
++                                    UINT8 seid, UINT8 *p_num_protect, UINT8 *p_protect_info);
++typedef void (*tBTA_AV_CO_SETCFG) (tBTA_AV_HNDL hndl, UINT8 *p_codec_info, UINT8 seid, BD_ADDR addr,
+                                    UINT8 num_protect, UINT8 *p_protect_info,
+                                    UINT8 t_local_sep, UINT8 avdt_handle);
+-typedef void (*tBTA_AV_CO_OPEN) (tBTA_AV_HNDL hndl,
+-                                 tBTA_AV_CODEC codec_type, UINT8 *p_codec_info,
+-                                 UINT16 mtu);
+-typedef void (*tBTA_AV_CO_CLOSE) (tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type, UINT16 mtu);
+-typedef void (*tBTA_AV_CO_START) (tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type, UINT8 *p_codec_info, BOOLEAN *p_no_rtp_hdr);
+-typedef void (*tBTA_AV_CO_STOP) (tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type);
+-typedef void *(*tBTA_AV_CO_DATAPATH) (tBTA_AV_CODEC codec_type,
++typedef void (*tBTA_AV_CO_OPEN) (tBTA_AV_HNDL hndl, UINT8 *p_codec_info, UINT16 mtu);
++typedef void (*tBTA_AV_CO_CLOSE) (tBTA_AV_HNDL hndl, UINT16 mtu);
++typedef void (*tBTA_AV_CO_START) (tBTA_AV_HNDL hndl, UINT8 *p_codec_info, BOOLEAN *p_no_rtp_hdr);
++typedef void (*tBTA_AV_CO_STOP) (tBTA_AV_HNDL hndl);
++typedef void *(*tBTA_AV_CO_DATAPATH) (const uint8_t* p_codec_info,
+                                       UINT32 *p_len, UINT32 *p_timestamp);
+ typedef void (*tBTA_AV_CO_DELAY) (tBTA_AV_HNDL hndl, UINT16 delay);
+ 
+--- a/host/bluedroid/bta/include/bta/bta_av_co.h
++++ b/host/bluedroid/bta/include/bta/bta_av_co.h
+@@ -24,6 +24,7 @@
+ #ifndef BTA_AV_CO_H
+ #define BTA_AV_CO_H
+ 
++#include "bt_av.h"
+ #include "stack/l2c_api.h"
+ #include "bta/bta_av_api.h"
+ 
+@@ -84,8 +85,9 @@
+ ** Returns          Stream codec and content protection capabilities info.
+ **
+ *******************************************************************************/
+-extern BOOLEAN bta_av_co_audio_init(UINT8 *p_codec_type, UINT8 *p_codec_info,
+-                                    UINT8 *p_num_protect, UINT8 *p_protect_info, UINT8 tsep);
++extern BOOLEAN bta_av_co_audio_init(btav_a2dp_codec_index_t codec_index,
++                                    UINT8 *p_codec_info, UINT8 *p_num_protect,
++                                    UINT8 *p_protect_info, UINT8 tsep);
+ 
+ /*******************************************************************************
+ **
+@@ -129,8 +131,8 @@
+ ** Returns          Stream codec and content protection configuration info.
+ **
+ *******************************************************************************/
+-extern UINT8 bta_av_co_audio_getconfig(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type,
+-                                       UINT8 *p_codec_info, UINT8 *p_sep_info_idx, UINT8 seid,
++extern UINT8 bta_av_co_audio_getconfig(tBTA_AV_HNDL hndl, UINT8 *p_codec_info,
++                                       UINT8 *p_sep_info_idx, UINT8 seid,
+                                        UINT8 *p_num_protect, UINT8 *p_protect_info);
+ 
+ /*******************************************************************************
+@@ -160,9 +162,10 @@
+ ** Returns          void
+ **
+ *******************************************************************************/
+-extern void bta_av_co_audio_setconfig(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type,
+-                                      UINT8 *p_codec_info, UINT8 seid, BD_ADDR addr,
+-                                      UINT8 num_protect, UINT8 *p_protect_info, UINT8 t_local_sep, UINT8 avdt_handle);
++extern void bta_av_co_audio_setconfig(tBTA_AV_HNDL hndl, UINT8 *p_codec_info,
++                                      UINT8 seid, BD_ADDR addr,
++                                      UINT8 num_protect, UINT8 *p_protect_info,
++                                      UINT8 t_local_sep, UINT8 avdt_handle);
+ 
+ /*******************************************************************************
+ **
+@@ -192,8 +195,7 @@
+ ** Returns          void
+ **
+ *******************************************************************************/
+-extern void bta_av_co_audio_open(tBTA_AV_HNDL hndl,
+-                                 tBTA_AV_CODEC codec_type, UINT8 *p_codec_info,
++extern void bta_av_co_audio_open(tBTA_AV_HNDL hndl, UINT8 *p_codec_info,
+                                  UINT16 mtu);
+ 
+ /*******************************************************************************
+@@ -207,9 +209,8 @@
+ ** Returns          void
+ **
+ *******************************************************************************/
+-extern void bta_av_co_video_open(tBTA_AV_HNDL hndl,
+-                                 tBTA_AV_CODEC codec_type, UINT8 *p_codec_info,
+-                                 UINT16 mtu);
++extern void bta_av_co_video_open(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type,
++                                 UINT8 *p_codec_info, UINT16 mtu);
+ 
+ /*******************************************************************************
+ **
+@@ -225,8 +226,7 @@
+ ** Returns          void
+ **
+ *******************************************************************************/
+-extern void bta_av_co_audio_close(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type,
+-                                  UINT16 mtu);
++extern void bta_av_co_audio_close(tBTA_AV_HNDL hndl, UINT16 mtu);
+ 
+ /*******************************************************************************
+ **
+@@ -253,8 +253,8 @@
+ ** Returns          void
+ **
+ *******************************************************************************/
+-extern void bta_av_co_audio_start(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type,
+-                                  UINT8 *p_codec_info, BOOLEAN *p_no_rtp_hdr);
++extern void bta_av_co_audio_start(tBTA_AV_HNDL hndl, UINT8 *p_codec_info,
++                                  BOOLEAN *p_no_rtp_hdr);
+ 
+ /*******************************************************************************
+ **
+@@ -281,7 +281,7 @@
+ ** Returns          void
+ **
+ *******************************************************************************/
+-extern void bta_av_co_audio_stop(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type);
++extern void bta_av_co_audio_stop(tBTA_AV_HNDL hndl);
+ 
+ /*******************************************************************************
+ **
+@@ -307,8 +307,8 @@
+ **                  Otherwise, a buffer (BT_HDR*) containing the audio data.
+ **
+ *******************************************************************************/
+-extern void *bta_av_co_audio_src_data_path(tBTA_AV_CODEC codec_type,
+-        UINT32 *p_len, UINT32 *p_timestamp);
++extern void *bta_av_co_audio_src_data_path(const uint8_t* p_codec_info,
++                                           UINT32 *p_len, UINT32 *p_timestamp);
+ 
+ /*******************************************************************************
+ **
+--- a/host/bluedroid/btc/profile/std/a2dp/bta_av_co.c
++++ b/host/bluedroid/btc/profile/std/a2dp/bta_av_co.c
+@@ -26,6 +26,7 @@
+ #include "common/bt_target.h"
+ #include "stack/a2d_api.h"
+ #include "stack/a2d_sbc.h"
++#include "stack/a2dp_codec_api.h"
+ #include "bta/bta_sys.h"
+ #include "bta/bta_av_api.h"
+ #include "bta/bta_av_co.h"
+@@ -68,28 +69,6 @@
+ /* SCMS-T protect info */
+ const UINT8 bta_av_co_cp_scmst[BTA_AV_CP_INFO_LEN] = "\x02\x02\x00";
+ 
+-/* SBC SRC codec capabilities */
+-const tA2D_SBC_CIE bta_av_co_sbc_caps = {
+-    (A2D_SBC_IE_SAMP_FREQ_44), /* samp_freq */
+-    (A2D_SBC_IE_CH_MD_MONO | A2D_SBC_IE_CH_MD_STEREO | A2D_SBC_IE_CH_MD_JOINT | A2D_SBC_IE_CH_MD_DUAL), /* ch_mode */
+-    (A2D_SBC_IE_BLOCKS_16 | A2D_SBC_IE_BLOCKS_12 | A2D_SBC_IE_BLOCKS_8 | A2D_SBC_IE_BLOCKS_4), /* block_len */
+-    (A2D_SBC_IE_SUBBAND_4 | A2D_SBC_IE_SUBBAND_8), /* num_subbands */
+-    (A2D_SBC_IE_ALLOC_MD_L | A2D_SBC_IE_ALLOC_MD_S), /* alloc_mthd */
+-    BTA_AV_CO_SBC_MAX_BITPOOL, /* max_bitpool */
+-    A2D_SBC_IE_MIN_BITPOOL /* min_bitpool */
+-};
+-
+-/* SBC SINK codec capabilities */
+-const tA2D_SBC_CIE bta_av_co_sbc_sink_caps = {
+-    (A2D_SBC_IE_SAMP_FREQ_48 | A2D_SBC_IE_SAMP_FREQ_44), /* samp_freq */
+-    (A2D_SBC_IE_CH_MD_MONO | A2D_SBC_IE_CH_MD_STEREO | A2D_SBC_IE_CH_MD_JOINT | A2D_SBC_IE_CH_MD_DUAL), /* ch_mode */
+-    (A2D_SBC_IE_BLOCKS_16 | A2D_SBC_IE_BLOCKS_12 | A2D_SBC_IE_BLOCKS_8 | A2D_SBC_IE_BLOCKS_4), /* block_len */
+-    (A2D_SBC_IE_SUBBAND_4 | A2D_SBC_IE_SUBBAND_8), /* num_subbands */
+-    (A2D_SBC_IE_ALLOC_MD_L | A2D_SBC_IE_ALLOC_MD_S), /* alloc_mthd */
+-    A2D_SBC_IE_MAX_BITPOOL, /* max_bitpool */
+-    A2D_SBC_IE_MIN_BITPOOL /* min_bitpool */
+-};
+-
+ #if !defined(BTC_AV_SBC_DEFAULT_SAMP_FREQ)
+ #define BTC_AV_SBC_DEFAULT_SAMP_FREQ A2D_SBC_IE_SAMP_FREQ_44
+ #endif
+@@ -116,10 +95,9 @@
+ static void bta_av_co_audio_peer_reset_config(tBTA_AV_CO_PEER *p_peer);
+ static BOOLEAN bta_av_co_cp_is_scmst(const UINT8 *p_protectinfo);
+ static BOOLEAN bta_av_co_audio_sink_has_scmst(const tBTA_AV_CO_SINK *p_sink);
+-static BOOLEAN bta_av_co_audio_peer_supports_codec(tBTA_AV_CO_PEER *p_peer, UINT8 *p_snk_index);
+-static UINT8 bta_av_co_audio_media_supports_config(UINT8 codec_type, const UINT8 *p_codec_cfg);
+-static UINT8 bta_av_co_audio_sink_supports_config(UINT8 codec_type, const UINT8 *p_codec_cfg);
+-static BOOLEAN bta_av_co_audio_peer_src_supports_codec(tBTA_AV_CO_PEER *p_peer, UINT8 *p_src_index);
++static tBTA_AV_CO_SINK* bta_av_co_audio_find_peer_sink(tBTA_AV_CO_PEER *p_peer);
++static tBTA_AV_CO_SINK* bta_av_co_audio_find_peer_src(tBTA_AV_CO_PEER *p_peer);
++
+ 
+ 
+ /*******************************************************************************
+@@ -219,7 +197,8 @@
+  ** Returns          Stream codec and content protection capabilities info.
+  **
+  *******************************************************************************/
+-BOOLEAN bta_av_co_audio_init(UINT8 *p_codec_type, UINT8 *p_codec_info, UINT8 *p_num_protect,
++BOOLEAN bta_av_co_audio_init(btav_a2dp_codec_index_t codec_index,
++                             UINT8 *p_codec_info, UINT8 *p_num_protect,
+                              UINT8 *p_protect_info, UINT8 tsep)
+ {
+     FUNC_TRACE();
+@@ -231,7 +210,7 @@
+     *p_protect_info = 0;
+ 
+     /* reset remote preference through setconfig */
+-    bta_av_co_cb.codec_cfg_setconfig.id = BTC_AV_CODEC_NONE;
++    memset(bta_av_co_cb.codec_cfg_setconfig.info, 0, AVDT_CODEC_SIZE);
+ 
+     if (tsep == AVDT_TSEP_SRC) {
+ #if defined(BTA_AV_CO_CP_SCMS_T) && (BTA_AV_CO_CP_SCMS_T == TRUE)
+@@ -244,31 +223,9 @@
+             UINT16_TO_STREAM(p, BTA_AV_CP_SCMS_T_ID);
+         } while (0);
+ #endif
+-#if (BTC_AV_EXT_CODEC == TRUE)
+-        /* for external codec, we get codec capability from BTA_AV */
+-        bta_av_co_cb.codec_caps.id = *p_codec_type;
+-        memcpy(bta_av_co_cb.codec_caps.info, p_codec_info, AVDT_CODEC_SIZE);
+-        bta_av_co_audio_codec_reset();
+-#else
+-        /* Set up for SBC codec  for SRC*/
+-        *p_codec_type = BTA_AV_CODEC_SBC;
+-        /* This should not fail because we are using constants for parameters */
+-        A2D_BldSbcInfo(AVDT_MEDIA_AUDIO, (tA2D_SBC_CIE *) &bta_av_co_sbc_caps, p_codec_info);
+-#endif
+-        return TRUE;
++        return A2DP_InitCodecConfig(codec_index, p_codec_info);
+     } else if (tsep == AVDT_TSEP_SNK) {
+-#if (BTC_AV_EXT_CODEC == TRUE)
+-        /* for external codec, we get codec capability from BTA_AV */
+-        bta_av_co_cb.codec_caps.id = *p_codec_type;
+-        memcpy(bta_av_co_cb.codec_caps.info, p_codec_info, AVDT_CODEC_SIZE);
+-        bta_av_co_audio_codec_reset();
+-#else
+-        *p_codec_type = BTA_AV_CODEC_SBC;
+-        /* This should not fail because we are using constants for parameters */
+-        A2D_BldSbcInfo(AVDT_MEDIA_AUDIO, (tA2D_SBC_CIE *) &bta_av_co_sbc_sink_caps, p_codec_info);
+-#endif
+-        /* Codec is valid */
+-        return TRUE;
++        return A2DP_InitCodecConfig(codec_index, p_codec_info);
+     } else {
+         APPL_TRACE_WARNING("invalid SEP type %d", tsep);
+         return FALSE;
+@@ -390,63 +347,10 @@
+  *******************************************************************************/
+ void bta_av_build_src_cfg (UINT8 *p_pref_cfg, UINT8 *p_src_cap)
+ {
+-    tA2D_SBC_CIE    src_cap;
+-    tA2D_SBC_CIE    pref_cap;
+-    UINT8           status = 0;
+-
+-    /* initialize it to default SBC configuration */
+-    A2D_BldSbcInfo(AVDT_MEDIA_AUDIO, (tA2D_SBC_CIE *) &btc_av_sbc_default_config, p_pref_cfg);
+-    /* now try to build a preferred one */
+-    /* parse configuration */
+-    if ((status = A2D_ParsSbcInfo(&src_cap, p_src_cap, TRUE)) != 0) {
+-        APPL_TRACE_DEBUG(" Can't parse src cap ret = %d", status);
+-        return ;
+-    }
+-
+-    memcpy(&pref_cap, &src_cap, sizeof(tA2D_SBC_CIE));
+-
+-    if (src_cap.samp_freq & A2D_SBC_IE_SAMP_FREQ_48) {
+-        pref_cap.samp_freq = A2D_SBC_IE_SAMP_FREQ_48;
+-    } else if (src_cap.samp_freq & A2D_SBC_IE_SAMP_FREQ_44) {
+-        pref_cap.samp_freq = A2D_SBC_IE_SAMP_FREQ_44;
+-    }
+-
+-    if (src_cap.ch_mode & A2D_SBC_IE_CH_MD_JOINT) {
+-        pref_cap.ch_mode = A2D_SBC_IE_CH_MD_JOINT;
+-    } else if (src_cap.ch_mode & A2D_SBC_IE_CH_MD_STEREO) {
+-        pref_cap.ch_mode = A2D_SBC_IE_CH_MD_STEREO;
+-    } else if (src_cap.ch_mode & A2D_SBC_IE_CH_MD_DUAL) {
+-        pref_cap.ch_mode = A2D_SBC_IE_CH_MD_DUAL;
+-    } else if (src_cap.ch_mode & A2D_SBC_IE_CH_MD_MONO) {
+-        pref_cap.ch_mode = A2D_SBC_IE_CH_MD_MONO;
+-    }
+-
+-    if (src_cap.block_len & A2D_SBC_IE_BLOCKS_16) {
+-        pref_cap.block_len = A2D_SBC_IE_BLOCKS_16;
+-    } else if (src_cap.block_len & A2D_SBC_IE_BLOCKS_12) {
+-        pref_cap.block_len = A2D_SBC_IE_BLOCKS_12;
+-    } else if (src_cap.block_len & A2D_SBC_IE_BLOCKS_8) {
+-        pref_cap.block_len = A2D_SBC_IE_BLOCKS_8;
+-    } else if (src_cap.block_len & A2D_SBC_IE_BLOCKS_4) {
+-        pref_cap.block_len = A2D_SBC_IE_BLOCKS_4;
+-    }
+-
+-    if (src_cap.num_subbands & A2D_SBC_IE_SUBBAND_8) {
+-        pref_cap.num_subbands = A2D_SBC_IE_SUBBAND_8;
+-    } else if (src_cap.num_subbands & A2D_SBC_IE_SUBBAND_4) {
+-        pref_cap.num_subbands = A2D_SBC_IE_SUBBAND_4;
+-    }
+-
+-    if (src_cap.alloc_mthd & A2D_SBC_IE_ALLOC_MD_L) {
+-        pref_cap.alloc_mthd = A2D_SBC_IE_ALLOC_MD_L;
+-    } else if (src_cap.alloc_mthd & A2D_SBC_IE_ALLOC_MD_S) {
+-        pref_cap.alloc_mthd = A2D_SBC_IE_ALLOC_MD_S;
++    if (!A2DP_BuildCodecConfig(p_src_cap, p_pref_cfg)) {
++        APPL_TRACE_ERROR("%s: cannot build a config for codec %s", __func__,
++                         A2DP_CodecName(p_src_cap));
+     }
+-
+-    pref_cap.max_bitpool = src_cap.max_bitpool;
+-    pref_cap.min_bitpool = src_cap.min_bitpool;
+-
+-    A2D_BldSbcInfo(AVDT_MEDIA_AUDIO, (tA2D_SBC_CIE *) &pref_cap, p_pref_cfg);
+ }
+ 
+ /*******************************************************************************
+@@ -461,22 +365,20 @@
+  ** Returns          Pass or Fail for current getconfig.
+  **
+  *******************************************************************************/
+-UINT8 bta_av_audio_sink_getconfig(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type,
++UINT8 bta_av_audio_sink_getconfig(tBTA_AV_HNDL hndl,
+                                   UINT8 *p_codec_info, UINT8 *p_sep_info_idx, UINT8 seid, UINT8 *p_num_protect,
+                                   UINT8 *p_protect_info)
+ {
+ 
+     UINT8 result = A2D_FAIL;
+-    BOOLEAN supported;
+     tBTA_AV_CO_PEER *p_peer;
+     tBTA_AV_CO_SINK *p_src;
+     UINT8 pref_cfg[AVDT_CODEC_SIZE];
+-    UINT8 index;
+ 
+     FUNC_TRACE();
+ 
+-    APPL_TRACE_DEBUG("bta_av_audio_sink_getconfig handle:0x%x codec_type:%d seid:%d",
+-                     hndl, codec_type, seid);
++    APPL_TRACE_DEBUG("bta_av_audio_sink_getconfig handle:0x%x seid:%d",
++                     hndl, seid);
+     APPL_TRACE_DEBUG("num_protect:0x%02x protect_info:0x%02x%02x%02x",
+                      *p_num_protect, p_protect_info[0], p_protect_info[1], p_protect_info[2]);
+ 
+@@ -493,17 +395,7 @@
+     p_peer->num_rx_srcs++;
+ 
+     /* Check if this is a supported configuration */
+-    supported = FALSE;
+-    switch (codec_type) {
+-    case BTA_AV_CODEC_SBC:
+-        supported = TRUE;
+-        break;
+-
+-    default:
+-        break;
+-    }
+-
+-    if (supported) {
++    if (A2DP_IsPeerSourceCodecSupported(p_codec_info) == A2D_SUCCESS) {
+         /* If there is room for a new one */
+         if (p_peer->num_sup_srcs < BTA_AV_CO_NUM_ELEMENTS(p_peer->srcs)) {
+             p_src = &p_peer->srcs[p_peer->num_sup_srcs++];
+@@ -513,7 +405,6 @@
+                              p_codec_info[4], p_codec_info[5], p_codec_info[6]);
+ 
+             memcpy(p_src->codec_caps, p_codec_info, AVDT_CODEC_SIZE);
+-            p_src->codec_type = codec_type;
+             p_src->sep_info_idx = *p_sep_info_idx;
+             p_src->seid = seid;
+             p_src->num_protect = *p_num_protect;
+@@ -532,9 +423,9 @@
+         osi_mutex_global_lock();
+ 
+         /* Find a src that matches the codec config */
+-        if (bta_av_co_audio_peer_src_supports_codec(p_peer, &index)) {
++        p_src = bta_av_co_audio_find_peer_src(p_peer);
++        if (p_src != NULL) {
+             APPL_TRACE_DEBUG(" Codec Supported ");
+-            p_src = &p_peer->srcs[index];
+ 
+             /* Build the codec configuration for this sink */
+             {
+@@ -577,17 +468,15 @@
+  ** Returns          Stream codec and content protection configuration info.
+  **
+  *******************************************************************************/
+-UINT8 bta_av_co_audio_getconfig(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type,
++UINT8 bta_av_co_audio_getconfig(tBTA_AV_HNDL hndl,
+                                 UINT8 *p_codec_info, UINT8 *p_sep_info_idx, UINT8 seid, UINT8 *p_num_protect,
+                                 UINT8 *p_protect_info)
+ 
+ {
+     UINT8 result = A2D_FAIL;
+-    BOOLEAN supported;
+     tBTA_AV_CO_PEER *p_peer;
+     tBTA_AV_CO_SINK *p_sink;
+     UINT8 codec_cfg[AVDT_CODEC_SIZE];
+-    UINT8 index;
+ 
+     FUNC_TRACE();
+ 
+@@ -599,12 +488,12 @@
+     }
+ 
+     if (p_peer->uuid_to_connect == UUID_SERVCLASS_AUDIO_SOURCE) {
+-        result = bta_av_audio_sink_getconfig(hndl, codec_type, p_codec_info, p_sep_info_idx,
++        result = bta_av_audio_sink_getconfig(hndl, p_codec_info, p_sep_info_idx,
+                                              seid, p_num_protect, p_protect_info);
+         return result;
+     }
+-    APPL_TRACE_DEBUG("bta_av_co_audio_getconfig handle:0x%x codec_type:%d seid:%d",
+-                     hndl, codec_type, seid);
++    APPL_TRACE_DEBUG("bta_av_co_audio_getconfig handle:0x%x seid:%d",
++                     hndl, seid);
+     APPL_TRACE_DEBUG("num_protect:0x%02x protect_info:0x%02x%02x%02x",
+                      *p_num_protect, p_protect_info[0], p_protect_info[1], p_protect_info[2]);
+ 
+@@ -614,17 +503,7 @@
+     p_peer->num_rx_snks++;
+ 
+     /* Check if this is a supported configuration */
+-    supported = FALSE;
+-    switch (codec_type) {
+-    case BTA_AV_CODEC_SBC:
+-        supported = TRUE;
+-        break;
+-
+-    default:
+-        break;
+-    }
+-
+-    if (supported) {
++    if (A2DP_IsPeerSinkCodecValid(p_codec_info)) {
+         /* If there is room for a new one */
+         if (p_peer->num_sup_snks < BTA_AV_CO_NUM_ELEMENTS(p_peer->snks)) {
+             p_sink = &p_peer->snks[p_peer->num_sup_snks++];
+@@ -634,7 +513,6 @@
+                              p_codec_info[4], p_codec_info[5], p_codec_info[6]);
+ 
+             memcpy(p_sink->codec_caps, p_codec_info, AVDT_CODEC_SIZE);
+-            p_sink->codec_type = codec_type;
+             p_sink->sep_info_idx = *p_sep_info_idx;
+             p_sink->seid = seid;
+             p_sink->num_protect = *p_num_protect;
+@@ -653,15 +531,14 @@
+         osi_mutex_global_lock();
+ 
+         /* Find a sink that matches the codec config */
+-        if (bta_av_co_audio_peer_supports_codec(p_peer, &index)) {
++        p_sink = bta_av_co_audio_find_peer_sink(p_peer);
++        if (p_sink != NULL) {
+             /* stop fetching caps once we retrieved a supported codec */
+             if (p_peer->acp) {
+                 *p_sep_info_idx = p_peer->num_seps;
+                 APPL_TRACE_EVENT("no need to fetch more SEPs");
+             }
+ 
+-            p_sink = &p_peer->snks[index];
+-
+             /* Build the codec configuration for this sink */
+             if (bta_av_co_audio_codec_build_config(p_sink->codec_caps, codec_cfg)) {
+                 APPL_TRACE_DEBUG("bta_av_co_audio_getconfig reconfig p_codec_info[%x:%x:%x:%x:%x:%x]",
+@@ -718,7 +595,7 @@
+  ** Returns          void
+  **
+  *******************************************************************************/
+-void bta_av_co_audio_setconfig(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type,
++void bta_av_co_audio_setconfig(tBTA_AV_HNDL hndl,
+                                UINT8 *p_codec_info, UINT8 seid, BD_ADDR addr, UINT8 num_protect, UINT8 *p_protect_info,
+                                UINT8 t_local_sep, UINT8 avdt_handle)
+ {
+@@ -777,11 +654,11 @@
+ #endif
+     if (status == A2D_SUCCESS) {
+         if (AVDT_TSEP_SNK == t_local_sep) {
+-            codec_cfg_status = bta_av_co_audio_sink_supports_config(codec_type, p_codec_info);
++            codec_cfg_status = A2DP_IsPeerSourceCodecSupported(p_codec_info);
+             APPL_TRACE_DEBUG(" Peer is  A2DP SRC ");
+         }
+         if (AVDT_TSEP_SRC == t_local_sep) {
+-            codec_cfg_status = bta_av_co_audio_media_supports_config(codec_type, p_codec_info);
++            codec_cfg_status = A2DP_IsSinkCodecSupported(p_codec_info);
+             APPL_TRACE_DEBUG(" Peer is A2DP SINK ");
+         }
+         /* Check if codec configuration is supported */
+@@ -791,36 +668,20 @@
+             osi_mutex_global_lock();
+ 
+             /* Check if the configuration matches the current codec config */
+-            switch (bta_av_co_cb.codec_cfg.id) {
+-            case BTC_AV_CODEC_SBC:
+-                if ((codec_type != BTA_AV_CODEC_SBC) || memcmp(p_codec_info, bta_av_co_cb.codec_cfg.info, 5)) {
+-                    recfg_needed = TRUE;
+-                } else if ((num_protect == 1) && (!bta_av_co_cb.cp.active)) {
+-                    recfg_needed = TRUE;
+-                }
+-
+-                /* if remote side requests a restricted notify sinks preferred bitpool range as all other params are
+-                   already checked for validify */
+-                APPL_TRACE_EVENT("remote peer setconfig bitpool range [%d:%d]",
+-                                 p_codec_info[BTA_AV_CO_SBC_MIN_BITPOOL_OFF],
+-                                 p_codec_info[BTA_AV_CO_SBC_MAX_BITPOOL_OFF] );
+-
+-                bta_av_co_cb.codec_cfg_setconfig.id = BTC_AV_CODEC_SBC;
+-                memcpy(bta_av_co_cb.codec_cfg_setconfig.info, p_codec_info, AVDT_CODEC_SIZE);
+-                if (AVDT_TSEP_SNK == t_local_sep) {
+-                    /* If Peer is SRC, and our cfg subset matches with what is requested by peer, then
+-                                         just accept what peer wants */
+-                    memcpy(bta_av_co_cb.codec_cfg.info, p_codec_info, AVDT_CODEC_SIZE);
+-                    recfg_needed = FALSE;
+-                }
+-                break;
+-
+-
+-            default:
+-                APPL_TRACE_ERROR("bta_av_co_audio_setconfig unsupported cid %d", bta_av_co_cb.codec_cfg.id);
++            if (!A2DP_CodecTypeEquals(bta_av_co_cb.codec_cfg_setconfig.info, p_codec_info)) {
+                 recfg_needed = TRUE;
+-                break;
++            } else if ((num_protect == 1) && (!bta_av_co_cb.cp.active)) {
++                recfg_needed = TRUE;
++            }
++
++            memcpy(bta_av_co_cb.codec_cfg_setconfig.info, p_codec_info, AVDT_CODEC_SIZE);
++            if (AVDT_TSEP_SNK == t_local_sep) {
++                /* If Peer is SRC, and our cfg subset matches with what is requested by peer, then
++                                     just accept what peer wants */
++                memcpy(bta_av_co_cb.codec_cfg.info, p_codec_info, AVDT_CODEC_SIZE);
++                recfg_needed = FALSE;
+             }
++
+             /* Protect access to bta_av_co_cb.codec_cfg */
+             osi_mutex_global_unlock();
+         } else {
+@@ -857,7 +718,7 @@
+  ** Returns          void
+  **
+  *******************************************************************************/
+-void bta_av_co_audio_open(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type, UINT8 *p_codec_info,
++void bta_av_co_audio_open(tBTA_AV_HNDL hndl, UINT8 *p_codec_info,
+                           UINT16 mtu)
+ {
+     tBTA_AV_CO_PEER *p_peer;
+@@ -865,7 +726,7 @@
+ 
+     FUNC_TRACE();
+ 
+-    APPL_TRACE_DEBUG("bta_av_co_audio_open mtu:%d codec_type:%d", mtu, codec_type);
++    APPL_TRACE_DEBUG("bta_av_co_audio_open mtu:%d codec:%s", mtu, A2DP_CodecName(p_codec_info));
+ 
+     /* Retrieve the peer info */
+     p_peer = bta_av_co_get_peer(hndl);
+@@ -888,11 +749,10 @@
+  ** Returns          void
+  **
+  *******************************************************************************/
+-void bta_av_co_audio_close(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type, UINT16 mtu)
++void bta_av_co_audio_close(tBTA_AV_HNDL hndl, UINT16 mtu)
+ 
+ {
+     tBTA_AV_CO_PEER *p_peer;
+-    UNUSED(codec_type);
+     UNUSED(mtu);
+ 
+     FUNC_TRACE();
+@@ -909,7 +769,7 @@
+     }
+ 
+     /* reset remote preference through setconfig */
+-    bta_av_co_cb.codec_cfg_setconfig.id = BTC_AV_CODEC_NONE;
++    memset(bta_av_co_cb.codec_cfg_setconfig.info, 0, AVDT_CODEC_SIZE);
+ }
+ 
+ /*******************************************************************************
+@@ -923,11 +783,10 @@
+  ** Returns          void
+  **
+  *******************************************************************************/
+-void bta_av_co_audio_start(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type,
++void bta_av_co_audio_start(tBTA_AV_HNDL hndl,
+                            UINT8 *p_codec_info, BOOLEAN *p_no_rtp_hdr)
+ {
+     UNUSED(hndl);
+-    UNUSED(codec_type);
+     UNUSED(p_codec_info);
+     UNUSED(p_no_rtp_hdr);
+ 
+@@ -948,10 +807,9 @@
+  ** Returns          void
+  **
+  *******************************************************************************/
+-extern void bta_av_co_audio_stop(tBTA_AV_HNDL hndl, tBTA_AV_CODEC codec_type)
++extern void bta_av_co_audio_stop(tBTA_AV_HNDL hndl)
+ {
+     UNUSED(hndl);
+-    UNUSED(codec_type);
+ 
+     FUNC_TRACE();
+ 
+@@ -968,7 +826,7 @@
+  ** Returns          Pointer to the buffer to send, NULL if no buffer to send
+  **
+  *******************************************************************************/
+-void *bta_av_co_audio_src_data_path(tBTA_AV_CODEC codec_type, UINT32 *p_len,
++void *bta_av_co_audio_src_data_path(const uint8_t* p_codec_info, UINT32 *p_len,
+                                     UINT32 *p_timestamp)
+ {
+ #if BTC_AV_SRC_INCLUDED
+@@ -977,6 +835,8 @@
+ 
+     FUNC_TRACE();
+ 
++    tBTA_AV_CODEC codec_type = A2DP_GetCodecType(p_codec_info);
++
+     p_buf = btc_a2dp_source_audio_readbuf();
+     if (p_buf != NULL) {
+         switch (codec_type) {
+@@ -1070,88 +930,7 @@
+     FUNC_TRACE();
+ 
+     memset(p_codec_cfg, 0, AVDT_CODEC_SIZE);
+-
+-    switch (bta_av_co_cb.codec_cfg.id) {
+-    case BTC_AV_CODEC_SBC:
+-        /*  only copy the relevant portions for this codec to avoid issues when
+-            comparing codec configs covering larger codec sets than SBC (7 bytes) */
+-        memcpy(p_codec_cfg, bta_av_co_cb.codec_cfg.info, BTA_AV_CO_SBC_MAX_BITPOOL_OFF + 1);
+-
+-        /* Update the bit pool boundaries with the codec capabilities */
+-        p_codec_cfg[BTA_AV_CO_SBC_MIN_BITPOOL_OFF] = BTA_AV_CO_MAX(p_codec_caps[BTA_AV_CO_SBC_MIN_BITPOOL_OFF], p_codec_cfg[BTA_AV_CO_SBC_MIN_BITPOOL_OFF]);
+-        p_codec_cfg[BTA_AV_CO_SBC_MAX_BITPOOL_OFF] = BTA_AV_CO_MIN(p_codec_caps[BTA_AV_CO_SBC_MAX_BITPOOL_OFF], p_codec_cfg[BTA_AV_CO_SBC_MAX_BITPOOL_OFF]);
+-
+-        APPL_TRACE_EVENT("bta_av_co_audio_codec_build_config : bitpool min %d, max %d",
+-                         p_codec_cfg[BTA_AV_CO_SBC_MIN_BITPOOL_OFF],
+-                         p_codec_cfg[BTA_AV_CO_SBC_MAX_BITPOOL_OFF]);
+-        break;
+-    default:
+-        APPL_TRACE_ERROR("bta_av_co_audio_codec_build_config: unsupported codec id %d", bta_av_co_cb.codec_cfg.id);
+-        return FALSE;
+-        break;
+-    }
+-    return TRUE;
+-}
+-
+-/*******************************************************************************
+- **
+- ** Function         bta_av_co_audio_codec_cfg_matches_caps
+- **
+- ** Description      Check if a codec config matches a codec capabilities
+- **
+- ** Returns          TRUE if it codec config is supported, FALSE otherwise
+- **
+- *******************************************************************************/
+-static BOOLEAN bta_av_co_audio_codec_cfg_matches_caps(UINT8 codec_id, const UINT8 *p_codec_caps, const UINT8 *p_codec_cfg)
+-{
+-    FUNC_TRACE();
+-
+-    switch (codec_id) {
+-    case BTC_AV_CODEC_SBC:
+-
+-        APPL_TRACE_EVENT("bta_av_co_audio_codec_cfg_matches_caps : min %d/%d max %d/%d",
+-                         p_codec_caps[BTA_AV_CO_SBC_MIN_BITPOOL_OFF],
+-                         p_codec_cfg[BTA_AV_CO_SBC_MIN_BITPOOL_OFF],
+-                         p_codec_caps[BTA_AV_CO_SBC_MAX_BITPOOL_OFF],
+-                         p_codec_cfg[BTA_AV_CO_SBC_MAX_BITPOOL_OFF]);
+-
+-        /* Must match all items exactly except bitpool boundaries which can be adjusted */
+-        if ((~p_codec_caps[BTA_AV_CO_SBC_FREQ_CHAN_OFF] & p_codec_cfg[BTA_AV_CO_SBC_FREQ_CHAN_OFF]) ||
+-            (~p_codec_caps[BTA_AV_CO_SBC_BLOCK_BAND_OFF] & p_codec_cfg[BTA_AV_CO_SBC_BLOCK_BAND_OFF])) {
+-            APPL_TRACE_EVENT("FALSE %x %x %x %x",
+-                             p_codec_caps[BTA_AV_CO_SBC_FREQ_CHAN_OFF],
+-                             p_codec_cfg[BTA_AV_CO_SBC_FREQ_CHAN_OFF],
+-                             p_codec_caps[BTA_AV_CO_SBC_BLOCK_BAND_OFF],
+-                             p_codec_cfg[BTA_AV_CO_SBC_BLOCK_BAND_OFF]);
+-            return FALSE;
+-        }
+-        break;
+-
+-
+-    default:
+-        APPL_TRACE_ERROR("bta_av_co_audio_codec_cfg_matches_caps: unsupported codec id %d", codec_id);
+-        return FALSE;
+-        break;
+-    }
+-    APPL_TRACE_EVENT("TRUE");
+-
+-    return TRUE;
+-}
+-
+-/*******************************************************************************
+- **
+- ** Function         bta_av_co_audio_codec_match
+- **
+- ** Description      Check if a codec capabilities supports the codec config
+- **
+- ** Returns          TRUE if the connection supports this codec, FALSE otherwise
+- **
+- *******************************************************************************/
+-static BOOLEAN bta_av_co_audio_codec_match(const UINT8 *p_codec_caps)
+-{
+-    FUNC_TRACE();
+-
+-    return bta_av_co_audio_codec_cfg_matches_caps(bta_av_co_cb.codec_cfg.id, p_codec_caps, bta_av_co_cb.codec_cfg.info);
++    return A2DP_BuildCodecConfig((UINT8 *)p_codec_caps, p_codec_cfg);
+ }
+ 
+ /*******************************************************************************
+@@ -1253,165 +1032,50 @@
+ 
+ /*******************************************************************************
+  **
+- ** Function         bta_av_co_audio_peer_supports_codec
++ ** Function         bta_av_co_audio_find_peer_sink
+  **
+- ** Description      Check if a connection supports the codec config
++ ** Description      Find a peer Sink SEP entry with a supported codec.
+  **
+- ** Returns          TRUE if the connection supports this codec, FALSE otherwise
++ ** Returns          the peer Sink SEP for the codec index if found, otherwise NULL
+  **
+  *******************************************************************************/
+-static BOOLEAN bta_av_co_audio_peer_supports_codec(tBTA_AV_CO_PEER *p_peer, UINT8 *p_snk_index)
++static tBTA_AV_CO_SINK* bta_av_co_audio_find_peer_sink(tBTA_AV_CO_PEER *p_peer)
+ {
+-    int index;
+-    UINT8 codec_type;
+-    FUNC_TRACE();
+-
+-    /* Configure the codec type to look for */
+-    codec_type = bta_av_co_cb.codec_cfg.id;
+-
+-
+-    for (index = 0; index < p_peer->num_sup_snks; index++) {
+-        if (p_peer->snks[index].codec_type == codec_type) {
+-            switch (bta_av_co_cb.codec_cfg.id) {
+-            case BTC_AV_CODEC_SBC:
+-                if (p_snk_index) {
+-                    *p_snk_index = index;
+-                }
+-                return bta_av_co_audio_codec_match(p_peer->snks[index].codec_caps);
+-                break;
+-
++    btav_a2dp_codec_index_t codec_index;
+ 
+-            default:
+-                APPL_TRACE_ERROR("bta_av_co_audio_peer_supports_codec: unsupported codec id %d", bta_av_co_cb.codec_cfg.id);
+-                return FALSE;
+-                break;
+-            }
+-        }
+-    }
+-    return FALSE;
+-}
+-
+-/*******************************************************************************
+- **
+- ** Function         bta_av_co_audio_peer_src_supports_codec
+- **
+- ** Description      Check if a peer acting as src supports codec config
+- **
+- ** Returns          TRUE if the connection supports this codec, FALSE otherwise
+- **
+- *******************************************************************************/
+-static BOOLEAN bta_av_co_audio_peer_src_supports_codec(tBTA_AV_CO_PEER *p_peer, UINT8 *p_src_index)
+-{
+-    int index;
+-    UINT8 codec_type;
+     FUNC_TRACE();
+ 
+-    /* Configure the codec type to look for */
+-    codec_type = bta_av_co_cb.codec_cfg.id;
+-
+-
+-    for (index = 0; index < p_peer->num_sup_srcs; index++) {
+-        if (p_peer->srcs[index].codec_type == codec_type) {
+-            switch (bta_av_co_cb.codec_cfg.id) {
+-            case BTC_AV_CODEC_SBC:
+-                if (p_src_index) {
+-                    *p_src_index = index;
+-                }
+-#if (BTC_AV_EXT_CODEC == TRUE)
+-                tA2D_SBC_CIE cap_cie;
+-                if (A2D_ParsSbcInfo(&cap_cie, bta_av_co_cb.codec_caps.info, TRUE) != A2D_SUCCESS) {
+-                    return FALSE;
+-                }
+-                if (0 ==  bta_av_sbc_cfg_matches_cap((UINT8 *)p_peer->srcs[index].codec_caps, &cap_cie)) {
+-                    return TRUE;
+-                }
+-#else
+-                if (0 ==  bta_av_sbc_cfg_matches_cap((UINT8 *)p_peer->srcs[index].codec_caps,
+-                                                        (tA2D_SBC_CIE *)&bta_av_co_sbc_sink_caps)) {
+-                    return TRUE;
+-                }
+-#endif
+-                break;
+-
+-            default:
+-                APPL_TRACE_ERROR("peer_src_supports_codec: unsupported codec id %d",
+-                                 bta_av_co_cb.codec_cfg.id);
+-                return FALSE;
+-                break;
+-            }
+-        }
++    for (int index = p_peer->num_sup_snks - 1; index >= 0; index--) {
++        tBTA_AV_CO_SINK* snk = &p_peer->snks[index];
++        codec_index = A2DP_SinkCodecIndex(snk->codec_caps);
++        if (codec_index != BTAV_A2DP_CODEC_INDEX_MAX)
++            return snk;
+     }
+-    return FALSE;
++    return NULL;
+ }
+ 
+ /*******************************************************************************
+  **
+- ** Function         bta_av_co_audio_sink_supports_config
++ ** Function         bta_av_co_audio_find_peer_src
+  **
+- ** Description      Check if the media source supports a given configuration
++ ** Description      Find a peer Source SEP entry with a supported codec.
+  **
+- ** Returns          TRUE if the media source supports this config, FALSE otherwise
++ ** Returns          the peer Source SEP for the codec index if found, otherwise NULL
+  **
+  *******************************************************************************/
+-static UINT8 bta_av_co_audio_sink_supports_config(UINT8 codec_type, const UINT8 *p_codec_cfg)
++static tBTA_AV_CO_SINK* bta_av_co_audio_find_peer_src(tBTA_AV_CO_PEER *p_peer)
+ {
+-    FUNC_TRACE();
+-    UINT8 status = A2D_BAD_CODEC_TYPE;
++    btav_a2dp_codec_index_t codec_index;
+ 
+-    switch (codec_type) {
+-    case BTA_AV_CODEC_SBC:
+-#if (BTC_AV_EXT_CODEC == TRUE)
+-        status = bta_av_sbc_cfg_in_external_codec_cap((UINT8 *)p_codec_cfg, (UINT8 *)bta_av_co_cb.codec_caps.info);
+-#else
+-        status = bta_av_sbc_cfg_in_cap((UINT8 *)p_codec_cfg, (tA2D_SBC_CIE *)&bta_av_co_sbc_sink_caps);
+-#endif
+-        break;
+-    case BTA_AV_CODEC_M12:
+-    case BTA_AV_CODEC_M24:
+-    case BTA_AV_CODEC_ATRAC:
+-        status = A2D_NS_CODEC_TYPE;
+-        APPL_TRACE_ERROR("bta_av_co_audio_sink_supports_config unsupported codec type %d", codec_type);
+-        break;
+-    default:
+-        APPL_TRACE_ERROR("bta_av_co_audio_sink_supports_config invalid codec type %d", codec_type);
+-        break;
+-    }
+-    return status;
+-}
+-
+-/*******************************************************************************
+- **
+- ** Function         bta_av_co_audio_media_supports_config
+- **
+- ** Description      Check if the media sink supports a given configuration
+- **
+- ** Returns          TRUE if the media source supports this config, FALSE otherwise
+- **
+- *******************************************************************************/
+-static UINT8 bta_av_co_audio_media_supports_config(UINT8 codec_type, const UINT8 *p_codec_cfg)
+-{
+     FUNC_TRACE();
+-    UINT8 status = A2D_BAD_CODEC_TYPE;
+ 
+-    switch (codec_type) {
+-    case BTA_AV_CODEC_SBC:
+-#if (BTC_AV_EXT_CODEC == TRUE)
+-        status = bta_av_sbc_cfg_in_external_codec_cap((UINT8 *)p_codec_cfg, (UINT8 *)bta_av_co_cb.codec_caps.info);
+-#else
+-        status = bta_av_sbc_cfg_in_cap((UINT8 *)p_codec_cfg, (tA2D_SBC_CIE *)&bta_av_co_sbc_caps);
+-#endif
+-        break;
+-    case BTA_AV_CODEC_M12:
+-    case BTA_AV_CODEC_M24:
+-    case BTA_AV_CODEC_ATRAC:
+-        status = A2D_NS_CODEC_TYPE;
+-        APPL_TRACE_ERROR("bta_av_co_audio_media_supports_config unsupported codec type %d", codec_type);
+-        break;
+-    default:
+-        APPL_TRACE_ERROR("bta_av_co_audio_media_supports_config invalid codec type %d", codec_type);
+-        break;
++    for (int index = p_peer->num_sup_srcs - 1; index >= 0; index--) {
++        tBTA_AV_CO_SINK* src = &p_peer->srcs[index];
++        codec_index = A2DP_SourceCodecIndex(src->codec_caps);
++        if (codec_index != BTAV_A2DP_CODEC_INDEX_MAX)
++            return src;
+     }
+-    return status;
++    return NULL;
+ }
+ 
+ /*******************************************************************************
+@@ -1427,7 +1091,6 @@
+ BOOLEAN bta_av_co_audio_codec_supported(tBTC_AV_STATUS *p_status)
+ {
+     UINT8 index;
+-    UINT8 snk_index;
+     tBTA_AV_CO_PEER *p_peer;
+     tBTA_AV_CO_SINK *p_sink;
+     UINT8 codec_cfg[AVDT_CODEC_SIZE];
+@@ -1446,13 +1109,13 @@
+     for (index = 0; index < BTA_AV_CO_NUM_ELEMENTS(bta_av_co_cb.peers); index++) {
+         p_peer = &bta_av_co_cb.peers[index];
+         if (p_peer->opened) {
+-            if (bta_av_co_audio_peer_supports_codec(p_peer, &snk_index)) {
+-                p_sink = &p_peer->snks[snk_index];
++            p_sink = bta_av_co_audio_find_peer_sink(p_peer);
++            if (p_sink != NULL) {
+ 
+                 /* Check that this sink is compatible with the CP */
+                 if (!bta_av_co_audio_sink_supports_cp(p_sink)) {
+-                    APPL_TRACE_DEBUG("bta_av_co_audio_codec_supported sink %d of peer %d doesn't support cp",
+-                                     snk_index, index);
++                    APPL_TRACE_DEBUG("bta_av_co_audio_codec_supported sink codec of peer %d doesn't support cp",
++                                     index);
+                     *p_status = BTC_ERROR_SRV_AV_CP_NOT_SUPPORTED;
+                     return FALSE;
+                 }
+@@ -1512,16 +1175,10 @@
+     osi_mutex_global_lock();
+     FUNC_TRACE();
+ 
+-#if (BTC_AV_EXT_CODEC == TRUE)
+-    bta_av_co_cb.codec_cfg.id = bta_av_co_cb.codec_caps.id;
+-    bta_av_build_src_cfg(bta_av_co_cb.codec_cfg.info, bta_av_co_cb.codec_caps.info);
+-#else
+     /* Reset the current configuration to SBC */
+-    bta_av_co_cb.codec_cfg.id = BTC_AV_CODEC_SBC;
+     if (A2D_BldSbcInfo(A2D_MEDIA_TYPE_AUDIO, (tA2D_SBC_CIE *)&btc_av_sbc_default_config, bta_av_co_cb.codec_cfg.info) != A2D_SUCCESS) {
+         APPL_TRACE_ERROR("bta_av_co_audio_codec_reset A2D_BldSbcInfo failed");
+     }
+-#endif
+ 
+     osi_mutex_global_unlock();
+ }
+@@ -1552,8 +1209,6 @@
+     /* Supported codecs */
+     switch (p_feeding->format) {
+     case BTC_AV_CODEC_PCM:
+-        new_cfg.id = BTC_AV_CODEC_SBC;
+-
+         sbc_config = btc_av_sbc_default_config;
+         if ((p_feeding->cfg.pcm.num_channel != 1) &&
+                 (p_feeding->cfg.pcm.num_channel != 2)) {
+@@ -1602,6 +1257,7 @@
+     /* The new config was correctly built */
+     bta_av_co_cb.codec_cfg = new_cfg;
+ 
++
+     /* Check all devices support it */
+     *p_status = BTC_AV_SUCCESS;
+     return bta_av_co_audio_codec_supported(p_status);
+@@ -1624,13 +1280,14 @@
+     tBTA_AV_CO_PEER *p_peer;
+     tBTA_AV_CO_SINK *p_sink;
+ 
+-    APPL_TRACE_EVENT("bta_av_co_cb.codec_cfg.id : codec 0x%x", bta_av_co_cb.codec_cfg.id);
++    APPL_TRACE_EVENT("bta_av_co_cb.codec_cfg : codec %s",
++                     A2DP_CodecName(bta_av_co_cb.codec_cfg.info));
+ 
+     /* Minimum MTU is by default very large */
+     *p_minmtu = 0xFFFF;
+ 
+     osi_mutex_global_lock();
+-    if (bta_av_co_cb.codec_cfg.id == BTC_AV_CODEC_SBC) {
++    if (A2DP_GetCodecType(bta_av_co_cb.codec_cfg.info) == BTC_AV_CODEC_SBC) {
+         if (A2D_ParsSbcInfo(p_sbc_config, bta_av_co_cb.codec_cfg.info, FALSE) == A2D_SUCCESS) {
+             for (index = 0; index < BTA_AV_CO_NUM_ELEMENTS(bta_av_co_cb.peers); index++) {
+                 p_peer = &bta_av_co_cb.peers[index];
+@@ -1640,7 +1297,8 @@
+                     }
+                     for (jndex = 0; jndex < p_peer->num_sup_snks; jndex++) {
+                         p_sink = &p_peer->snks[jndex];
+-                        if (p_sink->codec_type == A2D_MEDIA_CT_SBC) {
++                        tBTA_AV_CODEC codec_type = A2DP_GetCodecType(p_sink->codec_caps);
++                        if (codec_type == A2D_MEDIA_CT_SBC) {
+                             /* Update the bitpool boundaries of the current config */
+                             p_sbc_config->min_bitpool =
+                                 BTA_AV_CO_MAX(p_sink->codec_caps[BTA_AV_CO_SBC_MIN_BITPOOL_OFF],
+@@ -1703,17 +1361,14 @@
+  ** Returns          Nothing
+  **
+  *******************************************************************************/
+-void bta_av_co_init(tBTC_AV_CODEC_INFO *codec_caps)
++void bta_av_co_init(void)
+ {
+     FUNC_TRACE();
+ 
+     /* Reset the control block */
+     memset(&bta_av_co_cb, 0, sizeof(bta_av_co_cb));
+ 
+-    if (codec_caps) {
+-        memcpy(&bta_av_co_cb.codec_caps, codec_caps, sizeof(tBTC_AV_CODEC_INFO));
+-    }
+-    bta_av_co_cb.codec_cfg_setconfig.id = BTC_AV_CODEC_NONE;
++    memset(bta_av_co_cb.codec_cfg_setconfig.info, 0, AVDT_CODEC_SIZE);
+ 
+ #if defined(BTA_AV_CO_CP_SCMS_T) && (BTA_AV_CO_CP_SCMS_T == TRUE)
+     bta_av_co_cp_set_flag(BTA_AV_CP_SCMS_COPY_NEVER);
+@@ -1725,6 +1380,7 @@
+     bta_av_co_audio_codec_reset();
+ }
+ 
++
+ /*******************************************************************************
+  **
+  ** Function         bta_av_co_peer_cp_supported
+@@ -1751,7 +1407,7 @@
+ 
+     for (index = 0; index < p_peer->num_sup_snks; index++) {
+         p_sink = &p_peer->snks[index];
+-        if (p_sink->codec_type == A2D_MEDIA_CT_SBC) {
++        if (A2DP_GetCodecType(p_sink->codec_caps) == A2D_MEDIA_CT_SBC) {
+             return bta_av_co_audio_sink_has_scmst(p_sink);
+         }
+     }
+@@ -1768,14 +1424,14 @@
+  **                  of our exported bitpool range. If set we will set the
+  **                  remote preference.
+  **
+- ** Returns          TRUE if config set, FALSE otherwise
++ ** Returns          TRUE if config set, FALSE otherwize
+  **
+  *******************************************************************************/
+ 
+ BOOLEAN bta_av_co_get_remote_bitpool_pref(UINT8 *min, UINT8 *max)
+ {
+     /* check if remote peer did a set config */
+-    if (bta_av_co_cb.codec_cfg_setconfig.id == BTC_AV_CODEC_NONE) {
++    if (A2DP_GetCodecType(bta_av_co_cb.codec_cfg_setconfig.info)!= BTC_AV_CODEC_SBC){
+         return FALSE;
+     }
+ 
+--- a/host/bluedroid/btc/profile/std/a2dp/btc_a2dp.c
++++ b/host/bluedroid/btc/profile/std/a2dp/btc_a2dp.c
+@@ -49,12 +49,7 @@
+     }
+ #endif // BTC_AV_SRC_INCLUDED
+ 
+-#if (BTC_AV_EXT_CODEC == TRUE)
+-    tBTC_AV_CODEC_INFO *codec_caps = btc_av_codec_cap_get();
+-#else
+-    tBTC_AV_CODEC_INFO *codec_caps = NULL;
+-#endif
+-    bta_av_co_init(codec_caps);
++    bta_av_co_init();
+ 
+ #if BTC_AV_SINK_INCLUDED
+     if (btc_av_get_peer_sep() == AVDT_TSEP_SRC && btc_av_get_service_id() == BTA_A2DP_SINK_SERVICE_ID) {
+@@ -93,11 +88,9 @@
+                     ack = TRUE;
+                 }
+             } else {
+-#if (BTC_AV_EXT_CODEC == FALSE)
+                 /* we were remotely started,  make sure codec
+                    is setup before datapath is started */
+                 btc_a2dp_source_setup_codec();
+-#endif
+             }
+ 
+             /* media task is autostarted upon a2dp audiopath connection */
+--- a/host/bluedroid/btc/profile/std/a2dp/btc_a2dp_sink.c
++++ b/host/bluedroid/btc/profile/std/a2dp/btc_a2dp_sink.c
+@@ -19,7 +19,6 @@
+ #include "osi/thread.h"
+ #include "osi/fixed_queue.h"
+ #include "stack/a2d_api.h"
+-#include "stack/a2d_sbc.h"
+ #include "bta/bta_av_api.h"
+ #include "bta/bta_av_ci.h"
+ #include "btc_av_co.h"
+@@ -29,14 +28,23 @@
+ #include "btc/btc_manage.h"
+ #include "btc_av.h"
+ #include "btc/btc_util.h"
++#include "stack/a2dp_codec_api.h"
+ #include "esp_a2dp_api.h"
++#include "oi_status.h"
+ #include "osi/future.h"
+ #include <assert.h>
++#include "esp_heap_caps.h"  // For heap_caps_get_free_size/largest_free_block
+ 
+-#if (BTC_AV_SINK_INCLUDED == TRUE) && (BTC_AV_EXT_CODEC == FALSE)
++#if (BTC_AV_SINK_INCLUDED == TRUE)
+ 
+-#include "oi_codec_sbc.h"
+-#include "oi_status.h"
++/* Decode scratch is allocated per selected codec. AAC has its own decoder
++ * output storage and does not need this shared buffer at all. */
++#define BT_A2DP_SINK_BUF_SBC        (1024)
++#define BT_A2DP_SINK_BUF_LDAC       (2048)
++#define BT_A2DP_SINK_BUF_APTX       (4*1024)
++#define BT_A2DP_SINK_BUF_OPUS       (4*2000)
++#define BT_A2DP_SINK_BUF_LC3PLUS    (4*1024)
++#define BT_A2DP_SINK_BUF_DEFAULT    (4*1024)
+ 
+ /*****************************************************************************
+  **  Constants
+@@ -76,11 +84,24 @@
+    but due to link flow control or thread preemption in lower
+    layers we might need to temporarily buffer up data */
+ 
+-/* 18 frames is equivalent to 6.89*18*2.9 ~= 360 ms @ 44.1 khz, 20 ms mediatick */
+-#define MAX_OUTPUT_A2DP_SNK_FRAME_QUEUE_SZ     (25)
++/* Queue depth: 14 entries balances jitter absorption vs RAM.
++ * LDAC at 96kHz HQ: ~700 bytes/pkt × 14 = ~9.8KB peak queue.
++ * Provides ~75ms LDAC / ~200ms SBC buffering — sufficient for
++ * BT link jitter without starving the heap. */
++#define MAX_OUTPUT_A2DP_SNK_FRAME_QUEUE_SZ     (24)
+ 
+ #define BTC_A2DP_SNK_DATA_QUEUE_IDX            (1)
+ 
++#define A2DP_TASK_NAME                   "A2DP_DECODER"
++/* 4KB is sufficient for all codecs (SBC, aptX, LDAC, Opus, LC3plus).
++ * Decoders use pre-allocated static context, not deep stack recursion. */
++#define A2DP_TASK_STACK_SIZE             (8192)
++#define A2DP_TASK_PRIO                   (BT_TASK_MAX_PRIORITIES - 6)
++#define A2DP_TASK_PINNED_TO_CORE         (1)
++#define A2DP_TASK_WORKQUEUE_NUM          (2)
++#define A2DP_TASK_WORKQUEUE0_LEN         (1)
++#define A2DP_TASK_WORKQUEUE1_LEN         (4)
++
+ typedef struct {
+     uint32_t sig;
+     void *param;
+@@ -88,10 +109,8 @@
+ 
+ typedef struct {
+     BOOLEAN rx_flush; /* discards any incoming data when true */
+-    UINT8   channel_count;
+     struct osi_event *data_ready_event;
+     fixed_queue_t *RxSbcQ;
+-    UINT32  sample_rate;
+ } tBTC_A2DP_SINK_CB;
+ 
+ typedef struct {
+@@ -102,9 +121,11 @@
+ typedef struct {
+     tBTC_A2DP_SINK_CB   btc_aa_snk_cb;
+     osi_thread_t        *btc_aa_snk_task_hdl;
+-    OI_CODEC_SBC_DECODER_CONTEXT    context;
+-    OI_UINT32           contextData[CODEC_DATA_WORDS(2, SBC_CODEC_FAST_FILTER_BUFFERS)];
+-    OI_INT16            pcmData[15 * SBC_MAX_SAMPLES_PER_FRAME * SBC_MAX_CHANNELS];
++    const tA2DP_DECODER_INTERFACE* decoder;
++    unsigned char *decode_buf;  // Allocated from internal RAM
++    size_t decode_buf_len;
++    btav_a2dp_codec_index_t codec_index;
++    BOOLEAN decoder_ready;
+     a2dp_sink_media_pkt_seq_num_t   media_pkt_seq_num;
+ } a2dp_sink_local_param_t;
+ 
+@@ -112,8 +133,6 @@
+ static void btc_a2dp_sink_thread_cleanup(UNUSED_ATTR void *context);
+ static void btc_a2dp_sink_flush_q(fixed_queue_t *p_q);
+ static void btc_a2dp_sink_rx_flush(void);
+-static int btc_a2dp_sink_get_track_frequency(UINT8 frequency);
+-static int btc_a2dp_sink_get_track_channel_count(UINT8 channeltype);
+ /* Handle incoming media packets A2DP SINK streaming*/
+ static void btc_a2dp_sink_handle_inc_media(BT_HDR *p_msg);
+ static void btc_a2dp_sink_handle_decoder_reset(tBTC_MEDIA_SINK_CFG_UPDATE *p_msg);
+@@ -122,6 +141,13 @@
+ 
+ static void btc_a2dp_sink_data_ready(void *context);
+ 
++/* Free function for queued buffers */
++static void btc_a2dp_sink_free_buf(void *buf) {
++    if (buf) {
++        osi_free(buf);
++    }
++}
++
+ static int btc_a2dp_sink_state = BTC_A2DP_SINK_STATE_OFF;
+ static esp_a2d_sink_data_cb_t bt_aa_snk_data_cb = NULL;
+ #if A2D_DYNAMIC_MEMORY == FALSE
+@@ -131,13 +157,125 @@
+ #define a2dp_sink_local_param (*a2dp_sink_local_param_ptr)
+ #endif ///A2D_DYNAMIC_MEMORY == FALSE
+ 
++static size_t btc_a2dp_sink_decode_buf_size(btav_a2dp_codec_index_t codec_index)
++{
++    switch (codec_index) {
++    case BTAV_A2DP_CODEC_INDEX_SINK_SBC:
++        return BT_A2DP_SINK_BUF_SBC;
++#if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)
++    case BTAV_A2DP_CODEC_INDEX_SINK_AAC:
++        return 0;
++#endif
++#if (defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE)
++    case BTAV_A2DP_CODEC_INDEX_SINK_APTX:
++    case BTAV_A2DP_CODEC_INDEX_SINK_APTX_HD:
++    case BTAV_A2DP_CODEC_INDEX_SINK_APTX_LL:
++        return BT_A2DP_SINK_BUF_APTX;
++#endif
++#if (defined(LDAC_DEC_INCLUDED) && LDAC_DEC_INCLUDED == TRUE)
++    case BTAV_A2DP_CODEC_INDEX_SINK_LDAC:
++        return BT_A2DP_SINK_BUF_LDAC;
++#endif
++#if (defined(OPUS_DEC_INCLUDED) && OPUS_DEC_INCLUDED == TRUE)
++    case BTAV_A2DP_CODEC_INDEX_SINK_OPUS:
++    case BTAV_A2DP_CODEC_INDEX_SINK_OPUS_ANDROID:
++        return BT_A2DP_SINK_BUF_OPUS;
++#endif
++#if (defined(LC3PLUS_DEC_INCLUDED) && LC3PLUS_DEC_INCLUDED == TRUE)
++    case BTAV_A2DP_CODEC_INDEX_SINK_LC3PLUS:
++        return BT_A2DP_SINK_BUF_LC3PLUS;
++#endif
++    default:
++        return BT_A2DP_SINK_BUF_DEFAULT;
++    }
++}
++
++static UINT8 btc_a2dp_sink_queue_limit(void)
++{
++    switch (a2dp_sink_local_param.codec_index) {
++#if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)
++    case BTAV_A2DP_CODEC_INDEX_SINK_AAC:
++        return 18;
++#endif
++#if (defined(LDAC_DEC_INCLUDED) && LDAC_DEC_INCLUDED == TRUE)
++    case BTAV_A2DP_CODEC_INDEX_SINK_LDAC:
++        return 20;
++#endif
++    case BTAV_A2DP_CODEC_INDEX_SINK_SBC:
++        return 18;
++    default:
++        return 18;
++    }
++}
++
++static UINT8 btc_a2dp_sink_queue_floor(void)
++{
++    switch (a2dp_sink_local_param.codec_index) {
++#if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)
++    case BTAV_A2DP_CODEC_INDEX_SINK_AAC:
++        return 8;
++#endif
++#if (defined(LDAC_DEC_INCLUDED) && LDAC_DEC_INCLUDED == TRUE)
++    case BTAV_A2DP_CODEC_INDEX_SINK_LDAC:
++        return 8;
++#endif
++    case BTAV_A2DP_CODEC_INDEX_SINK_SBC:
++        return 8;
++    default:
++        return 8;
++    }
++}
++
++static size_t btc_a2dp_sink_pressure_target(void)
++{
++    switch (a2dp_sink_local_param.codec_index) {
++#if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)
++    case BTAV_A2DP_CODEC_INDEX_SINK_AAC:
++        return 10 * 1024;
++#endif
++#if (defined(LDAC_DEC_INCLUDED) && LDAC_DEC_INCLUDED == TRUE)
++    case BTAV_A2DP_CODEC_INDEX_SINK_LDAC:
++        return 6 * 1024;
++#endif
++    default:
++        return 6 * 1024;
++    }
++}
++
++static BOOLEAN btc_a2dp_sink_configure_decode_buf(size_t required_len)
++{
++    if (a2dp_sink_local_param.decode_buf_len == required_len &&
++        (required_len == 0 || a2dp_sink_local_param.decode_buf != NULL)) {
++        return TRUE;
++    }
++
++    if (a2dp_sink_local_param.decode_buf) {
++        osi_free(a2dp_sink_local_param.decode_buf);
++        a2dp_sink_local_param.decode_buf = NULL;
++        a2dp_sink_local_param.decode_buf_len = 0;
++    }
++
++    if (required_len == 0) {
++        return TRUE;
++    }
++
++    a2dp_sink_local_param.decode_buf = (unsigned char *)osi_malloc(required_len);
++    if (!a2dp_sink_local_param.decode_buf) {
++        APPL_TRACE_ERROR("%s: failed to allocate %u byte decode buffer",
++                         __func__, (unsigned)required_len);
++        return FALSE;
++    }
++    a2dp_sink_local_param.decode_buf_len = required_len;
++    return TRUE;
++}
++
+ void btc_a2dp_sink_reg_data_cb(esp_a2d_sink_data_cb_t callback)
+ {
+     // todo: critical section protection
+     bt_aa_snk_data_cb = callback;
+ }
+ 
+-static inline void btc_a2d_data_cb_to_app(const uint8_t *data, uint32_t len)
++static inline void btc_a2d_data_cb_to_app(unsigned char *data, uint32_t len)
+ {
+     // todo: critical section protection
+     if (bt_aa_snk_data_cb) {
+@@ -160,9 +298,16 @@
+  **  BTC ADAPTATION
+  *****************************************************************************/
+ 
+-static bool btc_a2dp_sink_ctrl(uint32_t sig, void *param)
++static void btc_a2dp_sink_ctrl(void *param)
+ {
+-    switch (sig) {
++    BT_HDR* p_buf = (BT_HDR*)param;
++
++    if (!p_buf) {
++        APPL_TRACE_ERROR("%s: p_buf is null", __func__);
++        return;
++    }
++
++    switch (p_buf->event) {
+     case BTC_MEDIA_TASK_SINK_INIT:
+         btc_a2dp_sink_thread_init(NULL);
+         break;
+@@ -179,14 +324,12 @@
+         btc_a2dp_sink_rx_flush();
+         break;
+     default:
+-        APPL_TRACE_WARNING("media task unhandled evt: 0x%x\n", sig);
++        APPL_TRACE_WARNING("media task unhandled evt: 0x%x\n", p_buf->event);
+     }
+ 
+     if (param != NULL) {
+         osi_free(param);
+     }
+-
+-    return true;
+ }
+ 
+ bool btc_a2dp_sink_startup(void)
+@@ -206,18 +349,41 @@
+ 
+     APPL_TRACE_EVENT("## A2DP SINK START MEDIA THREAD ##");
+ 
+-    a2dp_sink_local_param.btc_aa_snk_task_hdl = btc_get_current_thread();
++    const size_t workqueue_len[] = {A2DP_TASK_WORKQUEUE0_LEN, A2DP_TASK_WORKQUEUE1_LEN};
++    /* Always use internal RAM for task stack - no PSRAM */
++    a2dp_sink_local_param.btc_aa_snk_task_hdl = osi_thread_create(
++                                    A2DP_TASK_NAME,
++                                    A2DP_TASK_STACK_SIZE,
++                                    A2DP_TASK_PRIO,
++                                    A2DP_TASK_PINNED_TO_CORE,
++                                    A2DP_TASK_WORKQUEUE_NUM,
++                                    workqueue_len);
++
++    if(!a2dp_sink_local_param.btc_aa_snk_task_hdl) {
++        APPL_TRACE_ERROR("%s unable to create a2dp task\n", __func__);
++        goto error_exit;
++    }
+ 
+-    if (btc_a2dp_sink_ctrl(BTC_MEDIA_TASK_SINK_INIT, NULL) == false) {
++    BT_HDR *p_buf = (BT_HDR*)osi_malloc(sizeof(BT_HDR));
++    if (!p_buf) {
++        APPL_TRACE_ERROR("%s: no memory", __func__);
+         goto error_exit;
+     }
+ 
++    p_buf->event = BTC_MEDIA_TASK_SINK_INIT;
++    osi_thread_post(a2dp_sink_local_param.btc_aa_snk_task_hdl,
++                    btc_a2dp_sink_ctrl, p_buf, 0, OSI_THREAD_MAX_TIMEOUT);
++
+     APPL_TRACE_EVENT("## A2DP SINK MEDIA THREAD STARTED ##\n");
+ 
+     return true;
+ 
+ error_exit:;
+     APPL_TRACE_ERROR("%s unable to start up media thread\n", __func__);
++
++    if (a2dp_sink_local_param.btc_aa_snk_task_hdl) {
++        osi_thread_free(a2dp_sink_local_param.btc_aa_snk_task_hdl);
++    }
+     a2dp_sink_local_param.btc_aa_snk_task_hdl = NULL;
+ 
+ #if A2D_DYNAMIC_MEMORY == TRUE
+@@ -235,7 +401,17 @@
+     // Exit thread
+     btc_a2dp_sink_state = BTC_A2DP_SINK_STATE_SHUTTING_DOWN;
+ 
+-    btc_a2dp_sink_ctrl(BTC_MEDIA_TASK_SINK_CLEAN_UP, NULL);
++    /* Post cleanup BEFORE freeing the thread so it actually runs */
++    BT_HDR *p_buf = (BT_HDR*)osi_malloc(sizeof(BT_HDR));
++    if (p_buf) {
++        p_buf->event = BTC_MEDIA_TASK_SINK_CLEAN_UP;
++        osi_thread_post(a2dp_sink_local_param.btc_aa_snk_task_hdl,
++                        btc_a2dp_sink_ctrl, p_buf, 0, OSI_THREAD_MAX_TIMEOUT);
++    }
++
++    osi_thread_free(a2dp_sink_local_param.btc_aa_snk_task_hdl);
++
++    APPL_TRACE_EVENT("## A2DP SINK MEDIA THREAD STARTED ##\n");
+ 
+     a2dp_sink_local_param.btc_aa_snk_task_hdl = NULL;
+ 
+@@ -297,7 +473,16 @@
+  *******************************************************************************/
+ static BOOLEAN btc_a2dp_sink_clear_track(void)
+ {
+-    return btc_a2dp_sink_ctrl(BTC_MEDIA_AUDIO_SINK_CLEAR_TRACK, NULL);
++    BT_HDR *p_buf = (BT_HDR*)osi_malloc(sizeof(BT_HDR));
++    if (!p_buf) {
++        APPL_TRACE_ERROR("%s: no memory", __func__);
++        return false;
++    }
++
++    p_buf->event = BTC_MEDIA_AUDIO_SINK_CLEAR_TRACK;
++    osi_thread_post(a2dp_sink_local_param.btc_aa_snk_task_hdl,
++                    btc_a2dp_sink_ctrl, p_buf, 0, OSI_THREAD_MAX_TIMEOUT);
++    return true;
+ }
+ 
+ /* when true media task discards any rx frames */
+@@ -329,13 +514,16 @@
+                      p_av[4], p_av[5], p_av[6]);
+ 
+     tBTC_MEDIA_SINK_CFG_UPDATE *p_buf;
+-    if (NULL == (p_buf = osi_malloc(sizeof(tBTC_MEDIA_SINK_CFG_UPDATE)))) {
+-        APPL_TRACE_ERROR("btc reset decoder No Buffer ");
++    p_buf = osi_malloc(sizeof(tBTC_MEDIA_SINK_CFG_UPDATE));
++    if (!p_buf) {
++        APPL_TRACE_ERROR("%s: no memory", __func__);
+         return;
+     }
+ 
++    p_buf->hdr.event = BTC_MEDIA_AUDIO_SINK_CFG_UPDATE;
+     memcpy(p_buf->codec_info, p_av, AVDT_CODEC_SIZE);
+-    btc_a2dp_sink_ctrl(BTC_MEDIA_AUDIO_SINK_CFG_UPDATE, p_buf);
++    osi_thread_post(a2dp_sink_local_param.btc_aa_snk_task_hdl,
++                    btc_a2dp_sink_ctrl, p_buf, 0, OSI_THREAD_MAX_TIMEOUT);
+ }
+ 
+ static void btc_a2dp_sink_data_ready(UNUSED_ATTR void *context)
+@@ -343,32 +531,42 @@
+     BT_HDR *p_msg;
+     int nb_of_msgs_to_process = 0;
+ 
+-    if (fixed_queue_is_empty(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ)) {
+-        APPL_TRACE_DEBUG("  QUE  EMPTY ");
+-    } else {
+-        if (a2dp_sink_local_param.btc_aa_snk_cb.rx_flush == TRUE) {
+-            btc_a2dp_sink_flush_q(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
++    if (a2dp_sink_local_param.btc_aa_snk_cb.rx_flush == TRUE) {
++        btc_a2dp_sink_flush_q(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
++        return;
++    }
++
++    nb_of_msgs_to_process = fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
++    APPL_TRACE_DEBUG("nb:%d", nb_of_msgs_to_process);
++    while (nb_of_msgs_to_process > 0) {
++        if (btc_a2dp_sink_state != BTC_A2DP_SINK_STATE_ON){
+             return;
+         }
+-        nb_of_msgs_to_process = fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
+-        APPL_TRACE_DEBUG("nb:%d", nb_of_msgs_to_process);
+-        while (nb_of_msgs_to_process > 0) {
+-            if (btc_a2dp_sink_state != BTC_A2DP_SINK_STATE_ON){
+-                return;
+-            }
+-            p_msg = (BT_HDR *)fixed_queue_dequeue(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ, 0);
+-            if ( p_msg == NULL ) {
+-                APPL_TRACE_ERROR("Insufficient data in que ");
+-                break;
+-            }
+-            btc_a2dp_sink_handle_inc_media(p_msg);
+-            nb_of_msgs_to_process--;
++        p_msg = (BT_HDR *)fixed_queue_dequeue(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ, 0);
++        if ( p_msg == NULL ) {
++            APPL_TRACE_DEBUG("Insufficient data in que ");
++            break;
+         }
+-        APPL_TRACE_DEBUG(" Process Frames - ");
+ 
+-        if (!fixed_queue_is_empty(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ)) {
+-            osi_thread_post_event(a2dp_sink_local_param.btc_aa_snk_cb.data_ready_event, OSI_THREAD_MAX_TIMEOUT);
++        /* If a flush/reconfig/disconnect happens mid-drain, stop decoding immediately.
++         * Decoding stale frames into a reconfigured/closed decoder can corrupt state
++         * and has been observed to crash inside the AAC decoder.
++         */
++        if (a2dp_sink_local_param.btc_aa_snk_cb.rx_flush == TRUE) {
++            osi_free(p_msg);
++            btc_a2dp_sink_flush_q(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
++            return;
+         }
++
++        btc_a2dp_sink_handle_inc_media(p_msg);
++        /* p_msg is the original BT packet (zero-copy enqueue) */
++        osi_free(p_msg);
++        nb_of_msgs_to_process--;
++    }
++    APPL_TRACE_DEBUG(" Process Frames - ");
++
++    if (!fixed_queue_is_empty(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ)) {
++        osi_thread_post_event(a2dp_sink_local_param.btc_aa_snk_cb.data_ready_event, OSI_THREAD_MAX_TIMEOUT);
+     }
+ }
+ 
+@@ -383,132 +581,61 @@
+  *******************************************************************************/
+ static void btc_a2dp_sink_handle_decoder_reset(tBTC_MEDIA_SINK_CFG_UPDATE *p_msg)
+ {
+-    tBTC_MEDIA_SINK_CFG_UPDATE *p_buf = p_msg;
+-    tA2D_STATUS a2d_status;
+-    tA2D_SBC_CIE sbc_cie;
+-    OI_STATUS       status;
+-    UINT32          freq_multiple = 48 * 20; /* frequency multiple for 20ms of data , initialize with 48K*/
+-    UINT32          num_blocks = 16;
+-    UINT32          num_subbands = 8;
+-
+-    APPL_TRACE_EVENT("%s p_codec_info[%x:%x:%x:%x:%x:%x]\n", __FUNCTION__,
+-                     p_buf->codec_info[1], p_buf->codec_info[2], p_buf->codec_info[3],
+-                     p_buf->codec_info[4], p_buf->codec_info[5], p_buf->codec_info[6]);
+-
+-    a2d_status = A2D_ParsSbcInfo(&sbc_cie, p_buf->codec_info, FALSE);
+-    if (a2d_status != A2D_SUCCESS) {
+-        APPL_TRACE_ERROR("ERROR dump_codec_info A2D_ParsSbcInfo fail:%d\n", a2d_status);
+-        return;
+-    }
+-
+-    a2dp_sink_local_param.btc_aa_snk_cb.sample_rate = btc_a2dp_sink_get_track_frequency(sbc_cie.samp_freq);
+-    a2dp_sink_local_param.btc_aa_snk_cb.channel_count = btc_a2dp_sink_get_track_channel_count(sbc_cie.ch_mode);
++    const tA2DP_DECODER_INTERFACE *decoder = A2DP_GetDecoderInterface(p_msg->codec_info);
++    btav_a2dp_codec_index_t codec_index = A2DP_SinkCodecIndex(p_msg->codec_info);
+ 
+-    a2dp_sink_local_param.btc_aa_snk_cb.rx_flush = FALSE;
+-    APPL_TRACE_EVENT("Reset to sink role");
+-    status = OI_CODEC_SBC_DecoderReset(&a2dp_sink_local_param.context, a2dp_sink_local_param.contextData,
+-                                        sizeof(a2dp_sink_local_param.contextData), a2dp_sink_local_param.btc_aa_snk_cb.channel_count,
+-                                        a2dp_sink_local_param.btc_aa_snk_cb.channel_count, FALSE, FALSE);
+-    if (!OI_SUCCESS(status)) {
+-        APPL_TRACE_ERROR("OI_CODEC_SBC_DecoderReset failed with error code %d\n", status);
++    if (!decoder) {
++        APPL_TRACE_ERROR("%s: no decoder for codec %s", __func__,
++                         A2DP_CodecName(p_msg->codec_info));
++        a2dp_sink_local_param.decoder_ready = FALSE;
++        a2dp_sink_local_param.btc_aa_snk_cb.rx_flush = TRUE;
+         return;
+     }
+ 
+-    btc_a2dp_control_set_datachnl_stat(TRUE);
+-
+-    switch (sbc_cie.samp_freq) {
+-    case A2D_SBC_IE_SAMP_FREQ_16:
+-        APPL_TRACE_DEBUG("\tsamp_freq:%d (16000)\n", sbc_cie.samp_freq);
+-        freq_multiple = 16 * 20;
+-        break;
+-    case A2D_SBC_IE_SAMP_FREQ_32:
+-        APPL_TRACE_DEBUG("\tsamp_freq:%d (32000)\n", sbc_cie.samp_freq);
+-        freq_multiple = 32 * 20;
+-        break;
+-    case A2D_SBC_IE_SAMP_FREQ_44:
+-        APPL_TRACE_DEBUG("\tsamp_freq:%d (44100)\n", sbc_cie.samp_freq);
+-        freq_multiple = 441 * 2;
+-        break;
+-    case A2D_SBC_IE_SAMP_FREQ_48:
+-        APPL_TRACE_DEBUG("\tsamp_freq:%d (48000)\n", sbc_cie.samp_freq);
+-        freq_multiple = 48 * 20;
+-        break;
+-    default:
+-        APPL_TRACE_DEBUG(" Unknown Frequency ");
+-        break;
++    /* Hold the stream off until the new decoder is standing, and throw away
++     * anything still queued for the old one: those frames are in the previous
++     * codec's format. */
++    a2dp_sink_local_param.decoder_ready = FALSE;
++    a2dp_sink_local_param.btc_aa_snk_cb.rx_flush = TRUE;
++    if (a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ) {
++        btc_a2dp_sink_flush_q(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
+     }
+ 
+-    switch (sbc_cie.ch_mode) {
+-    case A2D_SBC_IE_CH_MD_MONO:
+-        APPL_TRACE_DEBUG("\tch_mode:%d (Mono)\n", sbc_cie.ch_mode);
+-        break;
+-    case A2D_SBC_IE_CH_MD_DUAL:
+-        APPL_TRACE_DEBUG("\tch_mode:%d (DUAL)\n", sbc_cie.ch_mode);
+-        break;
+-    case A2D_SBC_IE_CH_MD_STEREO:
+-        APPL_TRACE_DEBUG("\tch_mode:%d (STEREO)\n", sbc_cie.ch_mode);
+-        break;
+-    case A2D_SBC_IE_CH_MD_JOINT:
+-        APPL_TRACE_DEBUG("\tch_mode:%d (JOINT)\n", sbc_cie.ch_mode);
+-        break;
+-    default:
+-        APPL_TRACE_DEBUG(" Unknown Mode ");
+-        break;
++    if (!btc_a2dp_sink_configure_decode_buf(btc_a2dp_sink_decode_buf_size(codec_index))) {
++        APPL_TRACE_ERROR("%s: no room for a %s decode buffer", __func__,
++                         A2DP_CodecName(p_msg->codec_info));
++        return;
+     }
+ 
+-    switch (sbc_cie.block_len) {
+-    case A2D_SBC_IE_BLOCKS_4:
+-        APPL_TRACE_DEBUG("\tblock_len:%d (4)\n", sbc_cie.block_len);
+-        num_blocks = 4;
+-        break;
+-    case A2D_SBC_IE_BLOCKS_8:
+-        APPL_TRACE_DEBUG("\tblock_len:%d (8)\n", sbc_cie.block_len);
+-        num_blocks = 8;
+-        break;
+-    case A2D_SBC_IE_BLOCKS_12:
+-        APPL_TRACE_DEBUG("\tblock_len:%d (12)\n", sbc_cie.block_len);
+-        num_blocks = 12;
+-        break;
+-    case A2D_SBC_IE_BLOCKS_16:
+-        APPL_TRACE_DEBUG("\tblock_len:%d (16)\n", sbc_cie.block_len);
+-        num_blocks = 16;
+-        break;
+-    default:
+-        APPL_TRACE_DEBUG(" Unknown BlockLen ");
+-        break;
++    if (decoder != a2dp_sink_local_param.decoder) {
++        if (a2dp_sink_local_param.decoder && a2dp_sink_local_param.decoder->decoder_cleanup) {
++            a2dp_sink_local_param.decoder->decoder_cleanup();
++        }
++        a2dp_sink_local_param.decoder = decoder;
++        if (a2dp_sink_local_param.decoder->decoder_init &&
++            !a2dp_sink_local_param.decoder->decoder_init(btc_a2d_data_cb_to_app)) {
++            APPL_TRACE_ERROR("%s: decoder failed to initialize", __func__);
++            a2dp_sink_local_param.decoder = NULL;
++            return;
++        }
++    } else if (a2dp_sink_local_param.decoder->decoder_reset) {
++        a2dp_sink_local_param.decoder->decoder_reset();
+     }
+ 
+-    switch (sbc_cie.num_subbands) {
+-    case A2D_SBC_IE_SUBBAND_4:
+-        APPL_TRACE_DEBUG("\tnum_subbands:%d (4)\n", sbc_cie.num_subbands);
+-        num_subbands = 4;
+-        break;
+-    case A2D_SBC_IE_SUBBAND_8:
+-        APPL_TRACE_DEBUG("\tnum_subbands:%d (8)\n", sbc_cie.num_subbands);
+-        num_subbands = 8;
+-        break;
+-    default:
+-        APPL_TRACE_DEBUG(" Unknown SubBands ");
+-        break;
++    if (a2dp_sink_local_param.decoder->decoder_configure) {
++        a2dp_sink_local_param.decoder->decoder_configure(p_msg->codec_info);
+     }
+ 
+-    switch (sbc_cie.alloc_mthd) {
+-    case A2D_SBC_IE_ALLOC_MD_S:
+-        APPL_TRACE_DEBUG("\talloc_mthd:%d (SNR)\n", sbc_cie.alloc_mthd);
+-        break;
+-    case A2D_SBC_IE_ALLOC_MD_L:
+-        APPL_TRACE_DEBUG("\talloc_mthd:%d (Loudness)\n", sbc_cie.alloc_mthd);
+-        break;
+-    default:
+-        APPL_TRACE_DEBUG(" Unknown Allocation Method");
+-        break;
+-    }
++    a2dp_sink_local_param.codec_index = codec_index;
++    a2dp_sink_local_param.decoder_ready = TRUE;
++    a2dp_sink_local_param.btc_aa_snk_cb.rx_flush = FALSE;
+ 
+-    APPL_TRACE_EVENT("\tBit pool Min:%d Max:%d\n", sbc_cie.min_bitpool, sbc_cie.max_bitpool);
++    btc_a2dp_control_set_datachnl_stat(TRUE);
+ 
+-    int frames_to_process = ((freq_multiple) / (num_blocks * num_subbands)) + 1;
+-    APPL_TRACE_EVENT(" Frames to be processed in 20 ms %d\n", frames_to_process);
+-    UNUSED(frames_to_process);
++    APPL_TRACE_EVENT("%s: codec=%s scratch=%u queue_limit=%u", __func__,
++                     A2DP_CodecName(p_msg->codec_info),
++                     (unsigned)a2dp_sink_local_param.decode_buf_len,
++                     (unsigned)btc_a2dp_sink_queue_limit());
+ }
+ 
+ /*******************************************************************************
+@@ -522,37 +649,38 @@
+  *******************************************************************************/
+ static void btc_a2dp_sink_handle_inc_media(BT_HDR *p_msg)
+ {
+-    UINT8 *sbc_start_frame;
+-    int count;
+-    UINT32 pcmBytes, availPcmBytes;
+-    OI_INT16 *pcmDataPointer = a2dp_sink_local_param.pcmData; /*Will be overwritten on next packet receipt*/
+-    OI_STATUS status;
+-    int num_sbc_frames;
+-    UINT32 sbc_frame_len;
+-
+-    if (p_msg->len < 1) {
+-        osi_free(p_msg);
++    /* XXX: Check if the below check is correct, we are checking for peer to be sink when we are sink */
++    if (btc_av_get_peer_sep() == AVDT_TSEP_SNK || (a2dp_sink_local_param.btc_aa_snk_cb.rx_flush)) {
++        APPL_TRACE_DEBUG(" State Changed happened in this tick ");
+         return;
+     }
+ 
+-    sbc_start_frame = ((UINT8 *)(p_msg + 1) + p_msg->offset + 1);
+-    num_sbc_frames = (*((UINT8 *)(p_msg + 1) + p_msg->offset)) & 0x0f;
+-    sbc_frame_len = (UINT32)p_msg->len - 1U;
+-    availPcmBytes = sizeof(a2dp_sink_local_param.pcmData);
++    if (a2dp_sink_local_param.decoder_ready == FALSE || !a2dp_sink_local_param.decoder) {
++        APPL_TRACE_WARNING("%s: media packet before the decoder is ready", __func__);
++        return;
++    }
+ 
+-    /* XXX: Check if the below check is correct, we are checking for peer to be sink when we are sink */
+-    if (btc_av_get_peer_sep() == AVDT_TSEP_SNK || (a2dp_sink_local_param.btc_aa_snk_cb.rx_flush)) {
+-        APPL_TRACE_DEBUG(" State Changed happened in this tick ");
+-        osi_free(p_msg);
++    if (a2dp_sink_local_param.decode_buf_len != 0 && !a2dp_sink_local_param.decode_buf) {
++        APPL_TRACE_WARNING("%s: media packet with no decode buffer", __func__);
+         return;
+     }
+ 
+-    // ignore data if no one is listening
++    /* ignore data if no one is listening */
+     if (!btc_a2dp_control_get_datachnl_stat()) {
+-        osi_free(p_msg);
+         return;
+     }
+ 
++    /* Every codec frames its payload differently, so the decoder strips its own
++     * header. On the codecs that carry RTP that also fills in layer_specific with
++     * the sequence number, which is why the gap check below comes after it and not,
++     * as it used to, before. A codec with no RTP header leaves layer_specific as
++     * AVDTP set it. */
++    if (a2dp_sink_local_param.decoder->decode_packet_header) {
++        if (a2dp_sink_local_param.decoder->decode_packet_header(p_msg) < 0) {
++            return;
++        }
++    }
++
+     if (p_msg->layer_specific != a2dp_sink_local_param.media_pkt_seq_num.expected_seq_num) {
+         /* Because the sequence number of some devices is not recounted */
+         if (!a2dp_sink_local_param.media_pkt_seq_num.seq_num_recount ||
+@@ -562,31 +690,15 @@
+                                 a2dp_sink_local_param.media_pkt_seq_num.seq_num_recount);
+         }
+     }
+-    a2dp_sink_local_param.media_pkt_seq_num.expected_seq_num  = p_msg->layer_specific + 1;
++    a2dp_sink_local_param.media_pkt_seq_num.expected_seq_num = p_msg->layer_specific + 1;
+     a2dp_sink_local_param.media_pkt_seq_num.seq_num_recount = false;
+ 
+-    APPL_TRACE_DEBUG("Number of sbc frames %d, frame_len %d\n", num_sbc_frames, sbc_frame_len);
+-
+-    for (count = 0; count < num_sbc_frames && sbc_frame_len != 0; count ++) {
+-        pcmBytes = availPcmBytes;
+-        status = OI_CODEC_SBC_DecodeFrame(&a2dp_sink_local_param.context, (const OI_BYTE **)&sbc_start_frame,
+-                                        (OI_UINT32 *)&sbc_frame_len,
+-                                        (OI_INT16 *)pcmDataPointer,
+-                                        (OI_UINT32 *)&pcmBytes);
+-        if (!OI_SUCCESS(status)) {
+-            APPL_TRACE_ERROR("Decoding failure: %d\n", status);
+-            break;
+-        }
+-        availPcmBytes -= pcmBytes;
+-        pcmDataPointer += pcmBytes / 2;
+-    }
+-    if (count != num_sbc_frames || sbc_frame_len) {
+-        APPL_TRACE_WARNING("Potential decoding error, cnt:%d, num:%d, len:%d. Please ignore if playback is normal.",
+-                             count, num_sbc_frames, sbc_frame_len);
++    if (a2dp_sink_local_param.decoder->decode_packet) {
++        a2dp_sink_local_param.decoder->decode_packet(p_msg,
++                                                     a2dp_sink_local_param.decode_buf,
++                                                     a2dp_sink_local_param.decode_buf_len);
+     }
+-    osi_free(p_msg);
+-
+-    btc_a2d_data_cb_to_app((uint8_t *)a2dp_sink_local_param.pcmData, (sizeof(a2dp_sink_local_param.pcmData) - availPcmBytes));
++    /* p_msg belongs to the caller, which frees it. */
+ }
+ 
+ /*******************************************************************************
+@@ -604,7 +716,16 @@
+         return TRUE;
+     }
+ 
+-    return btc_a2dp_sink_ctrl(BTC_MEDIA_FLUSH_AA_RX, NULL);
++    BT_HDR *p_buf = (BT_HDR*)osi_malloc(sizeof(BT_HDR));
++    if (!p_buf) {
++        APPL_TRACE_ERROR("%s: no memory", __func__);
++        return false;
++    }
++
++    p_buf->event = BTC_MEDIA_FLUSH_AA_RX;
++    osi_thread_post(a2dp_sink_local_param.btc_aa_snk_task_hdl,
++                    btc_a2dp_sink_ctrl, p_buf, 0, OSI_THREAD_MAX_TIMEOUT);
++    return true;
+ }
+ 
+ /*******************************************************************************
+@@ -624,42 +745,6 @@
+     btc_a2dp_sink_flush_q(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
+ }
+ 
+-static int btc_a2dp_sink_get_track_frequency(UINT8 frequency)
+-{
+-    int freq = 48000;
+-    switch (frequency) {
+-    case A2D_SBC_IE_SAMP_FREQ_16:
+-        freq = 16000;
+-        break;
+-    case A2D_SBC_IE_SAMP_FREQ_32:
+-        freq = 32000;
+-        break;
+-    case A2D_SBC_IE_SAMP_FREQ_44:
+-        freq = 44100;
+-        break;
+-    case A2D_SBC_IE_SAMP_FREQ_48:
+-        freq = 48000;
+-        break;
+-    }
+-    return freq;
+-}
+-
+-static int btc_a2dp_sink_get_track_channel_count(UINT8 channeltype)
+-{
+-    int count = 1;
+-    switch (channeltype) {
+-    case A2D_SBC_IE_CH_MD_MONO:
+-        count = 1;
+-        break;
+-    case A2D_SBC_IE_CH_MD_DUAL:
+-    case A2D_SBC_IE_CH_MD_STEREO:
+-    case A2D_SBC_IE_CH_MD_JOINT:
+-        count = 2;
+-        break;
+-    }
+-    return count;
+-}
+-
+ /*******************************************************************************
+  **
+  ** Function         btc_a2dp_sink_enque_buf
+@@ -669,36 +754,89 @@
+  **
+  ** Returns          size of the queue
+  *******************************************************************************/
++
+ UINT8 btc_a2dp_sink_enque_buf(BT_HDR *p_pkt)
+ {
+     if (btc_a2dp_sink_state != BTC_A2DP_SINK_STATE_ON){
+-        osi_free(p_pkt);
++        osi_free(p_pkt);  /* Free original - caller expects us to take ownership */
+         return 0;
+     }
+ 
+-    if (a2dp_sink_local_param.btc_aa_snk_cb.rx_flush == TRUE) { /* Flush enabled, do not enqueue */
++    if (!a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ ||
++        !a2dp_sink_local_param.btc_aa_snk_cb.data_ready_event) {
+         osi_free(p_pkt);
++        return 0;
++    }
++
++    if (a2dp_sink_local_param.btc_aa_snk_cb.rx_flush == TRUE ||
++        a2dp_sink_local_param.decoder_ready == FALSE) { /* Flush enabled, do not enque*/
++        osi_free(p_pkt);  /* Free original - caller expects us to take ownership */
+         return fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
+     }
+ 
+-    if (fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ) >= MAX_OUTPUT_A2DP_SNK_FRAME_QUEUE_SZ) {
+-        osi_free(p_pkt);
+-        APPL_TRACE_WARNING("Pkt dropped\n");
++    UINT8 queue_limit = btc_a2dp_sink_queue_limit();
++    if (fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ) >= queue_limit) {
++        APPL_TRACE_WARNING("Pkt dropped, codec queue full (%u)\n", (unsigned)queue_limit);
++        osi_free(p_pkt);  /* Free original - caller expects us to take ownership */
+         return fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
+     }
+ 
+-    APPL_TRACE_DEBUG("btc_a2dp_sink_enque_buf + ");
++    /* Proactive memory pressure check — only every 32 packets  to avoid
++     * the overhead of heap_caps_get_free_size (spinlock + metadata walk)
++     * on every incoming BT packet.  At typical A2DP rates (~50 pkt/s)
++     * this still checks roughly twice per second. */
++    {
++        static uint8_t enq_counter = 0;
++        if ((++enq_counter & 0x1F) == 0) {
++            size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
++            size_t pressure_target = btc_a2dp_sink_pressure_target();
++            if (free_internal < pressure_target) {
++                int queue_len = fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
++                int queue_floor = btc_a2dp_sink_queue_floor();
++                if (queue_len > queue_floor) {
++                    int to_drop = queue_len - queue_floor;
++                    APPL_TRACE_WARNING("Low memory (%u bytes free, target %u), dropping %d oldest packets",
++                                     (unsigned)free_internal, (unsigned)pressure_target, to_drop);
++                    for (int i = 0; i < to_drop; i++) {
++                        void *buf = fixed_queue_dequeue(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ, 0);
++                        if (buf) {
++                            osi_free(buf);
++                        }
++                    }
++                }
++            }
++        }
++    }
+ 
+-    // p_msg->num_frames_to_be_processed = (*((UINT8 *)(p_msg + 1) + p_msg->offset)) & 0x0f;
+-    fixed_queue_enqueue(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ, p_pkt, FIXED_QUEUE_MAX_TIMEOUT);
+-    osi_thread_post_event(a2dp_sink_local_param.btc_aa_snk_cb.data_ready_event, OSI_THREAD_MAX_TIMEOUT);
++    APPL_TRACE_DEBUG("btc_a2dp_sink_enque_buf + ");
+ 
++    /* Zero-copy enqueue: pass the original packet directly to the queue
++     * instead of malloc+memcpy+free. The packet was allocated with osi_malloc
++     * by the HCI/L2CAP layer, so osi_free works on the decode side.
++     * This eliminates one malloc+free per packet and avoids transient
++     * double-allocation spikes that cause OOM during LDAC streaming. */
++    if (!fixed_queue_enqueue(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ, p_pkt, 0)) {
++        osi_free(p_pkt);
++        return fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
++    }
++    osi_thread_post_event(a2dp_sink_local_param.btc_aa_snk_cb.data_ready_event, 0);
+     return fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
+ }
+ 
+ static void btc_a2dp_sink_handle_clear_track (void)
+ {
+     APPL_TRACE_DEBUG("%s", __FUNCTION__);
++
++    /* Do not clean up the decoder here.
++     * Some phones briefly disconnect/reconnect while changing codecs and can
++     * deliver the new codec config before the idle/clear-track event is handled.
++     * Clearing the decoder here leaves the subsequent STARTED stream muted until
++     * a full reconnect. The decoder is safely replaced in decoder_reset() and
++     * freed during media-thread cleanup.
++     */
++    if (a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ) {
++        btc_a2dp_sink_flush_q(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
++    }
+ }
+ 
+ /*******************************************************************************
+@@ -713,7 +851,10 @@
+ static void btc_a2dp_sink_flush_q(fixed_queue_t *p_q)
+ {
+     while (! fixed_queue_is_empty(p_q)) {
+-        osi_free(fixed_queue_dequeue(p_q, 0));
++        void *buf = fixed_queue_dequeue(p_q, 0);
++        if (buf) {
++            osi_free(buf);
++        }
+     }
+ }
+ 
+@@ -721,6 +862,10 @@
+ {
+     APPL_TRACE_EVENT("%s\n", __func__);
+     memset(&a2dp_sink_local_param.btc_aa_snk_cb, 0, sizeof(a2dp_sink_local_param.btc_aa_snk_cb));
++    a2dp_sink_local_param.decoder_ready = FALSE;
++    a2dp_sink_local_param.decode_buf = NULL;
++    a2dp_sink_local_param.decode_buf_len = 0;
++    a2dp_sink_local_param.codec_index = BTAV_A2DP_CODEC_INDEX_MAX;
+ 
+     btc_a2dp_sink_state = BTC_A2DP_SINK_STATE_ON;
+ 
+@@ -736,18 +881,107 @@
+ 
+ static void btc_a2dp_sink_thread_cleanup(UNUSED_ATTR void *context)
+ {
++
++    if (a2dp_sink_local_param.decoder && a2dp_sink_local_param.decoder->decoder_cleanup) {
++        a2dp_sink_local_param.decoder->decoder_cleanup();
++        a2dp_sink_local_param.decoder = NULL;
++    }
++    a2dp_sink_local_param.decoder_ready = FALSE;
++
+     btc_a2dp_control_set_datachnl_stat(FALSE);
+     /* Clear task flag */
+     btc_a2dp_sink_state = BTC_A2DP_SINK_STATE_OFF;
+ 
+     btc_a2dp_control_cleanup();
+ 
+-    fixed_queue_free(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ, osi_free_func);
++    fixed_queue_free(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ, btc_a2dp_sink_free_buf);
+ 
+     a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ = NULL;
+ 
+     osi_event_delete(a2dp_sink_local_param.btc_aa_snk_cb.data_ready_event);
+     a2dp_sink_local_param.btc_aa_snk_cb.data_ready_event = NULL;
++
++    /* Free decode buffer */
++    if (a2dp_sink_local_param.decode_buf) {
++        osi_free(a2dp_sink_local_param.decode_buf);
++        a2dp_sink_local_param.decode_buf = NULL;
++    }
++    a2dp_sink_local_param.decode_buf_len = 0;
++    a2dp_sink_local_param.codec_index = BTAV_A2DP_CODEC_INDEX_MAX;
++}
++
++/*******************************************************************************
++ **
++ ** Function         btc_a2dp_sink_on_memory_pressure
++ **
++ ** Description      Called by HCI layer when memory allocation fails.
++ **                  Immediately flushes queued audio packets to free internal RAM.
++ **                  This is a synchronous flush - directly clears the queue without
++ **                  posting a message (which might also fail due to low memory).
++ **
++ ** Returns          void
++ **
++ *******************************************************************************/
++void btc_a2dp_sink_on_memory_pressure(void)
++{
++    /* Log memory pressure event with current state */
++    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
++    (void)free_internal;
++    
++    APPL_TRACE_WARNING("%s: Memory pressure! Internal RAM: %u bytes free, sink_state=%d", 
++                       __func__, (unsigned)free_internal, btc_a2dp_sink_state);
++    
++    if (btc_a2dp_sink_state != BTC_A2DP_SINK_STATE_ON) {
++        APPL_TRACE_WARNING("%s: Sink not active, nothing to flush", __func__);
++        return;
++    }
++
++    /* Enable flush mode to discard new incoming packets */
++    a2dp_sink_local_param.btc_aa_snk_cb.rx_flush = TRUE;
++
++    /* Directly flush the queue - don't post a message since we're low on memory */
++    if (a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ != NULL) {
++        int queue_len = fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
++        (void)queue_len;
++        APPL_TRACE_WARNING("%s: Queue has %d packets", __func__, queue_len);
++        
++        int flushed = 0;
++        while (!fixed_queue_is_empty(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ)) {
++            void *buf = fixed_queue_dequeue(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ, 0);
++            if (buf) {
++                osi_free(buf);
++                flushed++;
++            }
++        }
++        APPL_TRACE_WARNING("%s: Flushed %d packets, internal RAM now: %u bytes", 
++                          __func__, flushed, 
++                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
++    } else {
++        APPL_TRACE_WARNING("%s: RxSbcQ is NULL!", __func__);
++    }
++    
++    /* Re-enable rx only if a decoder is configured. */
++    if (a2dp_sink_local_param.decoder_ready == TRUE) {
++        a2dp_sink_local_param.btc_aa_snk_cb.rx_flush = FALSE;
++    }
++}
++
++/*******************************************************************************
++ **
++ ** Function         btc_a2dp_sink_get_queue_depth
++ **
++ ** Description      Get the current depth of the RX queue
++ **
++ ** Returns          Number of packets in queue, or 0 if queue not initialized
++ **
++ *******************************************************************************/
++UINT8 btc_a2dp_sink_get_queue_depth(void)
++{
++    if (btc_a2dp_sink_state != BTC_A2DP_SINK_STATE_ON ||
++        a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ == NULL) {
++        return 0;
++    }
++    return (UINT8)fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
+ }
+ 
+-#endif /* (BTC_AV_SINK_INCLUDED == TRUE) && (BTC_AV_EXT_CODEC == FALSE) */
++#endif /* BTC_AV_SINK_INCLUDED */
+--- a/host/bluedroid/btc/profile/std/a2dp/btc_a2dp_sink_ext_coedc.c
++++ b/host/bluedroid/btc/profile/std/a2dp/btc_a2dp_sink_ext_coedc.c
+@@ -29,7 +29,7 @@
+ 
+ #if (BTC_AV_SINK_INCLUDED == TRUE) && (BTC_AV_EXT_CODEC == TRUE)
+ 
+-#define MAX_OUTPUT_A2DP_SNK_FRAME_QUEUE_SZ     (25)
++#define MAX_OUTPUT_A2DP_SNK_FRAME_QUEUE_SZ     (14)
+ #define BTC_A2DP_SNK_DATA_QUEUE_IDX            (1)
+ 
+ enum {
+--- a/host/bluedroid/btc/profile/std/a2dp/btc_av.c
++++ b/host/bluedroid/btc/profile/std/a2dp/btc_av.c
+@@ -21,6 +21,7 @@
+ #include "btc/btc_dm.h"
+ #include "btc/btc_common.h"
+ #include "btc/btc_manage.h"
++#include "stack/a2dp_codec_api.h"
+ #include "btc_av.h"
+ #include "btc_av_co.h"
+ #include "btc_avrc.h"
+@@ -853,6 +854,17 @@
+         break;
+     }
+ 
++    case BTC_AV_CONFIG_EVT: {
++        /* The codec can be renegotiated on an open connection that is not
++         * streaming. Without this the application would go on reporting whatever
++         * was agreed the first time. */
++        esp_a2d_cb_param_t cfg_param;
++        cfg_param.audio_cfg.conn_hdl = btc_av_cb.bta_handle;
++        memcpy(cfg_param.audio_cfg.remote_bda, &btc_av_cb.peer_bda, sizeof(esp_bd_addr_t));
++        memcpy(&cfg_param.audio_cfg.mcc, p_data, sizeof(esp_a2d_mcc_t));
++        btc_a2d_cb_to_app(ESP_A2D_AUDIO_CFG_EVT, &cfg_param);
++    } break;
++
+     CHECK_RC_EVENT(event, p_data);
+ 
+     case BTA_AV_SNK_PSC_CFG_EVT:
+@@ -1381,8 +1393,6 @@
+ {
+     btc_sm_state_t state;
+     UINT8 que_len;
+-    tA2D_STATUS a2d_status;
+-    tA2D_SBC_CIE sbc_cie;
+ 
+     if (event == BTA_AV_MEDIA_DATA_EVT) { /* Switch to BTC_MEDIA context */
+         state = btc_sm_get_state(btc_av_cb.sm_handle);
+@@ -1402,9 +1412,7 @@
+         btc_a2dp_sink_reset_decoder((UINT8 *)p_data);
+ #endif
+ 
+-        /* currently only supports SBC */
+-        a2d_status = A2D_ParsSbcInfo(&sbc_cie, (UINT8 *)p_data, FALSE);
+-        if (a2d_status == A2D_SUCCESS) {
++        if (A2DP_IsPeerSourceCodecSupported((UINT8 *)p_data) == A2D_SUCCESS) {
+             btc_msg_t msg;
+             btc_av_args_t arg;
+ 
+@@ -1413,11 +1421,19 @@
+             msg.act = BTC_AV_CONFIG_EVT;
+ 
+             memset(&arg, 0, sizeof(btc_av_args_t));
+-            arg.mcc.type = ESP_A2D_MCT_SBC;
+-            memcpy(&arg.mcc.cie.sbc_info, (uint8_t *)p_data + BTC_AV_SBC_CIE_OFFSET, BTC_AV_SBC_CIE_LEN);
++            arg.mcc.type = A2DP_GetCodecType((UINT8 *)p_data);
++
++            /* The first octet of codec_info is the length of the rest. Hand the
++             * application the codec specific information elements without the
++             * AVDTP header, bounded by what the union can actually hold. */
++            size_t len = ((UINT8 *)p_data)[0] + 1 - AVDT_CODEC_HEADER_SIZE;
++            if (len > sizeof(arg.mcc.cie)) {
++                len = sizeof(arg.mcc.cie);
++            }
++            memcpy(&arg.mcc.cie, (UINT8 *)p_data + AVDT_CODEC_HEADER_SIZE, len);
+             btc_transfer_context(&msg, &arg, sizeof(btc_av_args_t), NULL, NULL);
+         } else {
+-            BTC_TRACE_ERROR("ERROR dump_codec_info A2D_ParsSbcInfo fail:%d\n", a2d_status);
++            BTC_TRACE_ERROR("Unsupported source codec %s", A2DP_CodecName((UINT8 *)p_data));
+         }
+     }
+     UNUSED(que_len);
+--- a/host/bluedroid/btc/profile/std/a2dp/include/btc_av_co.h
++++ b/host/bluedroid/btc/profile/std/a2dp/include/btc_av_co.h
+@@ -1,5 +1,5 @@
+ /*
+- * SPDX-FileCopyrightText: 2015-2025 Espressif Systems (Shanghai) CO LTD
++ * SPDX-FileCopyrightText: 2015-2021 Espressif Systems (Shanghai) CO LTD
+  *
+  * SPDX-License-Identifier: Apache-2.0
+  */
+@@ -16,18 +16,61 @@
+ ********************************************************************************/
+ 
+ enum {
++    BTC_SV_AV_AA_SOURCE_MIN = 0,
+     BTC_SV_AV_AA_SBC_INDEX = 0,
+-    BTC_SV_AV_AA_SBC_SINK_INDEX,
+-    BTC_SV_AV_AA_SEP_INDEX  /* Last index */
++#if (defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE)
++    BTC_SV_AV_AA_APTX_INDEX,
++    BTC_SV_AV_AA_APTX_HD_INDEX,
++    BTC_SV_AV_AA_APTX_LL_INDEX,
++#endif /* APTX_DEC_INCLUDED */
++#if (defined(LDAC_DEC_INCLUDED) && LDAC_DEC_INCLUDED == TRUE)
++    BTC_SV_AV_AA_LDAC_INDEX,
++#endif /* LDAC_DEC_INCLUDED */
++#if (defined(OPUS_DEC_INCLUDED) && OPUS_DEC_INCLUDED == TRUE)
++    BTC_SV_AV_AA_OPUS_INDEX,
++    BTC_SV_AV_AA_OPUS_ANDROID_INDEX,
++#endif /* LDAC_DEC_INCLUDED */
++#if (defined(LC3PLUS_DEC_INCLUDED) && LC3PLUS_DEC_INCLUDED == TRUE)
++    BTC_SV_AV_AA_LC3PLUS_INDEX,
++#endif /* LDAC_DEC_INCLUDED */
++#if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)
++    BTC_SV_AV_AA_AAC_INDEX,
++#endif /* AAC_DEC_INCLUDED */
++    BTC_SV_AV_AA_SOURCE_MAX,
++    BTC_SV_AV_AA_SINK_MIN = BTC_SV_AV_AA_SOURCE_MAX,
++    BTC_SV_AV_AA_SBC_SINK_INDEX = BTC_SV_AV_AA_SINK_MIN,
++#if (defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE)
++    BTC_SV_AV_AA_APTX_SINK_INDEX,
++    BTC_SV_AV_AA_APTX_HD_SINK_INDEX,
++    BTC_SV_AV_AA_APTX_LL_SINK_INDEX,
++#endif /* APTX_DEC_INCLUDED */
++#if (defined(LDAC_DEC_INCLUDED) && LDAC_DEC_INCLUDED == TRUE)
++    BTC_SV_AV_AA_LDAC_SINK_INDEX,
++#endif /* LDAC_DEC_INCLUDED */
++#if (defined(OPUS_DEC_INCLUDED) && OPUS_DEC_INCLUDED == TRUE)
++    BTC_SV_AV_AA_OPUS_SINK_INDEX,
++    BTC_SV_AV_AA_OPUS_ANDROID_SINK_INDEX,
++#endif /* OPUS_DEC_INCLUDED */
++#if (defined(LC3PLUS_DEC_INCLUDED) && LC3PLUS_DEC_INCLUDED == TRUE)
++    BTC_SV_AV_AA_LC3PLUS_SINK_INDEX,
++#endif /* LC3PLUS_DEC_INCLUDED */
++#if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)
++    BTC_SV_AV_AA_AAC_SINK_INDEX,
++#endif /* AAC_DEC_INCLUDED */
++    BTC_SV_AV_AA_SINK_MAX
+ };
+ 
++#define BTC_SV_AV_AA_SOURCE_COUNT (BTC_SV_AV_AA_SOURCE_MAX - \
++                                   BTC_SV_AV_AA_SOURCE_MIN)
++#define BTC_SV_AV_AA_SINK_COUNT (BTC_SV_AV_AA_SINK_MAX - \
++                                 BTC_SV_AV_AA_SINK_MIN)
++
+ /*****************************************************************************
+ **  Local data
+ *****************************************************************************/
+ typedef struct {
+     UINT8 sep_info_idx;                 /* local SEP index (in BTA tables) */
+     UINT8 seid;                         /* peer SEP index (in peer tables) */
+-    UINT8 codec_type;                   /* peer SEP codec type */
+     UINT8 codec_caps[AVDT_CODEC_SIZE];  /* peer SEP codec capabilities */
+     UINT8 num_protect;                  /* peer SEP number of CP elements */
+     UINT8 protect_info[BTA_AV_CP_INFO_LEN];  /* peer SEP content protection info */
+@@ -35,8 +78,8 @@
+ 
+ typedef struct {
+     BD_ADDR         addr;               /* address of audio/video peer */
+-    tBTA_AV_CO_SINK snks[BTC_SV_AV_AA_SEP_INDEX]; /* array of supported sinks */
+-    tBTA_AV_CO_SINK srcs[BTC_SV_AV_AA_SEP_INDEX]; /* array of supported srcs */
++    tBTA_AV_CO_SINK snks[BTC_SV_AV_AA_SINK_COUNT]; /* array of supported sinks */
++    tBTA_AV_CO_SINK srcs[BTC_SV_AV_AA_SOURCE_COUNT]; /* array of supported srcs */
+     UINT8           num_snks;           /* total number of sinks at peer */
+     UINT8           num_srcs;           /* total number of srcs at peer */
+     UINT8           num_seps;           /* total number of seids at peer */
+@@ -64,7 +107,6 @@
+ typedef struct {
+     /* Connected peer information */
+     tBTA_AV_CO_PEER peers[BTA_AV_NUM_STRS];
+-    tBTC_AV_CODEC_INFO codec_caps;
+     /* Current codec configuration - access to this variable must be protected */
+     tBTC_AV_CODEC_INFO codec_cfg;
+     tBTC_AV_CODEC_INFO codec_cfg_setconfig; /* remote peer setconfig preference */
+@@ -190,7 +232,8 @@
+  ** Returns          Nothing
+  **
+  *******************************************************************************/
+-void bta_av_co_init(tBTC_AV_CODEC_INFO *codec_caps);
++void bta_av_co_init(void);
++
+ 
+ /*******************************************************************************
+  **
+@@ -211,7 +254,7 @@
+  **                  of our exported bitpool range. If set we will set the
+  **                  remote preference.
+  **
+- ** Returns          TRUE if config set, FALSE otherwise
++ ** Returns          TRUE if config set, FALSE otherwize
+  **
+  *******************************************************************************/
+ BOOLEAN bta_av_co_get_remote_bitpool_pref(UINT8 *min, UINT8 *max);
+--- a/host/bluedroid/btc/profile/std/include/btc_a2dp_sink.h
++++ b/host/bluedroid/btc/profile/std/include/btc_a2dp_sink.h
+@@ -126,6 +126,27 @@
+  *******************************************************************************/
+ void btc_a2dp_sink_reset_decoder(UINT8 *p_av);
+ 
++/*******************************************************************************
++ **
++ ** Function         btc_a2dp_sink_on_memory_pressure
++ **
++ ** Description      Called by HCI layer when memory allocation fails.
++ **                  Flushes queued audio packets to free internal RAM.
++ **
++ *******************************************************************************/
++void btc_a2dp_sink_on_memory_pressure(void);
++
++/*******************************************************************************
++ **
++ ** Function         btc_a2dp_sink_get_queue_depth
++ **
++ ** Description      Get the current depth of the RX queue
++ **
++ ** Returns          Number of packets in queue, or 0 if queue not initialized
++ **
++ *******************************************************************************/
++UINT8 btc_a2dp_sink_get_queue_depth(void);
++
+ #endif /* #if BTC_AV_SINK_INCLUDED */
+ 
+ #endif /* __BTC_A2DP_SINK_H__ */
+--- a/host/bluedroid/btc/profile/std/include/btc_av.h
++++ b/host/bluedroid/btc/profile/std/include/btc_av.h
+@@ -60,8 +60,10 @@
+     BTC_AV_CONNECT_REQ_EVT = BTA_AV_MAX_EVT,
+     BTC_AV_DISCONNECT_REQ_EVT,
+     BTC_AV_START_STREAM_REQ_EVT,
++    BTC_AV_STOP_STREAM_REQ_EVT,       // Compatibility: renamed from SUSPEND in 5.1.4
+     BTC_AV_SUSPEND_STREAM_REQ_EVT,
+-    BTC_AV_CONFIG_EVT,
++    BTC_AV_SINK_CONFIG_REQ_EVT,       // Compatibility: was CONFIG_EVT in 5.5.2
++    BTC_AV_CONFIG_EVT = BTC_AV_SINK_CONFIG_REQ_EVT,  // Alias for new name
+ } btc_av_sm_event_t;
+ 
+ typedef enum {
+--- a/host/bluedroid/btc/profile/std/include/btc_av_api.h
++++ b/host/bluedroid/btc/profile/std/include/btc_av_api.h
+@@ -164,7 +164,6 @@
+  * Structure used to configure the AV codec capabilities/config
+  */
+ typedef struct {
+-    tBTC_AV_CODEC_ID id;             /* Codec ID (in terms of BTC) */
+     UINT8 info[AVDT_CODEC_SIZE];     /* Codec info (can be config or capabilities) */
+ } tBTC_AV_CODEC_INFO;
+ 
+--- a/host/bluedroid/common/include/common/bluedroid_user_config.h
++++ b/host/bluedroid/common/include/common/bluedroid_user_config.h
+@@ -63,6 +63,17 @@
+ #define UC_BT_AVRCP_ENABLED                 FALSE
+ #define UC_BT_AVRCP_CT_COVER_ART_ENABLED    FALSE
+ #endif
++#ifdef CONFIG_BT_A2DP_APTX_DECODER
++#define UC_BT_A2DP_APTX_DECODER_ENABLED    CONFIG_BT_A2DP_APTX_DECODER
++#else
++#define UC_BT_A2DP_APTX_DECODER_ENABLED    FALSE
++#endif
++
++#ifdef CONFIG_BT_A2DP_AAC_DECODER
++#define UC_BT_A2DP_AAC_DECODER_ENABLED    CONFIG_BT_A2DP_AAC_DECODER
++#else
++#define UC_BT_A2DP_AAC_DECODER_ENABLED    FALSE
++#endif
+ 
+ //SPP
+ #ifdef CONFIG_BT_SPP_ENABLED
+--- a/host/bluedroid/common/include/common/bt_target.h
++++ b/host/bluedroid/common/include/common/bt_target.h
+@@ -92,6 +92,12 @@
+ #define BTC_AV_INCLUDED             TRUE
+ #define BTA_AV_SINK_INCLUDED        TRUE
+ #define BTC_AV_SINK_INCLUDED        TRUE
++#if (UC_BT_A2DP_APTX_DECODER_ENABLED == TRUE)
++#define APTX_DEC_INCLUDED         TRUE
++#endif /* (UC_BT_A2DP_APTX_DECODER_ENABLED == TRUE) */
++#if (UC_BT_A2DP_AAC_DECODER_ENABLED == TRUE)
++#define AAC_DEC_INCLUDED           TRUE
++#endif /* (UC_BT_A2DP_AAC_DECODER_ENABLED == TRUE) */
+ #define BTC_AV_SRC_INCLUDED         TRUE
+ #if (UC_BT_A2DP_USE_EXTERNAL_CODEC == TRUE)
+ #define BTC_AV_EXT_CODEC            TRUE
+@@ -2288,7 +2294,22 @@
+ 
+ /* Number of simultaneous stream endpoints. */
+ #ifndef AVDT_NUM_SEPS
+-#define AVDT_NUM_SEPS               3
++
++# ifdef CONFIG_BT_A2DP_APTX_DECODER
++#  define AVDT_APTX_SEPS	(2)
++# else
++#  define AVDT_APTX_SEPS	(0)
++# endif /* CONFIG_BT_A2DP_APTX_DECODER */
++# ifdef CONFIG_BT_A2DP_AAC_DECODER
++#  define AVDT_AAC_SEPS	(1)
++# else
++#  define AVDT_AAC_SEPS	(0)
++# endif /* CONFIG_BT_A2DP_AAC_DECODER */
++
++#define AVDT_NUM_SEPS      (3 \
++							+ AVDT_APTX_SEPS \
++							+ AVDT_AAC_SEPS \
++							)
+ #endif
+ 
+ /* Number of transport channels setup per media stream(audio or video) */
+@@ -2313,7 +2334,11 @@
+ 
+ /* Maximum size in bytes of the codec capabilities information element. */
+ #ifndef AVDT_CODEC_SIZE
+-#define AVDT_CODEC_SIZE             10
++#define AVDT_CODEC_SIZE             30
++#endif
++
++#ifndef AVDT_CODEC_HEADER_SIZE
++#define AVDT_CODEC_HEADER_SIZE      3
+ #endif
+ 
+ /* Maximum size in bytes of the content protection information element. */
+--- a/host/bluedroid/stack/a2dp/a2d_api.c
++++ b/host/bluedroid/stack/a2dp/a2d_api.c
+@@ -366,17 +366,12 @@
+ **                  A2D_SET_ZERO_BIT, if all bits clear
+ **                  A2D_SET_MULTL_BIT, if multiple bits are set
+ ******************************************************************************/
+-UINT8 A2D_BitsSet(UINT8 num)
++uint8_t A2D_BitsSet(uint64_t num)
+ {
+-    UINT8 count;
+-    UINT8 res;
+     if (num == 0) {
+-        res = A2D_SET_ZERO_BIT;
+-    } else {
+-        count = (num & (num - 1));
+-        res = ((count == 0) ? A2D_SET_ONE_BIT : A2D_SET_MULTL_BIT);
++        return A2D_SET_ZERO_BIT;
+     }
+-    return res;
++    return ((num & (num - 1)) == 0) ? A2D_SET_ONE_BIT : A2D_SET_MULTL_BIT;
+ }
+ 
+ /*******************************************************************************
+--- a/host/bluedroid/stack/a2dp/a2d_sbc.c
++++ b/host/bluedroid/stack/a2dp/a2d_sbc.c
+@@ -29,10 +29,67 @@
+ #include "stack/a2d_api.h"
+ #include "a2d_int.h"
+ #include "stack/a2d_sbc.h"
++#include "stack/a2d_sbc_decoder.h"
++#include "stack/a2dp_codec_api.h"
+ #include "common/bt_defs.h"
+ 
++
+ #if (defined(A2D_INCLUDED) && A2D_INCLUDED == TRUE)
+ 
++#define BTA_AV_CO_SBC_MAX_BITPOOL  53
++
++#if !defined(BTC_AV_SBC_DEFAULT_SAMP_FREQ)
++#define BTC_AV_SBC_DEFAULT_SAMP_FREQ A2D_SBC_IE_SAMP_FREQ_44
++#endif
++
++/* SBC SRC codec capabilities */
++const tA2D_SBC_CIE a2dp_sbc_src_caps = {
++    (A2D_SBC_IE_SAMP_FREQ_44), /* samp_freq */
++    (A2D_SBC_IE_CH_MD_MONO | A2D_SBC_IE_CH_MD_STEREO | A2D_SBC_IE_CH_MD_JOINT | A2D_SBC_IE_CH_MD_DUAL), /* ch_mode */
++    (A2D_SBC_IE_BLOCKS_16 | A2D_SBC_IE_BLOCKS_12 | A2D_SBC_IE_BLOCKS_8 | A2D_SBC_IE_BLOCKS_4), /* block_len */
++    (A2D_SBC_IE_SUBBAND_4 | A2D_SBC_IE_SUBBAND_8), /* num_subbands */
++    (A2D_SBC_IE_ALLOC_MD_L | A2D_SBC_IE_ALLOC_MD_S), /* alloc_mthd */
++    BTA_AV_CO_SBC_MAX_BITPOOL, /* max_bitpool */
++    A2D_SBC_IE_MIN_BITPOOL /* min_bitpool */
++};
++
++/* SBC SINK codec capabilities */
++static const tA2D_SBC_CIE a2dp_sbc_sink_caps = {
++    (A2D_SBC_IE_SAMP_FREQ_48 | A2D_SBC_IE_SAMP_FREQ_44), /* samp_freq */
++    (A2D_SBC_IE_CH_MD_MONO | A2D_SBC_IE_CH_MD_STEREO | A2D_SBC_IE_CH_MD_JOINT | A2D_SBC_IE_CH_MD_DUAL), /* ch_mode */
++    (A2D_SBC_IE_BLOCKS_16 | A2D_SBC_IE_BLOCKS_12 | A2D_SBC_IE_BLOCKS_8 | A2D_SBC_IE_BLOCKS_4), /* block_len */
++    (A2D_SBC_IE_SUBBAND_4 | A2D_SBC_IE_SUBBAND_8), /* num_subbands */
++    (A2D_SBC_IE_ALLOC_MD_L | A2D_SBC_IE_ALLOC_MD_S), /* alloc_mthd */
++    A2D_SBC_IE_MAX_BITPOOL, /* max_bitpool */
++    A2D_SBC_IE_MIN_BITPOOL /* min_bitpool */
++};
++
++/* Default SBC codec configuration */
++const tA2D_SBC_CIE a2dp_sbc_default_config = {
++    BTC_AV_SBC_DEFAULT_SAMP_FREQ,   /* samp_freq */
++    A2D_SBC_IE_CH_MD_JOINT,         /* ch_mode */
++    A2D_SBC_IE_BLOCKS_16,           /* block_len */
++    A2D_SBC_IE_SUBBAND_8,           /* num_subbands */
++    A2D_SBC_IE_ALLOC_MD_L,          /* alloc_mthd */
++    BTA_AV_CO_SBC_MAX_BITPOOL,      /* max_bitpool */
++    A2D_SBC_IE_MIN_BITPOOL          /* min_bitpool */
++};
++
++static const tA2DP_DECODER_INTERFACE a2dp_decoder_interface_sbc = {
++    a2dp_sbc_decoder_init,
++    a2dp_sbc_decoder_cleanup,
++    a2dp_sbc_decoder_reset,
++    a2dp_sbc_decoder_decode_packet_header,
++    a2dp_sbc_decoder_decode_packet,
++    NULL,  // decoder_start
++    NULL,  // decoder_suspend
++    a2dp_sbc_decoder_configure,
++};
++
++static tA2D_STATUS A2DP_CodecInfoMatchesCapabilitySbc(
++    const tA2D_SBC_CIE* p_cap, const uint8_t* p_codec_info,
++    bool is_capability);
++
+ /******************************************************************************
+ **
+ ** Function         A2D_BldSbcInfo
+@@ -222,4 +279,237 @@
+     }
+ }
+ 
++const char* A2DP_CodecNameSbc(const uint8_t* p_codec_info) {
++  UNUSED(p_codec_info);
++  return "SBC";
++}
++
++bool A2DP_IsSinkCodecValidSbc(const uint8_t* p_codec_info) {
++  tA2D_SBC_CIE cfg_cie;
++
++  /* Use a liberal check when parsing the codec info */
++  return (A2D_ParsSbcInfo(&cfg_cie, (UINT8 *)p_codec_info, false) == A2D_SUCCESS) ||
++         (A2D_ParsSbcInfo(&cfg_cie, (UINT8 *)p_codec_info, true) == A2D_SUCCESS);
++}
++
++bool A2DP_IsPeerSinkCodecValidSbc(const uint8_t* p_codec_info) {
++  tA2D_SBC_CIE cfg_cie;
++
++  /* Use a liberal check when parsing the codec info */
++  return (A2D_ParsSbcInfo(&cfg_cie, (UINT8 *)p_codec_info, false) == A2D_SUCCESS) ||
++         (A2D_ParsSbcInfo(&cfg_cie, (UINT8 *)p_codec_info, true) == A2D_SUCCESS);
++}
++
++tA2D_STATUS A2DP_IsSinkCodecSupportedSbc(const uint8_t* p_codec_info) {
++  return A2DP_CodecInfoMatchesCapabilitySbc(&a2dp_sbc_sink_caps, p_codec_info,
++                                            false);
++}
++
++tA2D_STATUS A2DP_IsPeerSourceCodecSupportedSbc(const uint8_t* p_codec_info) {
++  return A2DP_CodecInfoMatchesCapabilitySbc(&a2dp_sbc_sink_caps, p_codec_info,
++                                            true);
++}
++
++btav_a2dp_codec_index_t A2DP_SinkCodecIndexSbc(const uint8_t* p_codec_info) {
++  UNUSED(p_codec_info);
++  return BTAV_A2DP_CODEC_INDEX_SINK_SBC;
++}
++
++btav_a2dp_codec_index_t A2DP_SourceCodecIndexSbc(const uint8_t* p_codec_info) {
++  UNUSED(p_codec_info);
++  return BTAV_A2DP_CODEC_INDEX_SOURCE_SBC;
++}
++
++// Checks whether A2DP SBC codec configuration matches with a device's codec
++// capabilities. |p_cap| is the SBC codec configuration. |p_codec_info| is
++// the device's codec capabilities. |is_capability| is true if
++// |p_codec_info| contains A2DP codec capability.
++// Returns A2D_SUCCESS if the codec configuration matches with capabilities,
++// otherwise the corresponding A2DP error status code.
++static tA2D_STATUS A2DP_CodecInfoMatchesCapabilitySbc(
++    const tA2D_SBC_CIE* p_cap, const uint8_t* p_codec_info,
++    bool is_capability) {
++  tA2D_STATUS status;
++  tA2D_SBC_CIE cfg_cie;
++
++  /* parse configuration */
++  status = A2D_ParsSbcInfo(&cfg_cie, (uint8_t*)p_codec_info, is_capability);
++  if (status != A2D_SUCCESS) {
++    LOG_ERROR("%s: parsing failed %d", __func__, status);
++    return status;
++  }
++
++  /* verify that each parameter is in range */
++
++  LOG_VERBOSE("%s: FREQ peer: 0x%x, capability 0x%x", __func__,
++              cfg_cie.samp_freq, p_cap->samp_freq);
++  LOG_VERBOSE("%s: CH_MODE peer: 0x%x, capability 0x%x", __func__,
++              cfg_cie.ch_mode, p_cap->ch_mode);
++  LOG_VERBOSE("%s: BLOCK_LEN peer: 0x%x, capability 0x%x", __func__,
++              cfg_cie.block_len, p_cap->block_len);
++  LOG_VERBOSE("%s: SUB_BAND peer: 0x%x, capability 0x%x", __func__,
++              cfg_cie.num_subbands, p_cap->num_subbands);
++  LOG_VERBOSE("%s: ALLOC_METHOD peer: 0x%x, capability 0x%x", __func__,
++              cfg_cie.alloc_mthd, p_cap->alloc_mthd);
++  LOG_VERBOSE("%s: MIN_BitPool peer: 0x%x, capability 0x%x", __func__,
++              cfg_cie.min_bitpool, p_cap->min_bitpool);
++  LOG_VERBOSE("%s: MAX_BitPool peer: 0x%x, capability 0x%x", __func__,
++              cfg_cie.max_bitpool, p_cap->max_bitpool);
++
++  /* sampling frequency */
++  if ((cfg_cie.samp_freq & p_cap->samp_freq) == 0) return A2D_NS_SAMP_FREQ;
++
++  /* channel mode */
++  if ((cfg_cie.ch_mode & p_cap->ch_mode) == 0) return A2D_NS_CH_MODE;
++
++  /* block length */
++  if ((cfg_cie.block_len & p_cap->block_len) == 0) return A2D_BAD_BLOCK_LEN;
++
++  /* subbands */
++  if ((cfg_cie.num_subbands & p_cap->num_subbands) == 0)
++    return A2D_NS_SUBBANDS;
++
++  /* allocation method */
++  if ((cfg_cie.alloc_mthd & p_cap->alloc_mthd) == 0)
++    return A2D_NS_ALLOC_MTHD;
++
++  /* min bitpool */
++  if (cfg_cie.min_bitpool > p_cap->max_bitpool) return A2D_NS_MIN_BITPOOL;
++
++  /* max bitpool */
++  if (cfg_cie.max_bitpool < p_cap->min_bitpool) return A2D_NS_MAX_BITPOOL;
++
++  return A2D_SUCCESS;
++}
++
++bool A2DP_CodecTypeEqualsSbc(const uint8_t* p_codec_info_a,
++                             const uint8_t* p_codec_info_b) {
++  tA2D_SBC_CIE sbc_cie_a;
++  tA2D_SBC_CIE sbc_cie_b;
++
++  // Check whether the codec info contains valid data
++  tA2D_STATUS a2dp_status =
++      A2D_ParsSbcInfo(&sbc_cie_a, (uint8_t*)p_codec_info_a, true);
++  if (a2dp_status != A2D_SUCCESS) {
++    if (a2dp_status != A2D_WRONG_CODEC)
++      LOG_ERROR("%s: cannot decode codec information: %d", __func__, a2dp_status);
++    return false;
++  }
++  a2dp_status = A2D_ParsSbcInfo(&sbc_cie_b, (uint8_t*)p_codec_info_b, true);
++  if (a2dp_status != A2D_SUCCESS) {
++      if (a2dp_status != A2D_WRONG_CODEC)
++        LOG_ERROR("%s: cannot decode codec information: %d", __func__, a2dp_status);
++    return false;
++  }
++
++  tA2D_CODEC_TYPE codec_type_a = A2DP_GetCodecType(p_codec_info_a);
++  tA2D_CODEC_TYPE codec_type_b = A2DP_GetCodecType(p_codec_info_b);
++
++  return (codec_type_a == codec_type_b) && (codec_type_a == A2D_MEDIA_CT_SBC);
++}
++
++bool A2DP_InitCodecConfigSbc(btav_a2dp_codec_index_t codec_index, UINT8 *p_result) {
++  switch(codec_index) {
++    case BTAV_A2DP_CODEC_INDEX_SINK_SBC:
++      return A2DP_InitCodecConfigSbcSink(p_result);
++    case BTAV_A2DP_CODEC_INDEX_SOURCE_SBC:
++      return A2DP_InitCodecConfigSbcSrc(p_result);
++    default:
++      break;
++  }
++
++  return false;
++}
++
++bool A2DP_InitCodecConfigSbcSink(uint8_t* p_codec_info) {
++  if (A2D_BldSbcInfo(A2D_MEDIA_TYPE_AUDIO, (tA2D_SBC_CIE *)&a2dp_sbc_sink_caps,
++                     p_codec_info) != A2D_SUCCESS) {
++    return false;
++  }
++
++  return true;
++}
++
++bool A2DP_InitCodecConfigSbcSrc(uint8_t* p_codec_info) {
++  if (A2D_BldSbcInfo(A2D_MEDIA_TYPE_AUDIO, (tA2D_SBC_CIE *)&a2dp_sbc_src_caps,
++                     p_codec_info) != A2D_SUCCESS) {
++    return false;
++  }
++
++  return true;
++}
++
++bool A2DP_BuildCodecConfigSbc(UINT8 *p_src_cap, UINT8 *p_result) {
++    tA2D_SBC_CIE    src_cap;
++    tA2D_SBC_CIE    pref_cap = a2dp_sbc_default_config;
++    UINT8           status = 0;
++
++    /* now try to build a preferred one */
++    /* parse configuration */
++    if ((status = A2D_ParsSbcInfo(&src_cap, p_src_cap, TRUE)) != 0) {
++        APPL_TRACE_DEBUG(" Cant parse src cap ret = %d", status);
++        return false;
++    }
++
++    if (src_cap.samp_freq & A2D_SBC_IE_SAMP_FREQ_48) {
++        pref_cap.samp_freq = A2D_SBC_IE_SAMP_FREQ_48;
++    } else if (src_cap.samp_freq & A2D_SBC_IE_SAMP_FREQ_44) {
++        pref_cap.samp_freq = A2D_SBC_IE_SAMP_FREQ_44;
++    }
++
++    if (src_cap.ch_mode & A2D_SBC_IE_CH_MD_JOINT) {
++        pref_cap.ch_mode = A2D_SBC_IE_CH_MD_JOINT;
++    } else if (src_cap.ch_mode & A2D_SBC_IE_CH_MD_STEREO) {
++        pref_cap.ch_mode = A2D_SBC_IE_CH_MD_STEREO;
++    } else if (src_cap.ch_mode & A2D_SBC_IE_CH_MD_DUAL) {
++        pref_cap.ch_mode = A2D_SBC_IE_CH_MD_DUAL;
++    } else if (src_cap.ch_mode & A2D_SBC_IE_CH_MD_MONO) {
++        pref_cap.ch_mode = A2D_SBC_IE_CH_MD_MONO;
++    }
++
++    if (src_cap.block_len & A2D_SBC_IE_BLOCKS_16) {
++        pref_cap.block_len = A2D_SBC_IE_BLOCKS_16;
++    } else if (src_cap.block_len & A2D_SBC_IE_BLOCKS_12) {
++        pref_cap.block_len = A2D_SBC_IE_BLOCKS_12;
++    } else if (src_cap.block_len & A2D_SBC_IE_BLOCKS_8) {
++        pref_cap.block_len = A2D_SBC_IE_BLOCKS_8;
++    } else if (src_cap.block_len & A2D_SBC_IE_BLOCKS_4) {
++        pref_cap.block_len = A2D_SBC_IE_BLOCKS_4;
++    }
++
++    if (src_cap.num_subbands & A2D_SBC_IE_SUBBAND_8) {
++        pref_cap.num_subbands = A2D_SBC_IE_SUBBAND_8;
++    } else if (src_cap.num_subbands & A2D_SBC_IE_SUBBAND_4) {
++        pref_cap.num_subbands = A2D_SBC_IE_SUBBAND_4;
++    }
++
++    if (src_cap.alloc_mthd & A2D_SBC_IE_ALLOC_MD_L) {
++        pref_cap.alloc_mthd = A2D_SBC_IE_ALLOC_MD_L;
++    } else if (src_cap.alloc_mthd & A2D_SBC_IE_ALLOC_MD_S) {
++        pref_cap.alloc_mthd = A2D_SBC_IE_ALLOC_MD_S;
++    }
++
++    if (A2D_SBC_IE_MIN_BITPOOL <= src_cap.max_bitpool &&
++        src_cap.max_bitpool <= A2D_SBC_IE_MAX_BITPOOL) {
++        pref_cap.max_bitpool = pref_cap.max_bitpool < src_cap.max_bitpool ?
++                               pref_cap.max_bitpool : src_cap.max_bitpool;
++    }
++
++    if (A2D_SBC_IE_MIN_BITPOOL <= src_cap.min_bitpool &&
++        src_cap.min_bitpool <= A2D_SBC_IE_MAX_BITPOOL) {
++        pref_cap.min_bitpool = pref_cap.min_bitpool > src_cap.min_bitpool ?
++                               pref_cap.min_bitpool : src_cap.min_bitpool;
++    }
++
++    status = A2D_BldSbcInfo(A2D_MEDIA_TYPE_AUDIO, (tA2D_SBC_CIE *) &pref_cap, p_result);
++    return status == A2D_SUCCESS;
++}
++
++const tA2DP_DECODER_INTERFACE* A2DP_GetDecoderInterfaceSbc(
++    const uint8_t* p_codec_info) {
++  if (!A2DP_IsSinkCodecValidSbc(p_codec_info)) return NULL;
++
++  return &a2dp_decoder_interface_sbc;
++}
++
+ #endif /* #if (defined(A2D_INCLUDED) && A2D_INCLUDED == TRUE) */
+--- a/host/bluedroid/stack/avdt/avdt_msg.c
++++ b/host/bluedroid/stack/avdt/avdt_msg.c
+@@ -1678,6 +1678,7 @@
+     UNUSED(pkt_type);
+ 
+     AVDT_TRACE_DEBUG("msg_type=%d, sig=%d\n", msg_type, sig);
++    AVDT_TRACE_WARNING(">>> AVDT msg_ind: label=%d msg_type=%d pkt_type=%d len=%d", label, msg_type, pkt_type, p_buf->len);
+     /* set up label and ccb_idx in message hdr */
+     msg.hdr.label = label;
+     msg.hdr.ccb_idx = avdt_ccb_to_idx(p_ccb);
+@@ -1704,6 +1705,7 @@
+         /* get and verify signal */
+         AVDT_MSG_PRS_SIG(p, sig);
+         msg.hdr.sig_id = sig;
++        AVDT_TRACE_WARNING(">>> AVDT sig parsed: sig=%d msg_type=%d", sig, msg_type);
+         if ((sig == 0) || (sig > AVDT_SIG_MAX)) {
+             AVDT_TRACE_WARNING("Dropping msg sig=%d msg_type:%d\n", sig, msg_type);
+             ok = FALSE;
+--- a/host/bluedroid/stack/avdt/avdt_scb_act.c
++++ b/host/bluedroid/stack/avdt/avdt_scb_act.c
+@@ -24,6 +24,7 @@
+  ******************************************************************************/
+ 
+ #include <string.h>
++#include "stack/a2d_api.h"
+ #include "stack/bt_types.h"
+ #include "common/bt_target.h"
+ #include "common/bt_defs.h"
+@@ -243,96 +244,45 @@
+ *******************************************************************************/
+ void avdt_scb_hdl_pkt_no_frag(tAVDT_SCB *p_scb, tAVDT_SCB_EVT *p_data)
+ {
+-    UINT8   *p, *p_start;
+-    UINT8   o_v, o_p, o_x, o_cc;
+-    UINT8   m_pt;
+-    UINT8   marker;
+-    UINT16  seq;
+-    UINT32  time_stamp;
+-    UINT16  offset;
+-    UINT16  ex_len;
+-    UINT8   pad_len = 0;
+-    uint16_t len = p_data->p_pkt->len;
+-
+-    p = p_start = (UINT8 *)(p_data->p_pkt + 1) + p_data->p_pkt->offset;
+-
+-    /* parse media packet header */
+-    offset = 12; // AVDT_MSG_PRS_OCTET1(1) + AVDT_MSG_PRS_M_PT(1) + UINT16(2) + UINT32(4) + 4
+-    if (len < offset) {
+-        AVDT_TRACE_WARNING("hdl packet length %u too short: must be at least %u", len, offset);
+-        goto length_error;
+-    }
+-    AVDT_MSG_PRS_OCTET1(p, o_v, o_p, o_x, o_cc);
+-    AVDT_MSG_PRS_M_PT(p, m_pt, marker);
+-    BE_STREAM_TO_UINT16(seq, p);
+-    BE_STREAM_TO_UINT32(time_stamp, p);
+-    p += 4;
+-
+-    UNUSED(o_v);
+-
+-    /* skip over any csrc's in packet */
+-    offset += o_cc * 4;
+-    p += o_cc * 4;
+-    if (len < offset) {
+-        goto length_error;
+-    }
++    /* The RTP media header is no longer parsed here.
++     *
++     * With one codec it could be: SBC always carries an RTP header, so AVDTP could
++     * strip it and hand up the payload. With several it cannot. Plain aptX carries
++     * no RTP header at all, aptX HD carries one, AAC carries one and then LATM
++     * framing on top. Only the decoder knows what precedes its payload, so the
++     * packet goes up whole and the decoder's decode_packet_header() strips it.
++     *
++     * The bounds checks this function used to perform have moved with the parse,
++     * into a2dp_rtp_strip_header(), which every decoder shares. They were not
++     * dropped: a media packet is whatever the peer chose to send. */
++    UINT8   m_pt = 0;
++    UINT8   marker = 0;
++    UINT16  seq = 0;
++    UINT32  time_stamp = 0;
+ 
+-    /* check for and skip over extension header */
+-    if (o_x) {
+-        offset += 4;
+-        if (len < offset) {
+-            AVDT_TRACE_WARNING("hdl packet length %u too short: must be at least %u", len, offset);
+-            goto length_error;
+-        }
+-        p += 2;
+-        BE_STREAM_TO_UINT16(ex_len, p);
+-        if ((UINT32)ex_len * 4 > (UINT32)(len - offset)) {
+-            goto length_error;
+-        }
+-        p += ex_len * 4;
+-    }
++    UNUSED(seq);
+ 
+-    /* save our new offset */
+-    offset = (UINT16) (p - p_start);
+-    if (len <= offset) {
++    if (p_data->p_pkt->len == 0) {
++        AVDT_TRACE_WARNING("Got empty media packet");
+         goto length_error;
+     }
+ 
+-    /* adjust length for any padding at end of packet */
+-    if (o_p) {
+-        /* padding length in last byte of packet */
+-        pad_len =  *(p_start + len - 1);
+-    }
+-
+-    /* do sanity check */
+-    if (pad_len >= len - offset) {
+-        AVDT_TRACE_WARNING("Got bad media packet");
+-        goto length_error;
+-    }
+-    /* adjust offset and length and send it up */
+-    else {
+-        p_data->p_pkt->len -= (offset + pad_len);
+-        p_data->p_pkt->offset += offset;
+-
+-        if (p_scb->cs.p_data_cback != NULL) {
+-            /* report sequence number */
+-            p_data->p_pkt->layer_specific = seq;
+-            (*p_scb->cs.p_data_cback)(avdt_scb_to_hdl(p_scb), p_data->p_pkt,
+-                                      time_stamp, (UINT8)(m_pt | (marker << 7)));
+-        } else {
++    if (p_scb->cs.p_data_cback != NULL) {
++        (*p_scb->cs.p_data_cback)(avdt_scb_to_hdl(p_scb), p_data->p_pkt,
++                                  time_stamp, (UINT8)(m_pt | (marker << 7)));
++    } else {
+ #if AVDT_MULTIPLEXING == TRUE
+-            if ((p_scb->cs.p_media_cback != NULL)
+-                    && (p_scb->p_media_buf != NULL)
+-                    && (p_scb->media_buf_len > p_data->p_pkt->len)) {
+-                /* media buffer enough length is assigned by application. Lets use it*/
+-                memcpy(p_scb->p_media_buf, (UINT8 *)(p_data->p_pkt + 1) + p_data->p_pkt->offset,
+-                       p_data->p_pkt->len);
+-                (*p_scb->cs.p_media_cback)(avdt_scb_to_hdl(p_scb), p_scb->p_media_buf,
+-                                           p_data->p_pkt->len, time_stamp, seq, m_pt, marker);
+-            }
+-#endif
+-            goto length_error;
++        if ((p_scb->cs.p_media_cback != NULL)
++                && (p_scb->p_media_buf != NULL)
++                && (p_scb->media_buf_len > p_data->p_pkt->len)) {
++            /* media buffer enough length is assigned by application. Lets use it*/
++            memcpy(p_scb->p_media_buf, (UINT8 *)(p_data->p_pkt + 1) + p_data->p_pkt->offset,
++                   p_data->p_pkt->len);
++            (*p_scb->cs.p_media_cback)(avdt_scb_to_hdl(p_scb), p_scb->p_media_buf,
++                                       p_data->p_pkt->len, time_stamp, seq, m_pt, marker);
+         }
++#endif
++        goto length_error;
+     }
+     return;
+ 
+--- a/host/bluedroid/stack/include/stack/a2d_api.h
++++ b/host/bluedroid/stack/include/stack/a2d_api.h
+@@ -54,6 +54,9 @@
+ #define A2D_MEDIA_CT_M12        0x01    /* MPEG-1, 2 Audio media codec type */
+ #define A2D_MEDIA_CT_M24        0x02    /* MPEG-2, 4 AAC media codec type */
+ #define A2D_MEDIA_CT_ATRAC      0x04    /* ATRAC family media codec type */
++#define A2D_MEDIA_CT_NON_A2DP   0xFF    /* Non-A2DP media codec type (vendor-specific codec) */
++
++typedef uint8_t tA2D_CODEC_TYPE; /* A2DP Codec type: A2DP_MEDIA_CT_* */
+ 
+ #define A2D_SUCCESS           0     /* Success */
+ #define A2D_FAIL              0x0A  /* Failed */
+@@ -237,7 +240,7 @@
+ **                  A2D_SET_ZERO_BIT, if all bits clear
+ **                  A2D_SET_MULTL_BIT, if multiple bits are set
+ ******************************************************************************/
+-extern UINT8 A2D_BitsSet(UINT8 num);
++extern uint8_t A2D_BitsSet(uint64_t num);
+ 
+ /*******************************************************************************
+ **
+--- a/host/bluedroid/stack/include/stack/a2d_sbc.h
++++ b/host/bluedroid/stack/include/stack/a2d_sbc.h
+@@ -23,6 +23,11 @@
+  ******************************************************************************/
+ #ifndef A2D_SBC_H
+ #define A2D_SBC_H
++
++#include "bt_av.h"
++#include "a2d_api.h"
++#include "a2dp_codec_api.h"
++
+ #if (A2D_INCLUDED == TRUE)
+ /*****************************************************************************
+ **  Constants
+@@ -189,6 +194,208 @@
+ extern void A2D_ParsSbcMplHdr(UINT8 *p_src, BOOLEAN *p_frag,
+                               BOOLEAN *p_start, BOOLEAN *p_last,
+                               UINT8 *p_num);
++
++/******************************************************************************
++**
++** Function         A2DP_CodecNameSbc
++**
++** Description      Gets the A2DP SBC codec name for a given |p_codec_info|.
++**
++**                      p_codec_info:  Contains information about the codec capabilities.
++**
++** Returns          Codec name.
++**
++******************************************************************************/
++const char* A2DP_CodecNameSbc(const uint8_t* p_codec_info);
++
++// Checks whether the codec capabilities contain a valid A2DP SBC Sink codec.
++// NOTE: only codecs that are implemented are considered valid.
++// Returns true if |p_codec_info| contains information about a valid SBC codec,
++// otherwise false.
++/******************************************************************************
++**
++** Function         A2DP_IsSinkCodecValidSbc
++**
++** Description      Checks whether the codec capabilities contain a valid A2DP SBC Sink codec.
++**                  NOTE: only codecs that are implemented are considered valid.
++**
++**                      p_codec_info:  Contains information about the codec capabilities.
++**
++** Returns          true if |p_codec_info| contains information about a valid codec,
++**                  otherwise false.
++**
++******************************************************************************/
++bool A2DP_IsSinkCodecValidSbc(const uint8_t* p_codec_info);
++
++/******************************************************************************
++**
++** Function         A2DP_IsPeerSinkCodecValidSbc
++**
++** Description      Checks whether the codec capabilities contain a valid peer A2DP SBC Sink
++**                  codec.
++**                  NOTE: only codecs that are implemented are considered valid.
++**
++**                      p_codec_info:  contains information about the codec capabilities of the
++**                                     peer device.
++**
++** Returns          true if |p_codec_info| contains information about a valid SBC codec,
++**                  otherwise false.
++**
++******************************************************************************/
++extern bool A2DP_IsPeerSinkCodecValidSbc(const uint8_t* p_codec_info);
++
++/******************************************************************************
++**
++** Function         A2DP_IsSinkCodecSupportedSbc
++**
++** Description      Checks whether A2DP SBC Sink codec is supported.
++**
++**                      p_codec_info:  Contains information about the codec capabilities.
++**
++** Returns          true if the A2DP SBC Sink codec is supported, otherwise false.
++**
++******************************************************************************/
++extern tA2D_STATUS A2DP_IsSinkCodecSupportedSbc(const uint8_t* p_codec_info);
++
++
++/******************************************************************************
++**
++** Function         A2DP_IsPeerSourceCodecSupportedSbc
++**
++** Description      Checks whether an A2DP SBC Source codec for a peer Source device is
++**                  supported
++**
++**                      p_codec_info:  contains information about the codec capabilities of the
++**                                     peer device.
++**
++** Returns          true if the A2DP SBC Source codec for a peer Source device is
++**                  supported, otherwise false.
++**
++******************************************************************************/
++tA2D_STATUS A2DP_IsPeerSourceCodecSupportedSbc(const uint8_t* p_codec_info);
++
++/******************************************************************************
++**
++** Function         A2DP_SinkCodecIndexSbc
++**
++** Description      Gets the A2DP SBC Sink codec index for a given |p_codec_info|.
++**
++**                      p_codec_info:  Contains information about the codec capabilities.
++**
++** Returns          the corresponding |btav_a2dp_codec_index_t| on success,
++**                  otherwise |BTAV_A2DP_CODEC_INDEX_MAX|.
++**
++******************************************************************************/
++extern btav_a2dp_codec_index_t A2DP_SinkCodecIndexSbc(const uint8_t* p_codec_info);
++
++/******************************************************************************
++**
++** Function         A2DP_SourceCodecIndexSbc
++**
++** Description      Gets the A2DP SBC Source codec index for a given |p_codec_info|.
++**
++**                      p_codec_info:  Contains information about the codec capabilities.
++**
++** Returns          the corresponding |btav_a2dp_codec_index_t| on success,
++**                  otherwise |BTAV_A2DP_CODEC_INDEX_MAX|.
++**
++******************************************************************************/
++extern btav_a2dp_codec_index_t A2DP_SourceCodecIndexSbc(const uint8_t* p_codec_info);
++
++/******************************************************************************
++**
++** Function
++**
++** Description      Checks whether two A2DP SBC codecs |p_codec_info_a| and |p_codec_info_b|
++**                  have the same type.
++**
++**                      p_codec_info_a:  Contains information about the codec capabilities.
++**
++**                      p_codec_info_b:  Contains information about the codec capabilities.
++**
++** Returns          true if the two codecs have the same type, otherwise false.
++**
++******************************************************************************/
++extern bool A2DP_CodecTypeEqualsSbc(const uint8_t* p_codec_info_a,
++                                    const uint8_t* p_codec_info_b);
++
++/******************************************************************************
++**
++** Function         A2DP_InitCodecConfigSbc
++**
++** Description      Initializes A2DP codec-specific information into |p_result|.
++**                  The selected codec is defined by |codec_index|.
++**
++**                      codec_index:  Selected codec index.
++**
++**                  Output Parameters:
++**                      p_result:  The resulting codec information element.
++**
++** Returns          true on success, otherwise false.
++**
++******************************************************************************/
++bool A2DP_InitCodecConfigSbc(btav_a2dp_codec_index_t codec_index, UINT8 *p_result);
++
++/******************************************************************************
++**
++** Function         A2DP_InitCodecConfigSbcSink
++**
++** Description      Initializes A2DP codec-specific information into |p_result|.
++**                  The selected codec is defined by |codec_index|.
++**
++**                      p_codec_info:  Contains information about the codec capabilities.
++**
++** Returns          true on success, otherwise false.
++**
++******************************************************************************/
++bool A2DP_InitCodecConfigSbcSink(uint8_t* p_codec_info);
++
++/******************************************************************************
++**
++** Function         A2DP_InitCodecConfigSbcSrc
++**
++** Description      Initializes A2DP codec-specific information into |p_result|.
++**                  The selected codec is defined by |codec_index|.
++**
++**                      p_codec_info:  Contains information about the codec capabilities.
++**
++** Returns          true on success, otherwise false.
++**
++******************************************************************************/
++bool A2DP_InitCodecConfigSbcSrc(uint8_t* p_codec_info);
++
++/******************************************************************************
++**
++** Function         A2DP_BuildCodecConfigSbc
++**
++** Description      Build codec info from a source config
++**
++**                      p_src_cap:  Codec capabilities of the A2DP source.
++**
++**                  Output Parameters:
++**                      p_result:  The resulting codec capabilities.
++**
++** Returns          true on success, otherwise false.
++**
++******************************************************************************/
++bool A2DP_BuildCodecConfigSbc(UINT8 *p_src_cap, UINT8 *p_result);
++
++/******************************************************************************
++**
++** Function         A2DP_GetDecoderInterfaceSbc
++**
++** Description      Gets the A2DP SBC decoder interface that can be used to decode received A2DP
++**                  packets
++**
++**                      p_codec_info:  contains the codec information.
++**
++** Returns          the A2DP SBC decoder interface if the |p_codec_info| is valid and
++**                  supported, otherwise NULL.
++**
++******************************************************************************/
++const tA2DP_DECODER_INTERFACE* A2DP_GetDecoderInterfaceSbc(
++    const uint8_t* p_codec_info);
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/Kconfig
++++ b/Kconfig
+@@ -63,6 +63,35 @@
+         source "$IDF_PATH/components/bt/host/bluedroid/Kconfig.in"
+     endmenu
+ 
++    menu "A2DP decoders"
++        depends on BT_BLUEDROID_ENABLED && BT_A2DP_ENABLE
++
++        # These options live here, and not in host/bluedroid/Kconfig.in with the
++        # rest of the A2DP settings, for a reason worth knowing: the source line
++        # above reads $IDF_PATH, the shared tree, not this component. A patch to
++        # any Kconfig.in under components/bt is therefore read by nobody and fails
++        # silently -- the build simply says "unknown kconfig symbol" and carries on
++        # with the codec turned off. This file is the component's own Kconfig and
++        # is read from wherever the component actually is.
++
++        config BT_A2DP_APTX_DECODER
++            bool "aptX and aptX HD"
++            default n
++            help
++                Registers stream endpoints for aptX and aptX HD and decodes them
++                with libfreeaptx. The wrapper is public domain or CC0; the decoder
++                core is LGPL-2.1.
++
++        config BT_A2DP_AAC_DECODER
++            bool "AAC-LC"
++            default n
++            help
++                Registers an MPEG-2/4 AAC stream endpoint and decodes it with Helix
++                from RealNetworks: fixed point, AAC-LC only, no SBR. Licensed under
++                the RPSL or the RCSL.
++
++    endmenu
++
+     menu "NimBLE Options"
+         depends on BT_NIMBLE_ENABLED
+         source "$IDF_PATH/components/bt/host/nimble/Kconfig.in"
