@@ -68,6 +68,10 @@ void link_send_gpio_map(const satlink_gpio_map_t *map);
 void link_send_adc_value(uint8_t index, uint16_t raw, uint16_t mv);
 void link_send_log(uint8_t level, const char *text);
 
+void link_send_cover_reset(uint32_t nonce, uint32_t generation);
+void link_send_cover_data(uint32_t nonce, uint32_t generation, uint32_t total,
+                          uint32_t offset, const uint8_t *data, uint16_t len);
+
 /* One chunk of cover art. The caller does the slicing; this only frames it. */
 void link_send_cover(uint16_t chunk, uint16_t total, uint8_t mime,
                      uint32_t total_len, const uint8_t *data, uint16_t len);

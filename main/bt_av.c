@@ -1,4 +1,5 @@
 #include "bt_av.h"
+#include "satlink/cover_wire.h"
 
 #include <inttypes.h>
 #include <string.h>
@@ -147,6 +148,13 @@ typedef struct {
 static QueueHandle_t s_queue;
 #define BT_EVENT_FORMAT_READY 0xff00
 static atomic_bool s_caps_pending;
+static atomic_bool s_cover_refresh;
+static atomic_bool s_cover_query;
+static atomic_uint s_cover_epoch;
+static atomic_bool s_cover_sending;
+static uint32_t s_cover_nonce;
+typedef struct { uint8_t *data; size_t len; uint32_t generation; } cover_job_t;
+static QueueHandle_t s_cover_queue;
 static atomic_uint s_latest_codec_epoch;
 static uint32_t s_codec_epoch;
 static fmt_barrier_t s_format;
@@ -183,6 +191,12 @@ static struct {
     char     art_handle[8];         /* seven characters and a terminator */
     uint8_t *art;                   /* grown while a transfer runs, freed after */
     size_t   art_len;
+    bool     art_connected;
+    bool     art_connecting;
+    bool     art_supported;
+    uint32_t art_generation;
+    uint32_t art_done_generation;
+    char     art_request[8];
     bool     art_busy;
     bool     art_oversize;
 } s_now;
@@ -301,6 +315,8 @@ static void begin_format(uint32_t rate, uint8_t bits, uint8_t channels, uint8_t 
 
 void bt_av_apply_host_caps(void)
 {
+    atomic_store(&s_cover_refresh, true);
+    atomic_store(&s_cover_query, true);
     atomic_store(&s_caps_pending, true);
 }
 
@@ -315,6 +331,11 @@ void bt_av_format_ready(const fmt_ready_t *ready)
 static void poll_format(void)
 {
     const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (atomic_exchange(&s_cover_query, false)) {
+        // This task requests metadata; all cover state stays on the BTC callback task.
+        if (esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS) != ESP_OK)
+            atomic_store(&s_cover_refresh, false);
+    }
     if (atomic_exchange(&s_caps_pending, false) && s_now.rate_hz) {
         uint32_t caps = link_host_caps();
         bool ack = (caps & FMT_HOST_CAP) != 0;
@@ -353,6 +374,8 @@ void bt_av_report_state(void)
 
 void bt_av_report_stream_fmt(void)
 {
+    atomic_store(&s_cover_refresh, true);
+    atomic_store(&s_cover_query, true);
     atomic_store(&s_caps_pending, true);
 }
 
@@ -408,130 +431,111 @@ static void pos_tick(void *arg)
 
 static void cover_reset(void)
 {
-    free(s_now.art);
-    s_now.art = NULL;
-    s_now.art_len = 0;
-    s_now.art_busy = false;
-    s_now.art_oversize = false;
+    free(s_now.art); s_now.art = NULL; s_now.art_len = 0;
+    s_now.art_busy = false; s_now.art_oversize = false;
 }
 
-static uint8_t cover_mime(const uint8_t *data, size_t len)
+static void cover_new_track(void)
 {
-    if (len >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF) {
-        return SATLINK_MIME_JPEG;
-    }
-    if (len >= 4 && data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G') {
-        return SATLINK_MIME_PNG;
-    }
-    return SATLINK_MIME_UNKNOWN;
+    // Keep draining an old OBEX response, but it cannot be sent under the new ID.
+    uint32_t gen = atomic_fetch_add(&s_cover_epoch, 1) + 1;
+    if (!gen) gen = atomic_fetch_add(&s_cover_epoch, 1) + 1;
+    s_now.art_handle[0] = 0;
+    link_send_cover_reset(s_cover_nonce, gen);
 }
 
-/* Only when the host asked for covers. With no host the bit is clear, so none of
- * this runs and the behaviour of a device sitting on its own is unchanged. */
 static void cover_fetch(void)
 {
-    if (s_now.art_busy || s_now.art_handle[0] == '\0') {
+    if (s_now.art_busy || !s_now.avrcp_up || !s_now.art_supported ||
+        atomic_load(&s_cover_sending) || !(link_host_caps() & SATLINK_HOST_CAP_COVER)) return;
+    // Android may withhold the handle until OBEX is connected. Match IDF's example:
+    // connect on remote features, then request metadata again on OBEX connected.
+    if (!s_now.art_connected) {
+        if (!s_now.art_connecting) {
+            const esp_err_t err = esp_avrc_ct_cover_art_connect(ESP_AVRC_CA_MTU_MAX);
+            s_now.art_connecting = err == ESP_OK;
+            if (err != ESP_OK) ESP_LOGW(TAG, "cover art: connect: %s", esp_err_to_name(err));
+        }
         return;
     }
-    if ((link_host_caps() & SATLINK_HOST_CAP_COVER) == 0) {
-        return;
-    }
+    if (!s_now.art_handle[0] || s_now.art_done_generation == atomic_load(&s_cover_epoch)) return;
     s_now.art_busy = true;
-    s_now.art_oversize = false;
-    if (esp_avrc_ct_cover_art_connect(ESP_AVRC_CA_MTU_MAX) != ESP_OK) {
-        ESP_LOGW(TAG, "cover art: the phone would not open an OBEX channel");
-        s_now.art_busy = false;
+    s_now.art_generation = atomic_load(&s_cover_epoch);
+    memcpy(s_now.art_request, s_now.art_handle, sizeof s_now.art_request);
+    esp_err_t err = esp_avrc_ct_cover_art_get_linked_thumbnail((uint8_t *)s_now.art_request);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "cover art: request rejected: %s", esp_err_to_name(err));
+        cover_reset();
     }
 }
 
-static void cover_send(void)
+// Never wait for UART capacity on the Bluetooth stack's callback task.
+static void cover_sender(void *arg)
 {
-    uint16_t total = (uint16_t)((s_now.art_len + SATLINK_COVER_CHUNK_MAX - 1) /
-                                SATLINK_COVER_CHUNK_MAX);
-    uint8_t mime = cover_mime(s_now.art, s_now.art_len);
-
-    ESP_LOGI(TAG, "cover art: %u bytes, %u chunks, mime %u",
-             (unsigned)s_now.art_len, total, mime);
-
-    /*
-     * Paced, because this is the one producer that can outrun the wire.
-     *
-     * A 48 KB image is 48 chunks and the droppable queue holds fourteen; when it
-     * is full the oldest entry is discarded, which is precisely the chunks the
-     * host needs first. Pushing the lot without pacing delivered images with
-     * their heads missing -- and quietly evicted whatever TRACK_POS or LOG was
-     * queued behind them. A kilobyte is about twenty-three milliseconds of wire
-     * at 460800 baud, so waiting is the honest thing to do.
-     *
-     * The wait is bounded: if the link is not draining, giving up beats blocking
-     * this task for ever, and a cover is the most droppable thing there is.
-     */
-    for (uint16_t i = 0; i < total; i++) {
-        int waited_ms = 0;
-        while (link_bulk_pending() > (LINK_BULK_COVER_HEADROOM) && waited_ms < 2000) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            waited_ms += 10;
+    (void)arg;
+    cover_job_t job;
+    for (;;) {
+        if (xQueueReceive(s_cover_queue, &job, portMAX_DELAY) != pdTRUE) continue;
+        bool complete = true;
+        for (uint32_t off = 0; off < job.len; off += COVER_PART_MAX) {
+            int waited = 0;
+            while (link_bulk_pending() > LINK_BULK_COVER_HEADROOM && waited < 2000 &&
+                   job.generation == atomic_load(&s_cover_epoch)) {
+                vTaskDelay(pdMS_TO_TICKS(10)); waited += 10;
+            }
+            if (waited >= 2000 || job.generation != atomic_load(&s_cover_epoch) ||
+                !(link_host_caps() & SATLINK_HOST_CAP_COVER)) { complete = false; break; }
+            size_t len = job.len - off;
+            if (len > COVER_PART_MAX) len = COVER_PART_MAX;
+            link_send_cover_data(s_cover_nonce, job.generation, job.len, off, job.data+off, len);
         }
-        if (waited_ms >= 2000) {
-            ESP_LOGW(TAG, "cover art: link not draining, abandoning at chunk %u of %u",
-                     i, total);
-            return;
-        }
-
-        size_t offset = (size_t)i * SATLINK_COVER_CHUNK_MAX;
-        size_t n = s_now.art_len - offset;
-        if (n > SATLINK_COVER_CHUNK_MAX) { n = SATLINK_COVER_CHUNK_MAX; }
-        link_send_cover(i, total, mime, (uint32_t)s_now.art_len,
-                        s_now.art + offset, (uint16_t)n);
+        ESP_LOGI(TAG, "cover art: %u bytes, generation %lu, %s", (unsigned)job.len,
+                 (unsigned long)job.generation, complete ? "queued" : "cancelled");
+        free(job.data);
+        atomic_store(&s_cover_sending, false);
+        if (job.generation != atomic_load(&s_cover_epoch))
+            esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS);
     }
 }
 
 static void cover_on_data(const esp_avrc_ct_cb_param_t *param)
 {
+    if (!s_now.art_busy) return;
     if (param->cover_art_data.status != ESP_BT_STATUS_SUCCESS) {
         ESP_LOGW(TAG, "cover art: transfer failed");
-        cover_reset();
-        esp_avrc_ct_cover_art_disconnect();
-        return;
+        cover_reset(); esp_avrc_ct_cover_art_disconnect(); return;
     }
-
+    bool stale = s_now.art_generation != atomic_load(&s_cover_epoch);
     size_t len = param->cover_art_data.data_len;
-    if (!s_now.art_oversize && len != 0) {
-        if (s_now.art_len + len > BT_COVER_MAX_BYTES) {
-            /* Stop collecting but keep draining: abandoning mid-transfer would
-             * leave the OBEX channel in a state the phone has to time out of. */
-            ESP_LOGW(TAG, "cover art: over %d bytes, not sending it at all",
-                     BT_COVER_MAX_BYTES);
-            s_now.art_oversize = true;
-            free(s_now.art);
-            s_now.art = NULL;
-            s_now.art_len = 0;
-        } else {
+    if (!stale && !s_now.art_oversize && len) {
+        if (len > BT_COVER_MAX_BYTES - s_now.art_len) s_now.art_oversize = true;
+        else {
             uint8_t *grown = realloc(s_now.art, s_now.art_len + len);
-            if (grown == NULL) {
-                ESP_LOGW(TAG, "cover art: out of memory at %u bytes",
-                         (unsigned)s_now.art_len);
-                s_now.art_oversize = true;
-                free(s_now.art);
-                s_now.art = NULL;
-                s_now.art_len = 0;
-            } else {
-                memcpy(grown + s_now.art_len, param->cover_art_data.p_data, len);
-                s_now.art = grown;
-                s_now.art_len += len;
+            if (!grown) s_now.art_oversize = true;
+            else {
+                memcpy(grown+s_now.art_len, param->cover_art_data.p_data, len);
+                s_now.art = grown; s_now.art_len += len;
             }
         }
+        if (s_now.art_oversize) {
+            ESP_LOGW(TAG, "cover art: thumbnail exceeds memory budget");
+            free(s_now.art); s_now.art=NULL; s_now.art_len=0;
+        }
     }
-
-    if (!param->cover_art_data.final) {
-        return;
-    }
-
-    if (!s_now.art_oversize && s_now.art_len > 0) {
-        cover_send();
+    if (!param->cover_art_data.final) return;
+    if (!stale && !s_now.art_oversize && s_now.art_len >= 3 &&
+        s_now.art[0] == 0xff && s_now.art[1] == 0xd8 && s_now.art[2] == 0xff) {
+        cover_job_t job = {s_now.art, s_now.art_len, s_now.art_generation};
+        atomic_store(&s_cover_sending, true);
+        if (xQueueSend(s_cover_queue, &job, 0) == pdTRUE) {
+            s_now.art = NULL;
+            s_now.art_done_generation = s_now.art_generation;
+        }
+        else atomic_store(&s_cover_sending, false);
     }
     cover_reset();
-    esp_avrc_ct_cover_art_disconnect();
+    // Preserve the OBEX session and its image handles between tracks.
+    if (stale) cover_fetch();
 }
 
 static uint8_t play_state_from_avrc(esp_avrc_playback_stat_t st)
@@ -765,6 +769,7 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
     case ESP_AVRC_CT_CONNECTION_STATE_EVT:
         s_now.avrcp_up = param->conn_stat.connected;
         ESP_LOGI(TAG, "avrcp %s", s_now.avrcp_up ? "connected" : "disconnected");
+        cover_new_track();
         if (s_now.avrcp_up) {
             esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS);
             /* Ask what the phone is willing to notify us about before subscribing
@@ -774,7 +779,9 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         } else {
             s_now.has_play_pos = false;
             s_now.play_state = SATLINK_PLAY_STOPPED;
-            s_now.art_handle[0] = '\0';
+            s_now.art_connected = false;
+            s_now.art_connecting = false;
+            s_now.art_supported = false;
             cover_reset();
         }
         break;
@@ -813,6 +820,10 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
     }
 
     case ESP_AVRC_CT_METADATA_RSP_EVT:
+        if (atomic_exchange(&s_cover_refresh, false)) {
+            cover_new_track();
+            cover_fetch();
+        }
         switch (param->meta_rsp.attr_id) {
         case ESP_AVRC_MD_ATTR_TITLE:
             copy_attr(s_now.title, sizeof(s_now.title),
@@ -827,8 +838,16 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
                       param->meta_rsp.attr_text, param->meta_rsp.attr_length);
             break;
         case ESP_AVRC_MD_ATTR_COVER_ART:
+            if (param->meta_rsp.attr_length != 7 || !param->meta_rsp.attr_text) {
+                if (s_now.art_handle[0]) cover_new_track();
+                ESP_LOGI(TAG, "cover art: no image handle for this track");
+                break;
+            }
+            if (s_now.art_handle[0] && memcmp(s_now.art_handle, param->meta_rsp.attr_text, 7))
+                cover_new_track();
             copy_attr(s_now.art_handle, sizeof(s_now.art_handle),
                       param->meta_rsp.attr_text, param->meta_rsp.attr_length);
+            ESP_LOGI(TAG, "cover art: handle %.7s", s_now.art_handle);
             cover_fetch();
             break;
         case ESP_AVRC_MD_ATTR_PLAYING_TIME: {
@@ -855,6 +874,8 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
     case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
         switch (param->change_ntf.event_id) {
         case ESP_AVRC_RN_TRACK_CHANGE:
+            cover_new_track();
+            s_now.title[0] = s_now.artist[0] = s_now.album[0] = 0;
             /* Notifications fire once. Re-arm or this is the last one. */
             esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS);
             esp_avrc_ct_send_get_play_status_cmd(TL_PLAY_STATUS);
@@ -895,14 +916,13 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         break;
 
     case ESP_AVRC_CT_COVER_ART_STATE_EVT:
-        if (param->cover_art_state.state == ESP_AVRC_COVER_ART_CONNECTED) {
-            /* The linked thumbnail rather than the full image: it is the one size
-             * BIP guarantees exists, and the only one this board has room for. */
-            esp_avrc_ct_cover_art_get_linked_thumbnail((uint8_t *)s_now.art_handle);
-        } else {
-            if (s_now.art_busy) {
-                ESP_LOGW(TAG, "cover art: channel closed mid-transfer");
-            }
+        s_now.art_connecting = false;
+        s_now.art_connected = param->cover_art_state.state == ESP_AVRC_COVER_ART_CONNECTED;
+        if (s_now.art_connected) {
+            ESP_LOGI(TAG, "cover art: OBEX connected");
+            esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS);
+        } else if (!s_now.art_connected) {
+            if (s_now.art_busy) ESP_LOGW(TAG, "cover art: channel closed, reason %d", param->cover_art_state.reason);
             cover_reset();
         }
         break;
@@ -918,6 +938,9 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         break;
 
     case ESP_AVRC_CT_REMOTE_FEATURES_EVT:
+        s_now.art_supported = (param->rmt_feats.tg_feat_flag & ESP_AVRC_FEAT_FLAG_TG_COVER_ART) != 0;
+        ESP_LOGI(TAG, "cover art: peer support %s", s_now.art_supported ? "yes" : "no");
+        cover_fetch();
         ESP_LOGI(TAG, "peer avrcp features 0x%" PRIx32 ", tg flag 0x%x",
                  param->rmt_feats.feat_mask, param->rmt_feats.tg_feat_flag);
         break;
@@ -1097,6 +1120,11 @@ void bt_av_set_radio(bool on, bool discoverable, bool disconnect)
 
 esp_err_t bt_av_start(const char *device_name)
 {
+    do { s_cover_nonce = esp_random(); } while (!s_cover_nonce);
+    s_cover_queue = xQueueCreate(1, sizeof(cover_job_t));
+    ESP_RETURN_ON_FALSE(s_cover_queue, ESP_ERR_NO_MEM, TAG, "cover queue");
+    ESP_RETURN_ON_FALSE(xTaskCreate(cover_sender, "cover_tx", 3072, NULL, 2, NULL) == pdPASS,
+                        ESP_ERR_NO_MEM, TAG, "cover sender");
     s_now.state = SATLINK_BT_OFF;
     s_now.codec = SATLINK_CODEC_NONE;
     s_now.play_state = SATLINK_PLAY_STOPPED;

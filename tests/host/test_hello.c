@@ -79,6 +79,10 @@ int main(void) {
     receive_hello(1, 4, 0x39); CHECK(s_host_caps == 0x39);
     receive_hello(1, 4, 0x29); CHECK(s_host_caps == 0x09);
     receive_hello(1, 4, 0x38); CHECK(s_host_caps == 0x18);
+    // Track-scoped covers must never be sent to a legacy cover consumer.
+    receive_hello(1, 4, 0x3b); CHECK(s_host_caps == 0x39);
+    receive_hello(1, 5, 0x3b); CHECK(s_host_caps == 0x3b);
+    receive_hello(1, 5, 0x39); CHECK(s_host_caps == 0x39);
     // A known incompatible host is not a lost greeting; do not retry forever.
     reset_case(); answer_hello(); receive_hello(2, 0, 0);
     CHECK(s_peer_incompatible); CHECK(!s_host_present); CHECK(callbacks == 0);

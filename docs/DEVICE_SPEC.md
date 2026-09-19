@@ -193,3 +193,7 @@ Rates: 44.1/48/96 kHz; stereo, 16/24 source bits, 5 ms framing. No 192 kHz,
 lossless, LL or spatial features are advertised. 96 kHz needs host HELLO 1.4
 with RELOCK, FORMAT_READY and 96KHZ; no resampling or forced widening is added.
 Runtime performance and audio fidelity need bench verification with an LHDC V5 source.
+
+## Cover integration (2026-09-20)
+
+Protocol 1.5 uses track-scoped JPEG RESET/DATA, gated by host bit 1 and minor >=5. Linked thumbnails only, 48 KiB local memory ceiling, independent paced sender. See `BT_COVER_2026-09-20.md`.

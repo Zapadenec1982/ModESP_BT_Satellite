@@ -1,4 +1,5 @@
 #include "link.h"
+#include "satlink/cover_wire.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -127,7 +128,7 @@ static bool type_is_droppable(uint8_t type)
 {
     return type == SATLINK_MSG_TRACK_POS ||
            type == SATLINK_MSG_LOG ||
-           type == SATLINK_MSG_COVER;
+           type == SATLINK_MSG_COVER || type == COVER_DATA;
 }
 
 static void tx_item_free(tx_item_t *item)
@@ -334,6 +335,25 @@ void link_send_adc_value(uint8_t index, uint16_t raw, uint16_t mv)
     if (len != 0) { tx_push(SATLINK_MSG_ADC_VALUE, payload, len); }
 }
 
+void link_send_cover_reset(uint32_t nonce, uint32_t generation)
+{
+    if (!(link_host_caps() & SATLINK_HOST_CAP_COVER)) return;
+    uint8_t p[8]; cover_put32(p, nonce); cover_put32(p+4, generation);
+    tx_push(COVER_RESET, p, sizeof p);
+}
+
+void link_send_cover_data(uint32_t nonce, uint32_t generation, uint32_t total,
+                          uint32_t offset, const uint8_t *data, uint16_t len)
+{
+    if (!(link_host_caps() & SATLINK_HOST_CAP_COVER) || len > COVER_PART_MAX) return;
+    // Only the dedicated cover sender calls this. tx_push copies before returning.
+    static uint8_t p[16 + COVER_PART_MAX];
+    cover_put32(p, nonce); cover_put32(p+4, generation);
+    cover_put32(p+8, total); cover_put32(p+12, offset);
+    memcpy(p+16, data, len);
+    tx_push(COVER_DATA, p, 16+len);
+}
+
 void link_send_cover(uint16_t chunk, uint16_t total, uint8_t mime,
                      uint32_t total_len, const uint8_t *data, uint16_t len)
 {
@@ -429,6 +449,7 @@ static void handle_hello(const uint8_t *payload, size_t len)
     uint32_t caps = fmt_ack_capable(h.minor, h.caps) ? h.caps : (h.caps & ~FMT_HOST_CAP);
     if (h.minor < 4 || !(caps & FMT_HOST_CAP) || !(caps & SATLINK_HOST_CAP_RELOCK))
         caps &= ~SATLINK_HOST_CAP_96KHZ;
+    if (h.minor < 5) caps &= ~SATLINK_HOST_CAP_COVER;
     __atomic_store_n(&s_host_caps, caps, __ATOMIC_SEQ_CST);
     ESP_LOGI(TAG, "host %u.%u, caps 0x%08" PRIx32 ", build \"%.*s\"",
              h.major, h.minor, h.caps, (int)h.build.len, h.build.ptr);

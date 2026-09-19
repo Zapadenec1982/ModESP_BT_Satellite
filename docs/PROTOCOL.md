@@ -13,9 +13,10 @@
 
 Доповнює `DEVICE_SPEC.md`. Тут розкладки, яких там бракувало.
 
-Ця версія **1.4** і вона узгоджена з другою реалізацією. Міняти можна, але правкою тут і
+Ця версія **1.5** і вона узгоджена з другою реалізацією. Міняти можна, але правкою тут і
 підняттям `proto_minor`.
 
+- **1.5** — track-scoped JPEG covers (RESET/DATA); asynchronous transfer and decoding.
 - **1.4** — LHDC V5 codec ID 5; host capability bit 5 authorizes 96 kHz.
 - **1.3** — optional acknowledged format transitions (`STREAM_PREPARE` / `STREAM_READY`),
   host capability bit 4; native decoder slot widths for capable hosts. Legacy layouts unchanged.
@@ -447,3 +448,34 @@ The STREAM_FMT + 50 ms rule below describes compatibility with legacy peers.
 Якщо хост у HELLO **не** виставив біт 0 (уміє перелочитись), пристрій анонсує в A2DP **тільки
 44,1 кГц**, щоб телефон не мав з чого вибирати. Це простіше й чесніше, ніж міняти частоту
 під хостом, який цього не переживе.
+
+
+### Track-scoped JPEG covers (protocol 1.5)
+
+Host capability bit 1 enables these messages only with host minor >= 5.
+New hosts do not consume legacy COVER 0x14; pre-1.5 hosts receive no cover
+from this implementation. Audio/metadata remain compatible. Existing layouts
+and framing sizes are unchanged.
+
+`0x17 COVER_RESET`, device to host, critical queue: `u32 boot_nonce`,
+`u32 track_generation`. Both nonzero. A new pair clears the displayed Bluetooth
+cover and cancels assembly/decode of the old image. A repeated pair is idempotent.
+Sent on AVRCP connection/track change and host refresh, before fetching the image.
+No image/unsupported phone means the tile remains empty. File covers are separate.
+
+`0x18 COVER_DATA`, device to host, droppable queue: `u32 boot_nonce`,
+`u32 track_generation`, `u32 total_bytes`, `u32 offset`, followed by 1..1000
+JPEG bytes. All integers little endian. There is no inner length: frame payload
+length minus 16 gives the byte count. Every non-final part has 1000 bytes.
+Host requires the current RESET pair, offset zero first, contiguous offsets,
+identical total size and an exact final length. Unknown/old pairs are ignored.
+A gap/duplicate/malformed current part aborts assembly; a missing tail times out
+after 5 seconds. Never publish a partial image. Hard protocol bound 256 KiB;
+this WROOM sender collects at most 48 KiB and only requests linked thumbnails.
+Maximum new payload is 1016 bytes, within the existing 1036-byte limit.
+
+RESET has priority over queued old DATA; the pair prevents cross-track mixing.
+Bluetooth callbacks never wait for UART draining. A separate low-priority task
+paces DATA and abandons it if the epoch changes or the queue stalls for 2 s.
+The P4 receives into PSRAM; JPEG decoding is off the UART/module task, and
+publication checks the current generation again after decoding.

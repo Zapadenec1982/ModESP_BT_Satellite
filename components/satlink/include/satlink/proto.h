@@ -13,7 +13,7 @@
 #define SATLINK_PROTO_MAJOR   1
 /* 1.3: optional correlated STREAM_PREPARE / STREAM_READY transitions.
  * Legacy STREAM_FMT layouts remain unchanged. */
-#define SATLINK_PROTO_MINOR   4
+#define SATLINK_PROTO_MINOR   5
 
 /* The largest decoded frame: type | seq | payload | crc16. */
 #define SATLINK_FRAME_MAX     1040
