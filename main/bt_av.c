@@ -1,5 +1,4 @@
 #include "bt_av.h"
-#include "cover_buffer.h"
 #include "cover_stream.h"
 #include "esp_heap_caps.h"
 #include "satlink/cover_wire.h"
@@ -99,19 +98,17 @@ static const char *TAG = "sat.bt";
                          ESP_AVRC_MD_ATTR_COVER_ART)
 
 /*
- * How large a cover this device will carry.
+ * Covers are streamed, never collected.
  *
- * The protocol's ceiling is 256 KB, which this board does not have: a WROOM has
- * no PSRAM and Bluedroid has already taken its share. What AVRCP calls the linked
- * thumbnail is a 200x200 image and runs to a few kilobytes, so 48 KB is generous
- * for what is actually asked for and affordable with what is actually here.
- * Anything larger is not sent at all, per the protocol: a truncated image is
- * worse than none, because the host cannot tell it from a lost tail.
+ * This board has no PSRAM and about 47 KB of heap free while LHDC plays. The
+ * 48 KB store-and-forward path that served protocol 1.5 hosts took that heap in
+ * 1000-byte pieces, in competition with the decoder, and the bench showed
+ * `ring full` bursts right after every "cover art ... queued" on it while the
+ * 1.6 streaming path showed none (docs/BT_COVER_2026-09-20.md). The 1.6 path
+ * copies each OBEX chunk straight into one bounded UART frame and keeps nothing.
+ * A host that speaks less than 1.6 therefore gets no cover at all: a missing
+ * image is a blank tile, a starved decoder is a click.
  */
-#define BT_COVER_MAX_BYTES  (48 * 1024)
-
-/* Leave room in the droppable queue for the telemetry that shares it, so a cover
- * transfer does not evict a TRACK_POS or a LOG on its way past. */
 
 /* Transaction labels. AVRCP allows sixteen; giving each conversation its own
  * makes a packet capture readable. */
@@ -153,10 +150,7 @@ static atomic_bool s_caps_pending;
 static atomic_bool s_cover_refresh;
 static atomic_bool s_cover_query;
 static atomic_uint s_cover_epoch;
-static atomic_bool s_cover_sending;
 static uint32_t s_cover_nonce;
-typedef struct { cover_buffer_t image; uint32_t generation; } cover_job_t;
-static QueueHandle_t s_cover_queue;
 static atomic_uint s_latest_codec_epoch;
 static uint32_t s_codec_epoch;
 static fmt_barrier_t s_format;
@@ -191,9 +185,7 @@ static struct {
     bool     has_play_pos;          /* the phone will notify about position */
 
     char     art_handle[8];         /* seven characters and a terminator */
-    cover_buffer_t art;             /* ownership moves to the UART sender */
-    cover_stream_t art_stream;
-    bool art_streaming;
+    cover_stream_t art_stream;      /* the image in flight: offset, CRC, JPEG magic */
     bool     art_connected;
     bool     art_connecting;
     bool     art_supported;
@@ -201,7 +193,6 @@ static struct {
     uint32_t art_done_generation;
     char     art_request[8];
     bool     art_busy;
-    bool     art_oversize;
 } s_now;
 
 static esp_timer_handle_t s_meta_timer;
@@ -434,9 +425,8 @@ static void pos_tick(void *arg)
 
 static void cover_reset(void)
 {
-    cover_buffer_clear(&s_now.art);
-    s_now.art_stream=(cover_stream_t){0};
-    s_now.art_busy = false; s_now.art_oversize = false;
+    s_now.art_stream = (cover_stream_t){0};
+    s_now.art_busy = false;
 }
 
 static void cover_new_track(void)
@@ -450,8 +440,10 @@ static void cover_new_track(void)
 
 static void cover_fetch(void)
 {
+    /* COVER_STREAM_CAP rather than the bare cover bit: a 1.5 host would need
+     * the collected image this build no longer keeps, so it is offered none. */
     if (s_now.art_busy || !s_now.avrcp_up || !s_now.art_supported ||
-        atomic_load(&s_cover_sending) || !(link_host_caps() & SATLINK_HOST_CAP_COVER)) return;
+        !(link_host_caps() & COVER_STREAM_CAP)) return;
     // Android may withhold the handle until OBEX is connected. Match IDF's example:
     // connect on remote features, then request metadata again on OBEX connected.
     if (!s_now.art_connected) {
@@ -464,7 +456,6 @@ static void cover_fetch(void)
     }
     if (!s_now.art_handle[0] || s_now.art_done_generation == atomic_load(&s_cover_epoch)) return;
     s_now.art_busy = true;
-    s_now.art_streaming=(link_host_caps() & COVER_STREAM_CAP)!=0;
     s_now.art_generation = atomic_load(&s_cover_epoch);
     memcpy(s_now.art_request, s_now.art_handle, sizeof s_now.art_request);
     esp_err_t err = esp_avrc_ct_cover_art_get_linked_thumbnail((uint8_t *)s_now.art_request);
@@ -472,46 +463,6 @@ static void cover_fetch(void)
         ESP_LOGW(TAG, "cover art: request rejected: %s", esp_err_to_name(err));
         cover_reset();
     }
-}
-
-// Never wait for UART capacity on the Bluetooth stack's callback task.
-static void cover_sender(void *arg)
-{
-    (void)arg;
-    cover_job_t job;
-    for (;;) {
-        if (xQueueReceive(s_cover_queue, &job, portMAX_DELAY) != pdTRUE) continue;
-        bool complete = true;
-        uint32_t off = 0;
-        const size_t total = job.image.size;
-        while (job.image.head) {
-            int waited = 0;
-            while (link_bulk_pending() > LINK_BULK_COVER_HEADROOM && waited < 2000 &&
-                   job.generation == atomic_load(&s_cover_epoch)) {
-                vTaskDelay(pdMS_TO_TICKS(10)); waited += 10;
-            }
-            if (waited >= 2000 || job.generation != atomic_load(&s_cover_epoch) ||
-                !(link_host_caps() & SATLINK_HOST_CAP_COVER)) { complete = false; break; }
-            cover_block_t *block = job.image.head;
-            link_send_cover_data(s_cover_nonce, job.generation, total, off, block->data, block->used);
-            off += block->used;
-            job.image.head = block->next;
-            free(block);
-        }
-        ESP_LOGI(TAG, "cover art: %u bytes, generation %lu, %s", (unsigned)total,
-                 (unsigned long)job.generation, complete ? "queued" : "cancelled");
-        cover_buffer_clear(&job.image);
-        atomic_store(&s_cover_sending, false);
-        if (job.generation != atomic_load(&s_cover_epoch))
-            esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS);
-    }
-}
-
-// Software reserve for Bluetooth/control allocations; never consume the last heap.
-static void *cover_allocate(size_t bytes)
-{
-    if (heap_caps_get_free_size(MALLOC_CAP_8BIT) < bytes + 16 * 1024) return NULL;
-    return malloc(bytes);
 }
 
 static bool cover_emit(void *ctx, uint32_t offset, const uint8_t *data,
@@ -522,6 +473,8 @@ static bool cover_emit(void *ctx, uint32_t offset, const uint8_t *data,
            link_try_cover_stream(s_cover_nonce,s_now.art_generation,offset,data,len,crc);
 }
 
+/* Runs on the Bluetooth stack's callback task: the bytes are borrowed, so each
+ * chunk is copied into its UART frame here and nothing waits. */
 static void cover_on_data(const esp_avrc_ct_cb_param_t *param)
 {
     if (!s_now.art_busy) return;
@@ -531,49 +484,19 @@ static void cover_on_data(const esp_avrc_ct_cb_param_t *param)
     }
     bool stale = s_now.art_generation != atomic_load(&s_cover_epoch);
     size_t len = param->cover_art_data.data_len;
-    if (s_now.art_streaming) {
-        if (!stale && !s_now.art_stream.failed &&
-            !cover_stream_feed(&s_now.art_stream,param->cover_art_data.p_data,len,
-                               param->cover_art_data.final,cover_emit,NULL)) {
-            ESP_LOGW(TAG,"cover art: stream cancelled at %lu bytes (limit/queue/invalid JPEG)",
-                     (unsigned long)s_now.art_stream.used);
-        }
-        if (param->cover_art_data.final) {
-            if (!stale) {
-                ESP_LOGI(TAG,"cover art: streamed %lu bytes, generation %lu, %s, heap %u",
-                         (unsigned long)s_now.art_stream.used,(unsigned long)s_now.art_generation,
-                         s_now.art_stream.finished?"queued":"discarded",
-                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
-                s_now.art_done_generation=s_now.art_generation;
-            }
-            cover_reset();
-            if (stale) cover_fetch();
-        }
-        return;
-    }
-    if (!stale && !s_now.art_oversize && len) {
-        const size_t before = s_now.art.size;
-        if (!cover_buffer_append(&s_now.art, param->cover_art_data.p_data, len,
-                                 BT_COVER_MAX_BYTES, cover_allocate)) {
-            ESP_LOGW(TAG, "cover art: dropped at %u+%u bytes (%s), free %u largest %u",
-                     (unsigned)before, (unsigned)len,
-                     len > BT_COVER_MAX_BYTES-before ? "size limit" : "heap reserve/allocation",
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-            s_now.art_oversize = true;
-            cover_buffer_clear(&s_now.art);
-        }
+    if (!stale && !s_now.art_stream.failed &&
+        !cover_stream_feed(&s_now.art_stream, param->cover_art_data.p_data, len,
+                           param->cover_art_data.final, cover_emit, NULL)) {
+        ESP_LOGW(TAG, "cover art: stream cancelled at %lu bytes (limit/queue/invalid JPEG)",
+                 (unsigned long)s_now.art_stream.used);
     }
     if (!param->cover_art_data.final) return;
-    if (!stale && !s_now.art_oversize && s_now.art.size >= 3 &&
-        s_now.art.head->data[0] == 0xff && s_now.art.head->data[1] == 0xd8 && s_now.art.head->data[2] == 0xff) {
-        cover_job_t job = {s_now.art, s_now.art_generation};
-        atomic_store(&s_cover_sending, true);
-        if (xQueueSend(s_cover_queue, &job, 0) == pdTRUE) {
-            s_now.art = (cover_buffer_t){0};
-            s_now.art_done_generation = s_now.art_generation;
-        }
-        else atomic_store(&s_cover_sending, false);
+    if (!stale) {
+        ESP_LOGI(TAG, "cover art: streamed %lu bytes, generation %lu, %s, heap %u",
+                 (unsigned long)s_now.art_stream.used, (unsigned long)s_now.art_generation,
+                 s_now.art_stream.finished ? "queued" : "discarded",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
+        s_now.art_done_generation = s_now.art_generation;
     }
     cover_reset();
     // Preserve the OBEX session and its image handles between tracks.
@@ -1163,10 +1086,6 @@ void bt_av_set_radio(bool on, bool discoverable, bool disconnect)
 esp_err_t bt_av_start(const char *device_name)
 {
     do { s_cover_nonce = esp_random(); } while (!s_cover_nonce);
-    s_cover_queue = xQueueCreate(1, sizeof(cover_job_t));
-    ESP_RETURN_ON_FALSE(s_cover_queue, ESP_ERR_NO_MEM, TAG, "cover queue");
-    ESP_RETURN_ON_FALSE(xTaskCreate(cover_sender, "cover_tx", 3072, NULL, 2, NULL) == pdPASS,
-                        ESP_ERR_NO_MEM, TAG, "cover sender");
     s_now.state = SATLINK_BT_OFF;
     s_now.codec = SATLINK_CODEC_NONE;
     s_now.play_state = SATLINK_PLAY_STOPPED;

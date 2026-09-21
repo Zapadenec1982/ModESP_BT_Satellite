@@ -473,8 +473,14 @@ Host requires the current RESET pair, offset zero first, contiguous offsets,
 identical total size and an exact final length. Unknown/old pairs are ignored.
 A gap/duplicate/malformed current part aborts assembly; a missing tail times out
 after 5 seconds. Never publish a partial image. Hard protocol bound 256 KiB;
-this WROOM sender collects at most 48 KiB and only requests linked thumbnails.
+the WROOM sender only requests linked thumbnails.
 Maximum new payload is 1016 bytes, within the existing 1036-byte limit.
+
+Sender note (satellite, 2026-09-21): the satellite no longer implements the
+known-length collection path. It sends cover messages only to a host that
+announces minor >= 6 with bits 1 and 6 (streaming, below); a host below that
+receives no RESET, DATA or legacy 0x14 COVER at all. This is a floor on the
+sender side, not a change to any layout or number.
 
 RESET has priority over queued old DATA; the pair prevents cross-track mixing.
 Bluetooth callbacks never wait for UART draining. A separate low-priority task
@@ -486,7 +492,7 @@ publication checks the current generation again after decoding.
 ### Bounded streaming JPEG covers (protocol 1.6)
 
 Host capability bit 6 (COVER_STREAM_CAP) requires host minor >=6 AND cover bit 1.
-The satellite falls back to unchanged 1.5 collection for a 1.5 host; a 1.6 host
+The satellite sends no covers to a 1.5 host (see the sender note above); a 1.6 host
 continues accepting known-length 1.5 DATA. Audio formats and capabilities do not change.
 
 With streaming negotiated, DATA 0x18 uses total_bytes=0 (unknown until OBEX final).

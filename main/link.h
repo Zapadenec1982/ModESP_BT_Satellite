@@ -68,15 +68,14 @@ void link_send_gpio_map(const satlink_gpio_map_t *map);
 void link_send_adc_value(uint8_t index, uint16_t raw, uint16_t mv);
 void link_send_log(uint8_t level, const char *text);
 
+/* Cover art, protocol 1.6 only: RESET on the critical queue, then one DATA per
+ * OBEX chunk and an END, all copied into bounded heap frames on the caller's
+ * task. Both are silent for a host that did not announce COVER_STREAM_CAP; the
+ * 1.5 collect-then-send path and the 1.0 COVER message are no longer sent, see
+ * docs/PROTOCOL.md. */
 void link_send_cover_reset(uint32_t nonce, uint32_t generation);
 bool link_try_cover_stream(uint32_t nonce, uint32_t generation, uint32_t offset,
                            const uint8_t *data, size_t len, uint32_t crc);
-void link_send_cover_data(uint32_t nonce, uint32_t generation, uint32_t total,
-                          uint32_t offset, const uint8_t *data, uint16_t len);
-
-/* One chunk of cover art. The caller does the slicing; this only frames it. */
-void link_send_cover(uint16_t chunk, uint16_t total, uint8_t mime,
-                     uint32_t total_len, const uint8_t *data, uint16_t len);
 
 /* Counters, for the report that explains a bad cable or a wedged host. */
 typedef struct {
@@ -110,7 +109,7 @@ void link_get_stats(link_stats_t *out);
 /*
  * How many droppable messages are still waiting to go out.
  *
- * Exists for the cover art sender, which is the only producer that can generate
+ * Exists for the cover stream, which is the only producer that can generate
  * more messages in one burst than the queue holds. Everything else emits one
  * message per event and cannot outrun the wire.
  */

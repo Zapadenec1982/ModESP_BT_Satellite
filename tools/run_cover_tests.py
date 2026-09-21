@@ -1,4 +1,4 @@
-"""Exercise production segmented buffer and patched BTA continuation callbacks."""
+"""Exercise the production cover stream feeder and patched BTA continuation callbacks."""
 from pathlib import Path
 import argparse, os, subprocess
 from run_bta_reopen_tests import function

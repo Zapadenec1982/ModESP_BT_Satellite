@@ -77,7 +77,8 @@ static const char *TAG = "sat.link";
  * main task on the first boot: the log bridge runs in whoever happens to be
  * logging, and app_main calling into a sender that allocates a kilobyte is the
  * end of a 3584-byte stack. A message gets room for what it can actually carry
- * and no more. Only COVER needs the full payload, and it has a static buffer.
+ * and no more. Cover parts are the one thing that needs the full payload, and
+ * link_try_cover_stream builds those on the heap, one frame at a time.
  */
 #define LINK_NAME_MAX      64        /* a Bluetooth device name */
 #define LINK_META_MAX     128        /* one of title, artist, album */
@@ -341,7 +342,9 @@ void link_send_adc_value(uint8_t index, uint16_t raw, uint16_t mv)
 
 void link_send_cover_reset(uint32_t nonce, uint32_t generation)
 {
-    if (!(link_host_caps() & SATLINK_HOST_CAP_COVER)) return;
+    /* Streaming hosts only. A 1.5 host would understand RESET, but this build
+     * never follows it with an image, so it is told nothing about covers. */
+    if (!(link_host_caps() & COVER_STREAM_CAP)) return;
     uint8_t p[8]; cover_put32(p, nonce); cover_put32(p+4, generation);
     tx_push(COVER_RESET, p, sizeof p);
 }
@@ -364,28 +367,6 @@ bool link_try_cover_stream(uint32_t nonce, uint32_t generation, uint32_t offset,
     tx_item_t item={.payload=p,.len=(uint16_t)bytes,.type=len?COVER_DATA:COVER_END};
     if (xQueueSend(s_q_bulk,&item,0)==pdTRUE) return true;
     free(p); return false;
-}
-
-void link_send_cover_data(uint32_t nonce, uint32_t generation, uint32_t total,
-                          uint32_t offset, const uint8_t *data, uint16_t len)
-{
-    if (!(link_host_caps() & SATLINK_HOST_CAP_COVER) || len > COVER_PART_MAX) return;
-    // Only the dedicated cover sender calls this. tx_push copies before returning.
-    static uint8_t p[16 + COVER_PART_MAX];
-    cover_put32(p, nonce); cover_put32(p+4, generation);
-    cover_put32(p+8, total); cover_put32(p+12, offset);
-    memcpy(p+16, data, len);
-    tx_push(COVER_DATA, p, 16+len);
-}
-
-void link_send_cover(uint16_t chunk, uint16_t total, uint8_t mime,
-                     uint32_t total_len, const uint8_t *data, uint16_t len)
-{
-    satlink_cover_t m = { .chunk = chunk, .total = total, .mime = mime,
-                          .total_len = total_len, .len = len, .data = data };
-    static uint8_t payload[SATLINK_PAYLOAD_MAX];   /* too big for a task stack */
-    size_t n = satlink_enc_cover(payload, sizeof(payload), &m);
-    if (n != 0) { tx_push(SATLINK_MSG_COVER, payload, n); }
 }
 
 void link_send_log(uint8_t level, const char *text)

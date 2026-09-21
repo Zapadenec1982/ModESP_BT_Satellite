@@ -198,5 +198,11 @@ Runtime performance and audio fidelity need bench verification with an LHDC V5 s
 
 Protocol 1.6 streams linked JPEG thumbnails into host memory with RESET/DATA/END,
 gated by host bits 1+6 and minor >=6. Maximum 256 KiB, explicit length/CRC completion,
-bounded nonblocking UART enqueue and 16-KiB heap reserve. A 1.5 host still uses
-the previous 48-KiB collection path. See `BT_COVER_2026-09-20.md`.
+bounded nonblocking UART enqueue and 16-KiB heap reserve. See `BT_COVER_2026-09-20.md`.
+
+Since 2026-09-21 (hardening stage 10.3) this is the only cover path. The 48-KiB
+collection path that served 1.5 hosts took the decoder's heap in 1000-byte pieces
+on a board with about 47 KiB free while LHDC plays, and the bench showed `ring full`
+bursts right after every collected image. A host announcing minor < 6, or without
+bits 1 and 6, receives no cover messages at all; it is not offered the legacy
+`0x14 COVER` either. Layouts and numbering are unchanged.
