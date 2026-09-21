@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "clk_ctrl_os.h"            /* periph_rtc_apll_acquire, see audio_servo_apply */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -151,6 +152,173 @@ static inline int16_t audio_narrow_32_to_16(int32_t v)
     return (int16_t)t;
 }
 
+/*
+ * The clock servo.
+ *
+ * The phone's crystal sets the pace of the stream and this device's APLL sets
+ * the pace of the I2S bus, and the two differ by some tens of ppm. The ring is
+ * the only elastic element between them: left alone it traverses its whole
+ * range every ~46 minutes at 44.1 kHz/16-bit and every ~11 minutes at
+ * 96 kHz/32-bit for a ±50 ppm difference, and ends in a dropped chunk or a
+ * run of DMA zeros either way -- a click on a schedule.
+ *
+ * Once a second the mean fill of the ring over that second is compared with the
+ * middle of the ring and MCLK is nudged through i2s_channel_tune_rate() so that
+ * the fill drifts back. The error is in milliseconds of audio rather than
+ * bytes, so the loop behaves the same at 44.1/16 (a 139 ms ring) as at 96/32
+ * (32 ms). AUDIO_SERVO_KP ppm per millisecond gives a 100 s time constant in
+ * the linear region; the integrator learns the standing offset so the fill
+ * settles on the target rather than a Kp-proportional distance from it, and
+ * with Ti = Kp/Ki = 400 s the pair is critically damped against the ring,
+ * which is a pure integrator of the rate error. Authority is ±200 ppm, a
+ * fiftieth of a percent, with 2 ppm steps so the APLL is not rewritten for
+ * noise.
+ *
+ * Two loops in series, and they do not fight: this one tracks the phone from
+ * the ring, the P4's ±500 ppm ASRC tracks this device's BCLK from its own ring,
+ * and this one is the slower of the two by design.
+ *
+ * Only while a stream plays with the gate open. Between tracks the fill means
+ * nothing, so the servo freezes and the integrator keeps the offset it has
+ * learned; a format change resets everything, because the driver derives a
+ * fresh clock and the phone that follows may be a different one.
+ *
+ * Every step re-derives the APLL live (i2s_common.c:1486, IDF 5.5.5): the sdm
+ * coefficients are rewritten and a calibration cycle runs while BCLK is
+ * expected to keep going. Whether it really does is a scope measurement, not a
+ * code reading -- docs/DEVICE_SPEC.md, "Вихід I2S".
+ */
+#define AUDIO_SERVO_PERIOD_US   (1000 * 1000)
+#define AUDIO_SERVO_TARGET      (AUDIO_RING_BYTES / 2)
+#define AUDIO_SERVO_MAX_PPM     200
+#define AUDIO_SERVO_KP          10.0f       /* ppm per millisecond of fill error */
+#define AUDIO_SERVO_KI          0.025f      /* ppm per millisecond, per second */
+#define AUDIO_SERVO_STEP_PPM    2           /* smallest change worth an APLL rewrite */
+
+static int      s_servo_ppm;            /* the correction last asked of the driver */
+static int32_t  s_servo_delta_hz;       /* what the driver says it applied, MCLK */
+static float    s_servo_integral;       /* ppm */
+static uint64_t s_servo_fill_acc;       /* bytes, summed over the current second */
+static uint32_t s_servo_fill_n;
+static int64_t  s_servo_next_us;
+static bool     s_servo_off;            /* the driver refused once; do not nag */
+
+/* Writer task only: one reading of the fill, as many times a second as the
+ * ring is read. An empty ring during a stream counts as zero. */
+static inline void audio_servo_sample(uint32_t fill)
+{
+    s_servo_fill_acc += fill;
+    s_servo_fill_n++;
+}
+
+/* With s_lock held: this moves the clock under i2s_channel_write. */
+static void audio_servo_apply(int ppm)
+{
+    i2s_tuning_info_t info = {0};
+    if (i2s_channel_tune_rate(s_tx, NULL, &info) != ESP_OK) {
+        s_servo_off = true;
+        return;
+    }
+    const int32_t origin = info.curr_mclk_hz - info.delta_mclk_hz;
+    const int32_t limit  = (int32_t)(((int64_t)origin * AUDIO_SERVO_MAX_PPM) / 1000000);
+    const i2s_tuning_config_t cfg = {
+        .tune_mode      = I2S_TUNING_MODE_SET,
+        .tune_mclk_val  = origin + (int32_t)(((int64_t)origin * ppm) / 1000000),
+        .max_delta_mclk = limit,
+        .min_delta_mclk = -limit,
+    };
+    /* A reference of our own for the duration of the call. The driver drops
+     * and retakes its only APLL reference around the re-derivation
+     * (i2s_common.c:1487-1489, IDF 5.5.5); with nobody else holding one the
+     * count reaches zero, which powers the PLL down under a running stream and
+     * trips the assert in periph_rtc_apll_freq_set (clk_ctrl_os.c:111). Held
+     * only here and never across a format change: with two holders the driver
+     * is not allowed to move the APLL at all. */
+    periph_rtc_apll_acquire();
+    const esp_err_t err = i2s_channel_tune_rate(s_tx, &cfg, &info);
+    periph_rtc_apll_release();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "clock servo: %+d ppm refused: %s; servo off until the next format",
+                 ppm, esp_err_to_name(err));
+        s_servo_off = true;
+        return;
+    }
+    if (s_servo_ppm == 0 && ppm != 0) {
+        ESP_LOGI(TAG, "clock servo engaged: MCLK %" PRId32 " Hz nominal", origin);
+    }
+    s_servo_ppm      = ppm;
+    s_servo_delta_hz = info.delta_mclk_hz;
+}
+
+/* Forget everything learned and put the clock back on its nominal value. From
+ * audio_out_configure(), under s_lock with the channel disabled: the driver
+ * derives a fresh origin when the rate changes, but a width-only change leaves
+ * the old correction standing, and the servo must not start from a lie. */
+static void audio_servo_reset(void)
+{
+    s_servo_ppm = 0;
+    s_servo_delta_hz = 0;
+    s_servo_integral = 0.0f;
+    s_servo_fill_acc = 0;
+    s_servo_fill_n = 0;
+    s_servo_off = false;
+
+    i2s_tuning_info_t info = {0};
+    if (s_tx != NULL && i2s_channel_tune_rate(s_tx, NULL, &info) == ESP_OK &&
+        info.delta_mclk_hz != 0) {
+        const i2s_tuning_config_t back = { .tune_mode = I2S_TUNING_MODE_RESET };
+        periph_rtc_apll_acquire();
+        i2s_channel_tune_rate(s_tx, &back, NULL);
+        periph_rtc_apll_release();
+    }
+}
+
+/* Writer task, with s_lock held, once a second. */
+static void audio_servo_tick(void)
+{
+    const int64_t now = esp_timer_get_time();
+    if (now < s_servo_next_us) {
+        return;
+    }
+    s_servo_next_us = now + AUDIO_SERVO_PERIOD_US;
+
+    const uint32_t n   = s_servo_fill_n;
+    const uint64_t acc = s_servo_fill_acc;
+    s_servo_fill_n   = 0;
+    s_servo_fill_acc = 0;
+
+    if (s_servo_off || !s_running || !s_streaming || (atomic_load(&s_gate) & 1u) || n == 0) {
+        return;     /* nothing to track; the integrator keeps what it has learned */
+    }
+
+    const unsigned frame_bytes = (unsigned)(s_slot_bits / 8) * 2u;
+    const float byte_rate = (float)s_rate_hz * (float)frame_bytes;
+    const float fill      = (float)(acc / n);
+    /* Positive: the ring is fuller than wanted, the phone is ahead, and the
+     * bus has to run faster to catch up. */
+    const float err_ms    = (fill - (float)AUDIO_SERVO_TARGET) * 1000.0f / byte_rate;
+
+    float out = AUDIO_SERVO_KP * err_ms + s_servo_integral;
+    /* Anti-windup: pinned against the limit in the direction of the error, the
+     * integrator would only be storing up an overshoot. */
+    const bool pinned = (out >=  AUDIO_SERVO_MAX_PPM && err_ms > 0.0f) ||
+                        (out <= -AUDIO_SERVO_MAX_PPM && err_ms < 0.0f);
+    if (!pinned) {
+        s_servo_integral += AUDIO_SERVO_KI * err_ms;    /* dt is the one-second period */
+        if (s_servo_integral >  AUDIO_SERVO_MAX_PPM) { s_servo_integral =  AUDIO_SERVO_MAX_PPM; }
+        if (s_servo_integral < -AUDIO_SERVO_MAX_PPM) { s_servo_integral = -AUDIO_SERVO_MAX_PPM; }
+        out = AUDIO_SERVO_KP * err_ms + s_servo_integral;
+    }
+    if (out >  AUDIO_SERVO_MAX_PPM) { out =  AUDIO_SERVO_MAX_PPM; }
+    if (out < -AUDIO_SERVO_MAX_PPM) { out = -AUDIO_SERVO_MAX_PPM; }
+
+    const int ppm  = (int)(out >= 0.0f ? out + 0.5f : out - 0.5f);
+    const int step = ppm - s_servo_ppm;
+    if (step >= AUDIO_SERVO_STEP_PPM || step <= -AUDIO_SERVO_STEP_PPM) {
+        audio_servo_apply(ppm);
+    }
+}
+
 /* Ten seconds, and only while something is playing. A line an hour from an idle
  * device is noise; a line every ten seconds from a stuttering one is the whole
  * diagnosis. */
@@ -182,7 +350,8 @@ static void audio_report(void)
 
     ESP_LOGI(TAG, "%s %" PRIu32 " Hz %u-bit slots: ring %u..%u of %u (%u ms), underruns %" PRIu32
                   ", dropped %" PRIu32 ", peak %" PRIu32 "/32768 (%u.%u%%), wire %" PRIu32
-                  " [%02x %02x %02x %02x %02x %02x %02x %02x], part %" PRIu32 ", free dma %u",
+                  " [%02x %02x %02x %02x %02x %02x %02x %02x], part %" PRIu32 ", free dma %u"
+                  ", clock %+d ppm (%+" PRId32 " Hz)",
              s_codec_name, s_rate_hz, s_slot_bits,
              (unsigned)st.fill_min, (unsigned)st.fill_max, (unsigned)AUDIO_RING_BYTES, fill_ms,
              st.underruns, st.dropped_bytes, st.peak,
@@ -190,7 +359,8 @@ static void audio_report(void)
              st.wire_head[0], st.wire_head[1], st.wire_head[2], st.wire_head[3],
              st.wire_head[4], st.wire_head[5], st.wire_head[6], st.wire_head[7],
              s_partial_frames,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             s_servo_ppm, s_servo_delta_hz);
 }
 
 /*
@@ -306,6 +476,7 @@ static void audio_out_task(void *arg)
     for (;;) {
         audio_report();
         xSemaphoreTake(s_lock, portMAX_DELAY);
+        audio_servo_tick();
         if (atomic_load(&s_gate) & 1u) {
             xSemaphoreGive(s_lock);
             vTaskDelay(1);
@@ -324,6 +495,9 @@ static void audio_out_task(void *arg)
                 s_underruns++;
                 s_fill_min = 0;
                 last_empty = now;
+            }
+            if (s_streaming) {
+                audio_servo_sample(0);
             }
             xSemaphoreGive(s_lock);
             vTaskDelay(1);
@@ -374,6 +548,7 @@ static void audio_out_task(void *arg)
         uint32_t fill = (uint32_t)(AUDIO_RING_BYTES - free_bytes);
         if (fill < s_fill_min) { s_fill_min = fill; }
         if (fill > s_fill_max) { s_fill_max = fill; }
+        audio_servo_sample(fill);
 
         if (len != 0) {
             const uint8_t *wire = (const uint8_t *)item + off;
@@ -427,8 +602,8 @@ esp_err_t audio_out_init(void)
             },
         },
     };
-    /* APLL, not the 160 MHz PLL: 44.1 kHz lands far closer, and absorbing the
-     * phone's drift later means tuning this clock (DEVICE_SPEC, "Вихід I2S"). */
+    /* APLL, not the 160 MHz PLL: 44.1 kHz lands far closer, and the clock servo
+     * above absorbs the phone's drift by tuning it (DEVICE_SPEC, "Вихід I2S"). */
     std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_APLL;
 
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_tx, &std_cfg), TAG, "init_std_mode");
@@ -621,6 +796,7 @@ esp_err_t audio_out_configure(uint32_t rate, uint8_t bits, uint8_t source_bits)
         err = i2s_channel_reconfig_std_clock(s_tx, &clock);
         if (err == ESP_OK) s_rate_hz = rate;
     }
+    if (err == ESP_OK) audio_servo_reset();   // a new format is a new phone as far as the clock knows
     if (err == ESP_OK) err = clear_dma();
     if (err == ESP_OK) {
         s_src_bits = source_bits;

@@ -103,6 +103,28 @@ channel, so the clock genuinely stops for that moment rather than going quiet. T
 that path never runs — the rate is 44.1 kHz at boot and stock Bluedroid negotiates
 nothing else — but it would if 48 kHz were ever announced.
 
+### And steered
+
+Since hardening stage 10.1 (2026-09-21) the clock no longer runs free. Once a second
+`audio_out.c` compares the ring's mean fill over that second with the middle of the
+ring and nudges MCLK through `i2s_channel_tune_rate()`: a PI loop with its error in
+milliseconds of audio (so 44.1/16 and 96/32 behave alike), 10 ppm per millisecond, an
+integrator with a 400 s time constant, ±200 ppm of authority and 2 ppm steps. It runs
+only while a stream plays with the gate open, freezes between tracks, and starts from
+zero after every format change. The 10-second report line carries the applied ppm.
+
+Two loops in series, and they do not fight: this one tracks the phone's crystal from
+the ring, the P4's ±500 ppm ASRC tracks this device's BCLK from its own ring, and this
+one is the slower of the two by design. Keep it that way if the P4's loop is ever
+retuned.
+
+The driver re-derives the APLL live for every step — sdm coefficients rewritten, a
+calibration cycle run — while `audio_out.c` holds one extra APLL reference of its own,
+without which IDF 5.5.5 powers the PLL down mid-stream and trips an assert
+(`i2s_common.c:1487`, `clk_ctrl_os.c:111`). Whether BCLK is truly continuous through a
+step is a scope measurement, not a code reading, and is the first thing to check on
+the bench.
+
 ## Status
 
 The receiver works: a phone pairs, SBC plays at 44.1 kHz, and the samples leave on the I2S
