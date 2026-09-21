@@ -45,7 +45,10 @@ void bt_av_set_radio(bool on, bool discoverable, bool disconnect);
  * announced, so there is no longer a reason to wait for a reboot.
  *
  * Does nothing when the width already matches, so calling it on every HELLO is
- * free.
+ * free. The sample rates the stream endpoints advertise are not in its gift:
+ * those are fixed when the endpoints are registered, and a greeting that would
+ * change them has the sink de-initialised and initialised again once no phone
+ * is attached (main/endpoint_policy.h).
  */
 void bt_av_apply_host_caps(void);
 

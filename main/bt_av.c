@@ -1,5 +1,6 @@
 #include "bt_av.h"
 #include "cover_stream.h"
+#include "endpoint_policy.h"
 #include "esp_heap_caps.h"
 #include "satlink/cover_wire.h"
 
@@ -142,10 +143,22 @@ typedef struct {
     esp_a2d_cb_param_t   param;
     fmt_ready_t ready;
     uint32_t codec_epoch;
+    uint32_t host_caps;         /* BT_EVENT_ENDPOINTS_REGISTERED */
 } bt_a2d_msg_t;
 
 static QueueHandle_t s_queue;
-#define BT_EVENT_FORMAT_READY 0xff00
+#define BT_EVENT_FORMAT_READY         0xff00
+#define BT_EVENT_ENDPOINTS_REGISTERED 0xff01
+static ep_fsm_t s_endpoints;            /* bt_av task only */
+
+/* How long a cold start waits for the host's HELLO before the endpoints are
+ * registered from whatever has arrived. The P4 sends its first greeting from a
+ * low-priority module after Wi-Fi, the display and the SD card have come up,
+ * which is several seconds after this board is ready; the previous half a
+ * second made a cold start of both boards a 44.1 kHz session, every time. A
+ * host that is not there does not become there, and one that turns up later
+ * still gets the endpoints registered again (endpoint_policy.h). */
+#define BT_AV_HELLO_WAIT_MS 10000
 static atomic_bool s_caps_pending;
 static atomic_bool s_cover_refresh;
 static atomic_bool s_cover_query;
@@ -320,6 +333,73 @@ void bt_av_format_ready(const fmt_ready_t *ready)
     bt_a2d_msg_t msg = { .event = BT_EVENT_FORMAT_READY, .ready = *ready };
     // Losing an ACK is safe: PREPARE retries and the host repeats READY.
     xQueueSend(s_queue, &msg, 0);
+}
+
+/* Sets the stack's switches from the host's HELLO. Read while esp_a2d_sink_init()
+ * registers the endpoints and never again, so it must run before every init. */
+static void decide_endpoints(uint32_t host_caps)
+{
+    A2DP_SinkAllow48kHz((host_caps & SATLINK_HOST_CAP_RELOCK) != 0);
+    A2DP_SinkAllow96kHz((host_caps & SATLINK_HOST_CAP_96KHZ) != 0);
+    A2DP_SinkOfferAptxHd(BT_AV_OFFER_APTX_HD);
+    A2DP_SinkOfferAptx(BT_AV_OFFER_APTX);
+    A2DP_SinkOfferAac(BT_AV_OFFER_AAC);
+    ESP_LOGI(TAG, "endpoints: SBC%s%s%s" BT_AV_LHDC_NAME ", %s, %u-bit slots",
+             BT_AV_OFFER_AAC ? " AAC" : "",
+             BT_AV_OFFER_APTX ? " aptX" : "",
+             BT_AV_OFFER_APTX_HD ? " aptX-HD" : "",
+             (host_caps & SATLINK_HOST_CAP_96KHZ) ? "44.1/48 kHz + LHDC 96 kHz" :
+             (host_caps & SATLINK_HOST_CAP_RELOCK) ? "44.1 and 48 kHz" : "44.1 kHz only",
+             audio_out_slot_bits());
+}
+
+/* No phone in any stage of attachment. Re-registering under one would drop it. */
+static bool bt_av_idle(void)
+{
+    return s_now.state <= SATLINK_BT_DISCOVERABLE && !s_now.avrcp_up;
+}
+
+static void a2d_data_cb(const uint8_t *buf, uint32_t len);
+
+/* Carries out what the endpoint machine asked for, and reports back to it. */
+static void run_endpoint_action(ep_action_t action)
+{
+    const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    const uint32_t caps = link_host_caps();
+    esp_err_t err;
+
+    switch (action) {
+    case EP_ACT_DEINIT:
+        ESP_LOGI(TAG, "host decides endpoints with 0x%02" PRIx32 " now, they were registered "
+                      "from 0x%02" PRIx32 " and no phone is attached: registering again",
+                 ep_deciding(caps), s_endpoints.decided);
+        err = esp_a2d_sink_deinit();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "endpoints: deinit refused: %s", esp_err_to_name(err));
+            ep_action_failed(&s_endpoints, now);
+        }
+        break;
+
+    case EP_ACT_INIT:
+        decide_endpoints(caps);
+        err = esp_a2d_sink_init();
+        if (err == ESP_OK) {
+            /* The data callback survives a deinit in this stack, but a stack
+             * is not a contract; registering it again costs one message. */
+            err = esp_a2d_sink_register_data_callback(a2d_data_cb);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "endpoints: init refused: %s; nothing to connect to until it succeeds",
+                     esp_err_to_name(err));
+            ep_action_failed(&s_endpoints, now);
+        } else {
+            ep_init_sent(&s_endpoints, caps);
+        }
+        break;
+
+    default:
+        break;
+    }
 }
 
 static void poll_format(void)
@@ -520,6 +600,17 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
     const esp_a2d_cb_param_t *p = &msg->param;
 
     switch (msg->event) {
+    case BT_EVENT_ENDPOINTS_REGISTERED:
+        ep_registered(&s_endpoints, msg->host_caps);
+        break;
+
+    case ESP_A2D_PROF_STATE_EVT: {
+        const bool deinit = p->a2d_prof_stat.init_state == ESP_A2D_DEINIT_SUCCESS;
+        ESP_LOGI(TAG, "a2dp sink %s", deinit ? "deinitialised" : "initialised");
+        run_endpoint_action(ep_on_prof_state(&s_endpoints, deinit));
+        break;
+    }
+
     case BT_EVENT_FORMAT_READY: {
         const bool refused_before = s_format.refused;
         fmt_ack(&s_format, &msg->ready);
@@ -687,6 +778,8 @@ static void bt_av_task(void *arg)
             handle_a2d_event(&msg);
         }
         poll_format();
+        run_endpoint_action(ep_poll(&s_endpoints, link_host_caps(), bt_av_idle(),
+                                    (uint32_t)(esp_timer_get_time() / 1000)));
     }
 }
 
@@ -1144,36 +1237,20 @@ esp_err_t bt_av_start(const char *device_name)
 
     /*
      * Two decisions the host makes for us, both read from HELLO and both taken
-     * here because the endpoints are about to be registered and their advertised
-     * capabilities are never looked at again.
+     * before the endpoints are registered, because their advertised capabilities
+     * are read at registration and never again.
      *
-     * If HELLO has not arrived yet -- the host booting later than us, say -- caps
-     * read as zero and both answers are the conservative one. That is the right
-     * way round to be wrong: 44.1 kHz in 16-bit slots is what every host can take,
-     * and a host that wanted more will get it after the next restart.
+     * If HELLO has not arrived when the wait runs out, caps read as zero and both
+     * answers are the conservative one. That is the right way round to be wrong:
+     * 44.1 kHz in 16-bit slots is what every host can take. It is no longer a
+     * sentence for the session, though: a greeting that arrives later, with
+     * wider capabilities, has the endpoints registered again as soon as no
+     * phone is attached (endpoint_policy.h).
      */
-    /* Wait for the greeting before reading it. Everything below is decided once
-     * and never revisited, so reading capabilities that have not arrived yet does
-     * not degrade gracefully -- it silently picks the wrong answer for the whole
-     * session. Half a second is generous: on this bench the host answers in
-     * twenty milliseconds, and a host that is not there does not become there. */
-    link_wait_for_host(500);
+    link_wait_for_host(BT_AV_HELLO_WAIT_MS);
     uint32_t host_caps = link_host_caps();
-
-    A2DP_SinkAllow48kHz((host_caps & SATLINK_HOST_CAP_RELOCK) != 0);
-    A2DP_SinkAllow96kHz((host_caps & SATLINK_HOST_CAP_96KHZ) != 0);
-    A2DP_SinkOfferAptxHd(BT_AV_OFFER_APTX_HD);
-    A2DP_SinkOfferAptx(BT_AV_OFFER_APTX);
-    A2DP_SinkOfferAac(BT_AV_OFFER_AAC);
-
+    decide_endpoints(host_caps);
     bt_av_apply_host_caps();
-    ESP_LOGI(TAG, "endpoints: SBC%s%s%s" BT_AV_LHDC_NAME ", %s, %u-bit slots",
-             BT_AV_OFFER_AAC ? " AAC" : "",
-             BT_AV_OFFER_APTX ? " aptX" : "",
-             BT_AV_OFFER_APTX_HD ? " aptX-HD" : "",
-             (host_caps & SATLINK_HOST_CAP_96KHZ) ? "44.1/48 kHz + LHDC 96 kHz" :
-             (host_caps & SATLINK_HOST_CAP_RELOCK) ? "44.1 and 48 kHz" : "44.1 kHz only",
-             audio_out_slot_bits());
 
     ESP_RETURN_ON_ERROR(esp_a2d_register_callback(a2d_cb), TAG, "a2d_register");
     ESP_RETURN_ON_ERROR(esp_a2d_sink_init(), TAG, "a2d_sink_init");
@@ -1181,6 +1258,12 @@ esp_err_t bt_av_start(const char *device_name)
      * stock route to decoded PCM: the external path hands over raw frames and has
      * no decoder behind it (docs/BASE.md). */
     ESP_RETURN_ON_ERROR(esp_a2d_sink_register_data_callback(a2d_data_cb), TAG, "a2d_data_cb");
+
+    /* Hand the endpoint machine its starting point on its own task, so that it
+     * never races the registration above. */
+    bt_a2d_msg_t registered = { .event = BT_EVENT_ENDPOINTS_REGISTERED, .host_caps = host_caps };
+    ESP_RETURN_ON_FALSE(xQueueSend(s_queue, &registered, pdMS_TO_TICKS(100)) == pdTRUE,
+                        ESP_ERR_NO_MEM, TAG, "event queue full at start");
 
     ESP_RETURN_ON_ERROR(esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE),
                         TAG, "set_scan_mode");

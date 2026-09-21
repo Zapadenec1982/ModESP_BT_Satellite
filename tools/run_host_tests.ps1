@@ -81,6 +81,20 @@ if ($LASTEXITCODE -ne 0) {
 & $exe
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+# The endpoint re-registration machine, pure C out of main/.
+$endpointsExe = Join-Path $outDir 'test_endpoints.exe'
+& $Cc '-std=c17' '-Wall' '-Wextra' '-Werror' '-g' '-O1' `
+    "-I$(Join-Path $repoRoot 'main')" `
+    "-I$(Join-Path $repoRoot 'components\satlink\include')" `
+    "-I$(Join-Path $repoRoot 'tests\host')" `
+    (Join-Path $repoRoot 'tests\host\test_endpoints.c') -o $endpointsExe
+if ($LASTEXITCODE -ne 0) {
+    Write-Host 'run_host_tests: test_endpoints compilation failed.' -ForegroundColor Red
+    exit 1
+}
+& $endpointsExe
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 # Replay the codec-switch race through source extracted from our generated BT.
 & $Python (Join-Path $repoRoot 'tools\run_bta_reopen_tests.py') --cc $Cc
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
