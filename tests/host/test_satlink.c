@@ -75,6 +75,80 @@ static void test_cobs(void)
     cobs_roundtrip(run, 256);
     cobs_roundtrip(run, 600);
 
+    /* The overhead the contract states is exactly ceil(n/254) code bytes for a
+     * zero-free body. At every multiple of 254 the encoder used to add a
+     * trailing 0x01 -- a run opened for input that never came -- and encode
+     * one byte longer than the player does for the same body. Both decoders
+     * accept both forms; the encoders should nevertheless agree. */
+    uint8_t enc_exact[SATLINK_WIRE_MAX];
+    uint8_t body[1016];
+    for (size_t i = 0; i < sizeof(body); i++) { body[i] = (uint8_t)(1 + (i % 255)); }
+    static const size_t boundaries[] = { 1, 253, 254, 255, 508, 509, 762, 1016 };
+    for (size_t b = 0; b < sizeof(boundaries) / sizeof(boundaries[0]); b++) {
+        size_t n = boundaries[b];
+        size_t got = 0;
+        CHECK(satlink_cobs_encode(body, n, enc_exact, sizeof(enc_exact), &got));
+        CHECK_EQ(got, n + (n + 253) / 254);
+    }
+
+    /* The streaming encoder cannot see the end of its input, so a full run
+     * that ends exactly on a push boundary must still not open a run for data
+     * that never arrives -- and must open one when data does arrive. Each
+     * split must produce the same bytes as the one-shot encoder. */
+    static const size_t splits[] = { 1, 2, 253, 254, 255, 507, 508, 509 };
+    for (size_t s = 0; s < sizeof(splits) / sizeof(splits[0]); s++) {
+        for (size_t n = 508; n <= 510; n++) {
+            uint8_t one_shot[SATLINK_WIRE_MAX], pieces[SATLINK_WIRE_MAX];
+            size_t one_len = 0, piece_len = 0;
+            CHECK(satlink_cobs_encode(body, n, one_shot, sizeof(one_shot), &one_len));
+            satlink_cobs_enc_t e;
+            satlink_cobs_enc_begin(&e, pieces, sizeof(pieces));
+            size_t first = (splits[s] < n) ? splits[s] : n;
+            satlink_cobs_enc_push(&e, body, first);
+            satlink_cobs_enc_push(&e, body + first, n - first);
+            CHECK(satlink_cobs_enc_finish(&e, &piece_len));
+            CHECK_EQ(piece_len, one_len);
+            CHECK_EQ(memcmp(pieces, one_shot, one_len), 0);
+        }
+    }
+
+    /* A zero right after a full run, pushed on its own: the run that stands
+     * for the zero must be opened, closed, and followed by the final run. */
+    {
+        uint8_t with_zero[256];
+        memcpy(with_zero, body, 254);
+        with_zero[254] = 0;
+        with_zero[255] = 0x7B;
+        uint8_t one_shot[SATLINK_WIRE_MAX], pieces[SATLINK_WIRE_MAX];
+        size_t one_len = 0, piece_len = 0;
+        CHECK(satlink_cobs_encode(with_zero, sizeof(with_zero), one_shot, sizeof(one_shot), &one_len));
+        satlink_cobs_enc_t e;
+        satlink_cobs_enc_begin(&e, pieces, sizeof(pieces));
+        satlink_cobs_enc_push(&e, with_zero, 254);
+        satlink_cobs_enc_push(&e, with_zero + 254, 1);
+        satlink_cobs_enc_push(&e, with_zero + 255, 1);
+        CHECK(satlink_cobs_enc_finish(&e, &piece_len));
+        CHECK_EQ(piece_len, one_len);
+        CHECK_EQ(memcmp(pieces, one_shot, one_len), 0);
+        CHECK_EQ(one_len, 254 + 4);           /* FF, 254 bytes, 01, 02 7B */
+        cobs_roundtrip(with_zero, sizeof(with_zero));
+    }
+
+    /* The long form a pre-fix peer still sends -- a full run followed by an
+     * empty trailing run -- must keep decoding to the same body. */
+    {
+        uint8_t legacy[SATLINK_WIRE_MAX];
+        size_t legacy_len = 0;
+        CHECK(satlink_cobs_encode(body, 254, legacy, sizeof(legacy), &legacy_len));
+        CHECK_EQ(legacy_len, 255);
+        legacy[legacy_len++] = 0x01;
+        uint8_t dec[SATLINK_FRAME_MAX];
+        size_t dec_len = 0;
+        CHECK(satlink_cobs_decode(legacy, legacy_len, dec, sizeof(dec), &dec_len));
+        CHECK_EQ(dec_len, 254);
+        CHECK_EQ(memcmp(dec, body, 254), 0);
+    }
+
     /* A zero followed by a long run, and a long run followed by a zero. */
     uint8_t mix[300];
     memset(mix, 0x41, sizeof(mix));

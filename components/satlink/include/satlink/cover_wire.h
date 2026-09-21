@@ -1,5 +1,5 @@
 #pragma once
-/* Protocol 1.5: track-scoped cover reset and JPEG data. Shared with satellite. */
+/* Protocol 1.6: track-scoped cover reset and JPEG data. Shared with satellite. */
 #include <stdint.h>
 #include <stddef.h>
 #define COVER_RESET 0x17

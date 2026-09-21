@@ -7,6 +7,7 @@ void satlink_cobs_enc_begin(satlink_cobs_enc_t *e, uint8_t *out, size_t cap)
     e->len      = 1;     /* out[0] is reserved for the first run length */
     e->code_pos = 0;
     e->code     = 1;
+    e->open     = true;
     e->ok       = (out != NULL && cap >= 1);
 }
 
@@ -21,15 +22,34 @@ void satlink_cobs_enc_push(satlink_cobs_enc_t *e, const uint8_t *data, size_t le
     }
 
     for (size_t i = 0; i < len; i++) {
+        if (!e->open) {
+            /* The previous run was a full one and ended on a push boundary.
+             * Only now is it known that more input follows, so only now does
+             * the next run get its code byte. */
+            if (e->len >= e->cap) { e->ok = false; return; }
+            e->code_pos = e->len++;
+            e->code = 1;
+            e->open = true;
+        }
         if (data[i] != 0) {
             if (e->len >= e->cap) { e->ok = false; return; }
             e->out[e->len++] = data[i];
-            e->code++;
-            if (e->code != 0xFF) {
+            if (++e->code != 0xFF) {
                 continue;
             }
-            /* A full run of 254 non-zero bytes: close it and start another. */
+            /* A full run of 254 non-zero bytes: close it, but do not open the
+             * next one yet. Whether anything follows is not known until the
+             * next byte arrives, and a run opened here for input that never
+             * comes is a trailing 0x01 -- one byte over the ceil(n/254)
+             * overhead the contract states, at every multiple of 254 bytes.
+             * Both decoders accept that form, but the player's encoder stopped
+             * emitting it (sat_link.cpp) and the two sides should agree byte
+             * for byte. */
+            e->out[e->code_pos] = e->code;
+            e->open = false;
+            continue;
         }
+        /* A zero: the run so far stands for it. Close it and open the next. */
         e->out[e->code_pos] = e->code;
         if (e->len >= e->cap) { e->ok = false; return; }
         e->code_pos = e->len++;
@@ -42,7 +62,9 @@ bool satlink_cobs_enc_finish(satlink_cobs_enc_t *e, size_t *out_len)
     if (!e->ok || out_len == NULL) {
         return false;
     }
-    e->out[e->code_pos] = e->code;
+    if (e->open) {
+        e->out[e->code_pos] = e->code;
+    }
     *out_len = e->len;
     return true;
 }

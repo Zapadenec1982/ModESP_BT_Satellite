@@ -128,12 +128,15 @@ static vprintf_like_t    s_prev_vprintf;
 
 /* ------------------------------------------------------------------ outbound */
 
-/* TRACK_POS, LOG and COVER are the three the spec names as droppable. */
+/* TRACK_POS, LOG and COVER are the three the spec names as droppable. The 1.6
+ * cover parts and their END are COVER by another name: END shares the bulk
+ * queue with DATA precisely so that it cannot overtake it. */
 static bool type_is_droppable(uint8_t type)
 {
     return type == SATLINK_MSG_TRACK_POS ||
            type == SATLINK_MSG_LOG ||
-           type == SATLINK_MSG_COVER || type == COVER_DATA;
+           type == SATLINK_MSG_COVER ||
+           type == COVER_DATA || type == COVER_END;
 }
 
 static void tx_item_free(tx_item_t *item)
@@ -181,16 +184,29 @@ static void tx_push_tagged(uint8_t type, const uint8_t *payload, size_t payload_
         return;
     }
 
-    /* Full. Make room by losing the oldest, which for a state message is also the
-     * least interesting one. */
+    if (bulk) {
+        /* Full, and the queue may be carrying a cover image mid-flight. Every
+         * ESP_LOG line is bridged into this same queue, so a burst of logging
+         * used to evict the oldest bulk item -- a cover part, as likely as
+         * not -- and hole the image for the sake of a line the console
+         * already printed. The newest droppable item is the cheapest to lose:
+         * a log line is gone from nowhere but the host, and a TRACK_POS is
+         * superseded within the second. */
+        tx_item_free(&item);
+        s_stats.tx_dropped_bulk++;
+        return;
+    }
+
+    /* Critical and full. Make room by losing the oldest, which for a state
+     * message is also the least interesting one. */
     tx_item_t victim;
     if (xQueueReceive(q, &victim, 0) == pdTRUE) {
         tx_item_free(&victim);
-        if (bulk) { s_stats.tx_dropped_bulk++; } else { s_stats.tx_dropped_critical++; }
+        s_stats.tx_dropped_critical++;
     }
     if (xQueueSend(q, &item, 0) != pdTRUE) {
         tx_item_free(&item);
-        if (bulk) { s_stats.tx_dropped_bulk++; } else { s_stats.tx_dropped_critical++; }
+        s_stats.tx_dropped_critical++;
     }
 }
 

@@ -31,6 +31,7 @@ typedef struct {
     size_t   len;        /* bytes written, including the pending code byte */
     size_t   code_pos;   /* where the run length for the current run goes */
     uint8_t  code;       /* length of the current run, counting the code byte */
+    bool     open;       /* a run is in progress and owns out[code_pos] */
     bool     ok;         /* sticky: one overflow and the rest is a no-op */
 } satlink_cobs_enc_t;
 
