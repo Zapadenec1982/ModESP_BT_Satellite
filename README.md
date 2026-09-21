@@ -59,6 +59,10 @@ belongs to more than this project.
 .\tools\run_host_tests.ps1
 ```
 
+On Linux, and in CI: `tools/setup.sh` then `CC=gcc PYTHON=python3 tools/run_host_tests.sh`
+-- the same steps as the PowerShell scripts. `.github/workflows/build.yml` runs both in
+the official `espressif/idf:v5.5.5` container on every push.
+
 `components/satlink` has no ESP-IDF dependencies on purpose, so the framing, the CRC, the
 reassembler and all nineteen message layouts build and run with a host compiler. A framing bug
 is far cheaper to find in a terminal than over a UART.

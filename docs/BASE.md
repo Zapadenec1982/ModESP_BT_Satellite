@@ -15,7 +15,7 @@ repo/
   idf.pin            # v5.5.5 і хеш тега
   patches/*.patch    # справжні unified diff, тільки правки наявних файлів
   bt_overlay/        # цілком наші файли: каркас кодеків, декодери, libfreeaptx, Helix
-  tools/setup.ps1
+  tools/setup.ps1    # Windows; tools/setup.sh — те саме для Linux і CI
   components/bt/     # у .gitignore, створюється скриптом
 ```
 

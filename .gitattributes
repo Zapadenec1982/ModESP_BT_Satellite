@@ -1,3 +1,10 @@
+# Everything is text and lives in the repository with LF, and is checked out with
+# LF everywhere, so that the Linux CI container and a Windows checkout compile the
+# same bytes. The index already held LF for every file when this rule arrived
+# (git ls-files --eol, 2026-09-21); existing working copies were not renormalised,
+# and `git add --renormalize` remains a deliberate, separate step.
+* text=auto eol=lf
+
 # This checkout runs with core.autocrlf=true, which rewrites line endings on the
 # way in and out. For most of the repository that is harmless. For two trees it is
 # not, so they are marked -text and pass through byte for byte.
