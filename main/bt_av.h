@@ -54,3 +54,18 @@ void bt_av_apply_host_caps(void);
 
 void bt_av_report_state(void);
 void bt_av_report_stream_fmt(void);
+
+/*
+ * Protocol 1.7. The host received this pair's cover broken and wants it again.
+ *
+ * Honoured only when the pair names this boot and the track that is playing now:
+ * a stale pair means the phone has moved on, and the COVER_RESET the next track
+ * brings carries its own image anyway. Bounded, because the observed fault is one
+ * dropped UART frame in a 50 KiB image and one repeat settles that, while a link
+ * that loses frames steadily is a different fault and must not be answered with
+ * unbounded OBEX traffic.
+ *
+ * Called from the link's task. It only raises the same flags a late HELLO does,
+ * because every byte of cover state belongs to the Bluetooth callback task.
+ */
+void bt_av_cover_retry(uint32_t boot_nonce, uint32_t track_generation);

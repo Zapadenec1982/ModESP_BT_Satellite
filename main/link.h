@@ -26,6 +26,11 @@ typedef struct {
     void (*on_gpio_cfg)(const satlink_gpio_cfg_t *cfg);
     void (*on_gpio_out)(uint32_t values, uint32_t mask);
     void (*on_adc_read)(uint8_t index);
+    /* Protocol 1.7. The host's transfer of this pair produced no usable image and
+     * it wants the picture sent again. A hint, not a request: nothing answers it,
+     * nothing waits for it, and ignoring it leaves the host exactly where 1.6
+     * left it -- with an empty tile. */
+    void (*on_cover_retry)(uint32_t boot_nonce, uint32_t track_generation);
 } link_handlers_t;
 
 /* `caps` is what this build can actually do, not what the protocol defines. The

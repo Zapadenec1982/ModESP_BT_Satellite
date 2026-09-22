@@ -164,6 +164,11 @@ static atomic_bool s_cover_refresh;
 static atomic_bool s_cover_query;
 static atomic_uint s_cover_epoch;
 static uint32_t s_cover_nonce;
+/* Repeats of ONE image already served, bounded by COVER_RETRY_MAX. Zeroed by a real
+ * track change and by a transfer that completed -- both are evidence that the next
+ * image starts from a clean link. Atomic because the link task raises it and the
+ * Bluetooth callback task clears it. */
+static atomic_uint s_cover_retries;
 static atomic_uint s_latest_codec_epoch;
 static uint32_t s_codec_epoch;
 static fmt_barrier_t s_format;
@@ -325,6 +330,30 @@ void bt_av_apply_host_caps(void)
     atomic_store(&s_cover_refresh, true);
     atomic_store(&s_cover_query, true);
     atomic_store(&s_caps_pending, true);
+}
+
+void bt_av_cover_retry(uint32_t boot_nonce, uint32_t track_generation)
+{
+    /* s_cover_nonce is written once at start-up and never again, so reading it from
+     * this task is safe; the epoch is atomic because it is not. */
+    if (boot_nonce != s_cover_nonce ||
+        track_generation != (uint32_t)atomic_load(&s_cover_epoch)) {
+        return;     /* the phone has moved on; the next RESET brings its own image */
+    }
+    if (atomic_load(&s_cover_retries) >= COVER_RETRY_MAX) {
+        ESP_LOGW(TAG, "cover art: %u repeats already for generation %" PRIu32 ", not asking the phone again",
+                 (unsigned)COVER_RETRY_MAX, track_generation);
+        return;
+    }
+    atomic_fetch_add(&s_cover_retries, 1);
+    /* The same two flags a late HELLO raises. Re-reading the metadata rather than
+     * only repeating the GET is deliberate: it refreshes the image handle too, so a
+     * retry also recovers the case where the handle, and not the transfer, was the
+     * problem. cover_new_track() then gives it a fresh generation, which the host
+     * needs -- a repeated RESET pair is idempotent and would clear nothing. */
+    atomic_store(&s_cover_refresh, true);
+    atomic_store(&s_cover_query, true);
+    ESP_LOGI(TAG, "cover art: host asked for generation %" PRIu32 " again", track_generation);
 }
 
 void bt_av_format_ready(const fmt_ready_t *ready)
@@ -577,6 +606,9 @@ static void cover_on_data(const esp_avrc_ct_cb_param_t *param)
                  s_now.art_stream.finished ? "queued" : "discarded",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
         s_now.art_done_generation = s_now.art_generation;
+        /* Whatever this image cost in repeats, it arrived: the next one starts with
+         * its full allowance. */
+        if (s_now.art_stream.finished) atomic_store(&s_cover_retries, 0);
     }
     cover_reset();
     // Preserve the OBEX session and its image handles between tracks.
@@ -932,6 +964,10 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
     case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
         switch (param->change_ntf.event_id) {
         case ESP_AVRC_RN_TRACK_CHANGE:
+            /* A new track is a new image, and its allowance is its own. Only here,
+             * not in cover_new_track(): a retry goes through that function too, and
+             * refilling there would make the bound mean nothing. */
+            atomic_store(&s_cover_retries, 0);
             cover_new_track();
             s_now.title[0] = s_now.artist[0] = s_now.album[0] = 0;
             /* Notifications fire once. Re-arm or this is the last one. */

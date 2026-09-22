@@ -96,7 +96,11 @@ static uint32_t own_caps(void)
     uint32_t caps = expander_caps();
 #if !CONFIG_SAT_LINK_ONLY
     caps |= SATLINK_CAP_A2DP_SINK | SATLINK_CAP_AVRCP_META |
-            SATLINK_CAP_ABS_VOLUME | SATLINK_CAP_COVER_ART;
+            SATLINK_CAP_ABS_VOLUME | SATLINK_CAP_COVER_ART |
+            /* Alongside COVER_ART and never without it: the host's gate requires
+             * both, and this build answers COVER_RETRY only for a track whose cover
+             * it was sending in the first place. */
+            SATLINK_CAP_COVER_RETRY;
 #endif
     return caps;
 }
@@ -119,6 +123,7 @@ void app_main(void)
         .on_hello     = on_hello,
 #if !CONFIG_SAT_LINK_ONLY
         .on_format_ready = bt_av_format_ready,
+        .on_cover_retry  = bt_av_cover_retry,
 #endif
         .on_transport = on_transport,
         .on_volume    = on_volume,

@@ -567,6 +567,19 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
         break;
     }
 
+    case SATLINK_MSG_COVER_RETRY: {
+        satlink_cover_retry_t m = {0};
+        if (!satlink_dec_cover_retry(payload, len, &m)) { s_stats.rx_bad++; break; }
+        /* Gated on the host's own cover capability, not only on ours. A host that
+         * is sent no covers at all has nothing that could have failed, so a retry
+         * from it names a transfer that never happened -- and serving it would
+         * cost the phone an OBEX round trip for an image nobody will receive. */
+        if (!s_peer_incompatible && (link_host_caps() & COVER_STREAM_CAP) &&
+            s_handlers.on_cover_retry)
+            s_handlers.on_cover_retry(m.boot_nonce, m.track_generation);
+        break;
+    }
+
     case SATLINK_MSG_ADC_READ: {
         satlink_adc_read_t m = {0};
         if (!satlink_dec_adc_read(payload, len, &m)) { s_stats.rx_bad++; break; }
