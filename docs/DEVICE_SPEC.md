@@ -216,3 +216,12 @@ on a board with about 47 KiB free while LHDC plays, and the bench showed `ring f
 bursts right after every collected image. A host announcing minor < 6, or without
 bits 1 and 6, receives no cover messages at all; it is not offered the legacy
 `0x14 COVER` either. Layouts and numbering are unchanged.
+
+Since 2026-09-22 (stage 10.7, protocol 1.7) a host that received an image broken may
+ask for it again with `COVER_RETRY 0x24`, and device capability bit 6 is what says
+this build answers. A retry repeats the metadata read and the OBEX GET under a new
+track generation -- the host needs a new one, because a repeated `COVER_RESET` pair is
+idempotent by contract. Two repeats per image, counted from the last AVRCP track
+change or the last completed transfer: one dropped frame is what this is for, and a
+link that loses frames steadily is a different fault. A host that does not ask gets
+exactly the 1.6 behaviour, an empty tile.

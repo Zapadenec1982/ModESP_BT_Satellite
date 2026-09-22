@@ -14,7 +14,7 @@ Two, and they are self-contained.
 | | |
 |---|---|
 | [`docs/DEVICE_SPEC.md`](docs/DEVICE_SPEC.md) | the device: hardware, pins, codecs, I2S, behaviour |
-| [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | the link, byte by byte, version 1.0 |
+| [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | the link, byte by byte, version 1.7 |
 | [`docs/BASE.md`](docs/BASE.md) | why the Bluetooth stack is patched and how those patches are carried |
 
 A gap in the specification is a question for the customer, not an invitation to go looking in
