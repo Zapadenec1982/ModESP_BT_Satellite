@@ -161,6 +161,20 @@ typedef struct {
 size_t satlink_enc_cmd_radio(uint8_t *buf, size_t cap, const satlink_cmd_radio_t *m);
 bool   satlink_dec_cmd_radio(const uint8_t *buf, size_t len, satlink_cmd_radio_t *m);
 
+/* ------------------------------------------------------------ 0x24 COVER_RETRY */
+
+/* Protocol 1.7. The host names the pair whose transfer produced no usable image
+ * and asks for it again. An encoder is here as well as a decoder even though only
+ * the host sends it: the golden-vector tests build every message from this side,
+ * and a layout only one end can write is a layout only one end has checked. */
+typedef struct {
+    uint32_t boot_nonce;
+    uint32_t track_generation;
+} satlink_cover_retry_t;
+
+size_t satlink_enc_cover_retry(uint8_t *buf, size_t cap, const satlink_cover_retry_t *m);
+bool   satlink_dec_cover_retry(const uint8_t *buf, size_t len, satlink_cover_retry_t *m);
+
 /* ---------------------------------------------------------------- 0x30 GPIO_IN */
 
 typedef struct {

@@ -272,6 +272,61 @@ static void test_msg_commands(void)
     CHECK_STRICT_LEN(satlink_dec_cmd_radio, radio_out, len);
 }
 
+/*
+ * Protocol 1.7. The bytes are checked against the same frozen vector the player's
+ * own tests carry, so a change made on one side alone fails on that side rather
+ * than on the bench. The document says "exactly 8 bytes, both nonzero", and both
+ * halves of that sentence are load bearing: a zero pair is the shape a truncated
+ * or padded frame takes, and acting on it would cost the phone an OBEX round trip
+ * for an image the host is not assembling.
+ */
+static void test_msg_cover_retry(void)
+{
+    satlink_cover_retry_t retry = { .boot_nonce = 0x11223344u, .track_generation = 5u };
+    size_t len = satlink_enc_cover_retry(g_buf, sizeof(g_buf), &retry);
+    CHECK_EQ(len, 8);
+
+    static const uint8_t wire[8] = { 0x44, 0x33, 0x22, 0x11, 0x05, 0x00, 0x00, 0x00 };
+    CHECK(memcmp(g_buf, wire, sizeof(wire)) == 0);
+
+    satlink_cover_retry_t out = {0};
+    CHECK(satlink_dec_cover_retry(g_buf, len, &out));
+    CHECK_EQ(out.boot_nonce, 0x11223344u);
+    CHECK_EQ(out.track_generation, 5u);
+    CHECK_STRICT_LEN(satlink_dec_cover_retry, out, len);
+
+    /* Neither field may be zero, and the check is per field rather than per pair. */
+    satlink_cover_retry_t no_nonce = { .boot_nonce = 0, .track_generation = 5u };
+    len = satlink_enc_cover_retry(g_buf, sizeof(g_buf), &no_nonce);
+    CHECK_EQ(len, 8);
+    CHECK(!satlink_dec_cover_retry(g_buf, len, &out));
+
+    satlink_cover_retry_t no_gen = { .boot_nonce = 7u, .track_generation = 0 };
+    len = satlink_enc_cover_retry(g_buf, sizeof(g_buf), &no_gen);
+    CHECK_EQ(len, 8);
+    CHECK(!satlink_dec_cover_retry(g_buf, len, &out));
+}
+
+/*
+ * The version and the two capability bits the 1.7 negotiation turns on.
+ *
+ * This is not decoration: bit 6 already means "takes streaming covers" in the HOST
+ * word, and 1.7 gives bit 6 of the DEVICE word a different meaning. A refactor that
+ * merged the two words, or moved either bit, would break a satellite talking to a
+ * panel flashed at a different time -- which is the normal case here, not an edge.
+ */
+static void test_proto_1_7_constants(void)
+{
+    CHECK_EQ(SATLINK_PROTO_MAJOR, 1);
+    CHECK_EQ(SATLINK_PROTO_MINOR, 7);
+    CHECK_EQ(SATLINK_MSG_COVER_RETRY, 0x24);
+    CHECK_EQ(SATLINK_CAP_COVER_RETRY, 1u << 6);   /* device word */
+    CHECK_EQ(SATLINK_CAP_COVER_ART, 1u << 3);
+    CHECK_EQ(COVER_STREAM_CAP, 1u << 6);          /* host word, and a different word */
+    CHECK_EQ(SATLINK_HOST_CAP_COVER, 1u << 1);
+    CHECK_EQ(COVER_RETRY_MAX, 2u);
+}
+
 static void test_msg_gpio_in_out(void)
 {
     satlink_gpio_in_t in = { .values = 0x0000A5A5, .changed = 0x00000021 };
@@ -496,6 +551,8 @@ const test_case_t message_tests[] = {
     { "cover",                 test_msg_cover },
     { "volume state",          test_msg_volume_state },
     { "host commands",         test_msg_commands },
+    { "cover retry",           test_msg_cover_retry },
+    { "protocol 1.7 constants", test_proto_1_7_constants },
     { "gpio in and out",       test_msg_gpio_in_out },
     { "gpio cfg",              test_msg_gpio_cfg },
     { "gpio map",              test_msg_gpio_map },

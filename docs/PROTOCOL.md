@@ -13,9 +13,10 @@
 
 Доповнює `DEVICE_SPEC.md`. Тут розкладки, яких там бракувало.
 
-Ця версія **1.6** і вона узгоджена з другою реалізацією. Міняти можна, але правкою тут і
+Ця версія **1.7** і вона узгоджена з другою реалізацією. Міняти можна, але правкою тут і
 підняттям `proto_minor`.
 
+- **1.7** - host-requested cover retry (`COVER_RETRY`), device capability bit 6.
 - **1.6** - bounded unknown-length cover streaming with length/CRC completion.
 - **1.5** — track-scoped JPEG covers (RESET/DATA); asynchronous transfer and decoding.
 - **1.4** — LHDC V5 codec ID 5; host capability bit 5 authorizes 96 kHz.
@@ -83,6 +84,7 @@ I2S від лінка не залежить, і пристрій, який гр�
 | 3 | обкладинка |
 | 4 | розширювач портів |
 | 5 | АЦП на лініях розширювача |
+| 6 | honours `COVER_RETRY` (`proto_minor` >= 7; requires bit 3) |
 
 `caps` хоста:
 
@@ -320,6 +322,43 @@ I2S configuration failures remain silent; local satellite driver failures requir
 restart before another attempt. An established stream survives missing liveness
 messages, but a pending acknowledged transition never falls back to timer-only.
 
+### `0x24` COVER_RETRY, H → D (1.7)
+
+```
+u32  boot_nonce       // the pair whose transfer failed
+u32  track_generation
+```
+
+Exactly 8 bytes, little endian, both nonzero. Sent only to a device whose HELLO
+carries minor >= 7 and device capability bit 6; otherwise never sent at all, and
+the 1.6 behaviour stands unchanged. A device that does not implement it ignores
+an unknown type, so a mismatched pair costs nothing either way.
+
+The host sends it when a transfer for that pair ended without a usable image: a
+gap, a duplicate or a malformed part, a length or CRC mismatch at `COVER_END`, or
+the five-second silence timeout. It is a hint, not a request-response pair — there
+is no reply, no NACK and no timeout on it, and a host that never hears back simply
+keeps the empty tile 1.6 would have left.
+
+The device honours it only when the pair names its current boot nonce and its
+current track generation. Anything else is ignored: the phone has moved on, and
+the next `COVER_RESET` carries the new image anyway.
+
+**Honouring it means a NEW generation.** The device repeats the OBEX GET and sends
+`COVER_RESET` with a fresh `track_generation`, then `COVER_DATA` from offset zero
+and `COVER_END` as usual. Reusing the failed generation would be wrong, not merely
+inelegant: `COVER_RESET` with a repeated pair is defined above as idempotent, so
+the host would clear nothing and the retry would arrive against a failed assembly.
+
+Both sides bound it, and neither depends on the other's bound. The host asks at
+most twice for one image and not again until an image completes; the device serves
+at most twice per track, counted from the last AVRCP track change or the last
+transfer that completed. Whichever limit is reached first ends the chain and the
+tile stays empty. This exists because the observed fault is one dropped frame in a
+50 KiB image (bench 21.09.2026: `received 18036, next offset 18537`), and one
+repeat is enough for that; a phone or a link that loses frames steadily is a
+different fault and must not be answered with unbounded OBEX traffic.
+
 ### `0x30` GPIO_IN, D → H
 
 ```
@@ -517,3 +556,33 @@ pressure, invalid JPEG or the 256-KiB limit cancels this image without sending E
 The existing 512-byte OBEX MTU / 50-ms continuation pacing remains. Packet total
 size need not be supplied by the phone. UART TX still waits on the hardware FIFO
 semaphore, preserving the audio decoder's opportunity to run.
+
+
+### Cover retry (protocol 1.7)
+
+Until 1.7 a cover lost one frame and was gone. The 1.6 rules are deliberately
+strict — a gap aborts assembly, `COVER_END` commits only on an exact length and
+CRC, and a partial image is never published — and they are right, because half a
+picture is worse than none. What was missing was a way to ask again.
+
+`COVER_RETRY` 0x24 is that, and it is one message and one capability bit. Device
+capability bit 6 says the device honours it; it requires device bit 3 and device
+minor >= 7. No host capability bit is added, because there is nothing the device
+would do differently for knowing: the image handle and the OBEX session are kept
+between tracks already, so serving a retry needs no state held in advance.
+
+**The panel and the satellite are flashed separately, so the mismatched pairs are
+the normal case and both are defined:**
+
+- **1.7 host, pre-1.7 device.** A 1.6 device never sets bit 6, so the host never
+  sends 0x24 and the link behaves exactly as 1.6. Were one sent anyway, the
+  device's dispatcher counts it as an unknown type and ignores it — no error, no
+  desync, and nothing waiting for a reply.
+- **Pre-1.7 host, 1.7 device.** The host never sends 0x24, so the device never
+  retries. Bit 6 is advertised and unused. Again exactly 1.6.
+- **Both 1.7.** A failed transfer costs one repeat of the OBEX GET under a new
+  generation, bounded on both sides as the message describes.
+
+Neither side may treat the absence of a retry as a fault, and neither may wait for
+one: a cover that never arrives leaves the tile empty, which is what happens today
+and is a correct outcome, not a degraded one.

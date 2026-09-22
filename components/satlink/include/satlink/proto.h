@@ -6,14 +6,16 @@
  */
 
 #pragma once
+#include "cover_wire.h"
 #include "format_sync.h"
 
 #include <stdint.h>
 
 #define SATLINK_PROTO_MAJOR   1
 /* 1.3: optional correlated STREAM_PREPARE / STREAM_READY transitions.
- * Legacy STREAM_FMT layouts remain unchanged. */
-#define SATLINK_PROTO_MINOR   6
+ * Legacy STREAM_FMT layouts remain unchanged.
+ * 1.7: COVER_RETRY, device capability bit 6. */
+#define SATLINK_PROTO_MINOR   7
 
 /* The largest decoded frame: type | seq | payload | crc16. */
 #define SATLINK_FRAME_MAX     1040
@@ -40,6 +42,7 @@ typedef enum {
     SATLINK_MSG_CMD_TRANSPORT  = 0x20,  /* H -> D */
     SATLINK_MSG_CMD_VOLUME     = 0x21,  /* H -> D */
     SATLINK_MSG_CMD_RADIO      = 0x22,  /* H -> D */
+    SATLINK_MSG_COVER_RETRY    = COVER_RETRY,  /* H -> D, 1.7 */
     SATLINK_MSG_GPIO_IN        = 0x30,  /* D -> H */
     SATLINK_MSG_GPIO_OUT       = 0x31,  /* H -> D */
     SATLINK_MSG_GPIO_CFG       = 0x32,  /* H -> D */
@@ -56,6 +59,11 @@ typedef enum {
 #define SATLINK_CAP_COVER_ART     (1u << 3)
 #define SATLINK_CAP_EXPANDER      (1u << 4)  /* understands the GPIO messages, not "has pins" */
 #define SATLINK_CAP_ADC           (1u << 5)
+/* 1.7. Says a COVER_RETRY naming the current pair is answered with a fresh
+ * generation and a repeated OBEX GET. Claimed only alongside SATLINK_CAP_COVER_ART:
+ * the host's own gate requires both, and claiming one without the other would
+ * describe something this build does not do. */
+#define SATLINK_CAP_COVER_RETRY   COVER_RETRY_CAP
 
 /* HELLO capability bits, host side. */
 #define SATLINK_HOST_CAP_RELOCK   (1u << 0)  /* can follow STREAM_FMT mid-flight */

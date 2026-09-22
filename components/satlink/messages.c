@@ -330,6 +330,29 @@ bool satlink_dec_cmd_radio(const uint8_t *buf, size_t len, satlink_cmd_radio_t *
     return rd_finish(&r);
 }
 
+/* ----------------------------------------------------------------- COVER_RETRY */
+
+size_t satlink_enc_cover_retry(uint8_t *buf, size_t cap, const satlink_cover_retry_t *m)
+{
+    satlink_wr_t w;
+    satlink_wr_init(&w, buf, cap);
+    satlink_wr_u32(&w, m->boot_nonce);
+    satlink_wr_u32(&w, m->track_generation);
+    return wr_finish(&w);
+}
+
+bool satlink_dec_cover_retry(const uint8_t *buf, size_t len, satlink_cover_retry_t *m)
+{
+    satlink_rd_t r;
+    satlink_rd_init(&r, buf, len);
+    m->boot_nonce       = satlink_rd_u32(&r);
+    m->track_generation = satlink_rd_u32(&r);
+    /* "Both nonzero" is the contract's own wording, and it is what makes the
+     * all-zero frame -- the shape a truncated or padded one takes -- fail here
+     * rather than name a pair and cost the phone an OBEX round trip. */
+    return rd_finish(&r) && m->boot_nonce != 0 && m->track_generation != 0;
+}
+
 /* --------------------------------------------------------------- GPIO_IN, OUT */
 
 size_t satlink_enc_gpio_in(uint8_t *buf, size_t cap, const satlink_gpio_in_t *m)
