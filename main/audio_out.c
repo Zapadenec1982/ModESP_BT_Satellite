@@ -68,9 +68,22 @@ static bool              s_fault;
 static void flush_ring(void);
 static uint32_t           s_rate_hz = AUDIO_RATE_DEFAULT;
 static volatile uint32_t  s_dropped;
-static volatile uint32_t  s_underruns;
+/* Polls of the ring that came back empty, per report window. See audio_out.h for
+ * why this is not the underrun it used to be named after. */
+static volatile uint32_t  s_ring_dry;
+/* TX DMA descriptor-queue overflows: the real starvation, counted in the I2S ISR. */
+static volatile uint32_t  s_dma_starved;
+/* False until the writer has fed the DMA once since the stream started. The first
+ * descriptors of a fresh stream are unclaimed by definition, and counting that as
+ * a fault is how a counter starts crying wolf. */
+static volatile bool      s_dma_primed;
 static volatile uint32_t  s_fill_min = UINT32_MAX;
 static volatile uint32_t  s_fill_max;
+/* Sum and count of the fills sampled in this window, for the mean. 64-bit because
+ * a 10 s window at 100 polls/s of a 24 KiB ring is far inside it but the next
+ * person to widen either number should not have to check. */
+static volatile uint64_t  s_fill_sum;
+static volatile uint32_t  s_fill_n;
 static volatile bool      s_streaming;   /* an empty ring only matters while playing */
 static volatile uint32_t  s_peak;
 /*
@@ -344,17 +357,23 @@ static void audio_report(void)
      * full. Bytes alone do not, because the same count means different things at
      * different rates and widths. */
     unsigned frame_bytes = (unsigned)(s_slot_bits / 8) * 2u;
+    /* The mean, not the peak. Reporting only min and max is what let a ring that
+     * spends most of its time near empty read as "40-60 ms" for a whole session
+     * (item 10.10): those were high-water marks, and the low one beside them was
+     * set by the empty-ring branch itself. */
     unsigned fill_ms = (frame_bytes && s_rate_hz)
-                     ? (unsigned)((uint64_t)st.fill_max * 1000u / (frame_bytes * s_rate_hz))
+                     ? (unsigned)((uint64_t)st.fill_avg * 1000u / (frame_bytes * s_rate_hz))
                      : 0u;
 
-    ESP_LOGI(TAG, "%s %" PRIu32 " Hz %u-bit slots: ring %u..%u of %u (%u ms), underruns %" PRIu32
+    ESP_LOGI(TAG, "%s %" PRIu32 " Hz %u-bit slots: ring %u/%u/%u of %u (%u ms mean)"
+                  ", dry %" PRIu32 ", dma starved %" PRIu32
                   ", dropped %" PRIu32 ", peak %" PRIu32 "/32768 (%u.%u%%), wire %" PRIu32
                   " [%02x %02x %02x %02x %02x %02x %02x %02x], part %" PRIu32 ", free dma %u"
                   ", clock %+d ppm (%+" PRId32 " Hz)",
              s_codec_name, s_rate_hz, s_slot_bits,
-             (unsigned)st.fill_min, (unsigned)st.fill_max, (unsigned)AUDIO_RING_BYTES, fill_ms,
-             st.underruns, st.dropped_bytes, st.peak,
+             (unsigned)st.fill_min, (unsigned)st.fill_avg, (unsigned)st.fill_max,
+             (unsigned)AUDIO_RING_BYTES, fill_ms,
+             st.ring_dry, st.dma_starved, st.dropped_bytes, st.peak,
              peak_permille / 10, peak_permille % 10, st.wire_peak,
              st.wire_head[0], st.wire_head[1], st.wire_head[2], st.wire_head[3],
              st.wire_head[4], st.wire_head[5], st.wire_head[6], st.wire_head[7],
@@ -393,6 +412,31 @@ static uint32_t audio_wire_peak(const uint8_t *p, size_t len)
         if (mag > peak) { peak = mag; }
     }
     return peak;
+}
+
+/*
+ * The one measurement that is actually about the pins.
+ *
+ * The driver hands a finished TX descriptor back through `msg_queue`, and
+ * i2s_channel_write takes them from there to refill. The queue holds desc_num-1
+ * entries, and the write path deliberately keeps one space free, so it is full
+ * only when every buffer has come back and nobody has claimed one: the DMA has
+ * looped over descriptors the application never refilled. With auto_clear set,
+ * what went out of them was silence.
+ *
+ * That is the gap in the music the old `underruns` counter promised and never
+ * looked at -- it watched the application ring, one stage upstream and ~32 ms
+ * of DMA away from the wire.
+ *
+ * Runs in the I2S ISR. No IRAM_ATTR: CONFIG_I2S_ISR_IRAM_SAFE is off, so the
+ * driver's own handler is not IRAM-resident either and marking only this would
+ * buy nothing. One compare and one increment; nothing here can block.
+ */
+static bool audio_dma_starved(i2s_chan_handle_t handle, i2s_event_data_t *event, void *ctx)
+{
+    (void)handle; (void)event; (void)ctx;
+    if (s_streaming && s_dma_primed) { s_dma_starved++; }
+    return false;   /* nothing woken, so no yield needed */
 }
 
 static void i2s_write_locked(const void *data, size_t len)
@@ -485,18 +529,19 @@ static void audio_out_task(void *arg)
         size_t len = 0;
         uint8_t *item = xRingbufferReceiveUpTo(s_ring, &len, 0, AUDIO_CHUNK_BYTES);
         if (item == NULL) {
-            /* Nothing to send. Between tracks that is silence and correct; during
-             * a stream it is a hole in the music, because the DMA fills it with
-             * zeros and says nothing. */
-            // Preserve the existing 100 ms starvation diagnostic cadence.
-            static TickType_t last_empty;
-            const TickType_t now = xTaskGetTickCount();
-            if (s_streaming && now - last_empty >= pdMS_TO_TICKS(100)) {
-                s_underruns++;
-                s_fill_min = 0;
-                last_empty = now;
-            }
+            /* Nothing left in the ring. This is how every drain cycle ends -- the
+             * poll has no timeout and the loop repeats until it comes back empty
+             * -- so on its own it says nothing about the music. What reaches the
+             * pins is decided a stage later, by whether the DMA still has data,
+             * and s_dma_starved is the counter that watches that.
+             *
+             * Counted per window rather than throttled: the old one-per-100-ms
+             * limit capped the number at 10/s regardless of the fault, so it
+             * reported the throttle instead of the condition. */
             if (s_streaming) {
+                s_ring_dry++;
+                s_fill_min = 0;
+                s_fill_n++;          /* a zero fill, so the mean counts it too */
                 audio_servo_sample(0);
             }
             xSemaphoreGive(s_lock);
@@ -548,6 +593,8 @@ static void audio_out_task(void *arg)
         uint32_t fill = (uint32_t)(AUDIO_RING_BYTES - free_bytes);
         if (fill < s_fill_min) { s_fill_min = fill; }
         if (fill > s_fill_max) { s_fill_max = fill; }
+        s_fill_sum += fill;
+        s_fill_n++;
         audio_servo_sample(fill);
 
         if (len != 0) {
@@ -560,6 +607,10 @@ static void audio_out_task(void *arg)
             }
             portEXIT_CRITICAL(&s_peak_lock);
             i2s_write_locked(wire, len);
+            /* The DMA now holds something this stream put there, so an overflow
+             * of its descriptor queue from here on is a real starve and not the
+             * empty pool every stream begins with. */
+            s_dma_primed = true;
         }
         vRingbufferReturnItem(s_ring, item);
         xSemaphoreGive(s_lock);
@@ -607,6 +658,11 @@ esp_err_t audio_out_init(void)
     std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_APLL;
 
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_tx, &std_cfg), TAG, "init_std_mode");
+    /* Before enable: the driver refuses callbacks on a running channel. They live
+     * in the handle and survive the disable/reconfig/enable that a format change
+     * does, so this registration is the only one. */
+    const i2s_event_callbacks_t cbs = { .on_send_q_ovf = audio_dma_starved };
+    ESP_RETURN_ON_ERROR(i2s_channel_register_event_callback(s_tx, &cbs, NULL), TAG, "register_cb");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(s_tx), TAG, "channel_enable");
     s_running = true;
 
@@ -852,7 +908,12 @@ void audio_out_set_codec_name(const char *name)
 
 void audio_out_set_streaming(bool streaming)
 {
-    s_streaming = streaming;
+    /* Cleared on both edges, and before the flag the ISR gates on: a stream begins
+     * with a DMA pool nobody has filled yet, and counting that as starvation is
+     * how a counter starts crying wolf. The writer sets it again on its first
+     * write, which is the moment the DMA first holds this stream's audio. */
+    s_dma_primed = false;
+    s_streaming  = streaming;
 }
 
 void audio_out_get_stats(audio_out_stats_t *out)
@@ -861,9 +922,12 @@ void audio_out_get_stats(audio_out_stats_t *out)
         return;
     }
     out->dropped_bytes = s_dropped;
-    out->underruns     = s_underruns;
+    out->ring_dry      = s_ring_dry;
+    out->dma_starved   = s_dma_starved;
     out->fill_min      = (s_fill_min == UINT32_MAX) ? 0 : s_fill_min;
     out->fill_max      = s_fill_max;
+    const uint32_t n   = s_fill_n;
+    out->fill_avg      = n ? (uint32_t)(s_fill_sum / n) : 0;
     portENTER_CRITICAL(&s_peak_lock);
     out->peak      = s_peak;
     out->wire_peak = s_wire_peak;
@@ -871,6 +935,11 @@ void audio_out_get_stats(audio_out_stats_t *out)
     s_peak      = 0;
     s_wire_peak = 0;
     portEXIT_CRITICAL(&s_peak_lock);
+    /* The window counters restart; dma_starved does not, because zero is the only
+     * good value it has and a running total is what anyone would check. */
+    s_ring_dry = 0;
     s_fill_min = UINT32_MAX;
     s_fill_max = 0;
+    s_fill_sum = 0;
+    s_fill_n   = 0;
 }

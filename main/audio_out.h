@@ -36,15 +36,52 @@ uint32_t audio_out_dropped_bytes(void);
 /*
  * How the output is actually doing.
  *
- * `underruns` is the one that was missing and the one that is audible: when the
- * ring runs dry the DMA sends zeros by design, which is a gap in the music, and
- * nothing in this firmware used to notice. A full ring is loud in the log; an
- * empty one was silent in every sense.
+ * Two different faults used to share the name `underruns`, and only one of them
+ * was ever measured. The field that carried that name counted polls of the
+ * application ring that came back empty -- and the ring sits upstream of a
+ * ~32 ms TX DMA pool (6 descriptors of 240 frames), so an empty ring is not a
+ * gap in the music. It is the ordinary way every drain cycle ends: the writer
+ * polls with no timeout and keeps pulling until there is nothing left.
+ *
+ * That is why it climbed for a whole session (33 -> 4806 over the satellite's
+ * uptime, 21-22.09.2026) while nobody heard anything wrong, and why no amount
+ * of work on the host's DMA moved it. It was never about the host.
+ *
+ * It also could not report severity. The increment was rate limited to one per
+ * 100 ms, so the ceiling was 10/s whatever happened; the observed "~2/s, steady"
+ * was a count of 100 ms windows, not of events. One empty poll in a window and a
+ * thousand printed the same number.
+ *
+ * The figure it was read next to did not help either. `ring 40..60 ms` in the
+ * log is `fill_max`, a ten-second HIGH-water mark, and the `fill_min` beside it
+ * was written to zero by the empty-ring branch itself. So "the ring looks full
+ * while the DMA starves" was one artefact standing next to another. A mean did
+ * exist -- the clock servo has averaged the fill over one second since item
+ * 10.1 -- but it never left the servo, so nothing anyone could read from a log
+ * said whether the ring was steadily full or filled in bursts. `fill_avg`
+ * publishes one over the report window, and the two are finally distinguishable.
+ *
+ * So the names below say what each one measures:
+ *
+ *  - `ring_dry`    -- polls that found the ring empty, in THIS report window.
+ *                     Expected to be non-zero while playing. Interesting only
+ *                     next to `fill_avg`: many dry polls and a low mean is a
+ *                     producer that cannot keep up, many dry polls and a healthy
+ *                     mean is just the writer winning the race, as it should.
+ *  - `dma_starved` -- since boot, and the one that is audible: the TX DMA
+ *                     descriptor queue overflowed, meaning every buffer was
+ *                     handed back unclaimed and the peripheral clocked out the
+ *                     zeros `auto_clear` leaves behind. Zero is the only good
+ *                     value. Counted only once the writer has fed the DMA at
+ *                     least once since the stream started, so the priming of a
+ *                     fresh stream does not register as a fault.
  */
 typedef struct {
     uint32_t dropped_bytes;    /* ring was full: the producer outran the consumer */
-    uint32_t underruns;        /* ring was empty when the writer wanted data */
+    uint32_t ring_dry;         /* this window: the ring was empty when polled */
+    uint32_t dma_starved;      /* since boot: the TX DMA ran out of written data */
     uint32_t fill_min;         /* bytes, lowest seen since the last report */
+    uint32_t fill_avg;         /* bytes, mean over the reads in that window */
     uint32_t fill_max;
     /* Largest absolute sample seen since the last report, 0..32768. It answers
      * one question and answers it without argument: is this device handing over a
