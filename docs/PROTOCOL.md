@@ -61,7 +61,7 @@ D = пристрій, H = хост.
 
 ```
 u8   proto_major = 1
-u8   proto_minor      // версія цього документа, якої дотримується відправник; зараз 3
+u8   proto_minor      // версія цього документа, якої дотримується відправник (див. заголовок)
 u32  caps
 str  build            // "sat 0.1.0 a1b2c3d"
 ```
@@ -351,9 +351,10 @@ inelegant: `COVER_RESET` with a repeated pair is defined above as idempotent, so
 the host would clear nothing and the retry would arrive against a failed assembly.
 
 Both sides bound it, and neither depends on the other's bound. The host asks at
-most twice for one image and not again until an image completes; the device serves
-at most twice per track, counted from the last AVRCP track change or the last
-transfer that completed. Whichever limit is reached first ends the chain and the
+most twice for one image, its allowance restarting when an image completes or when
+a `COVER_RESET` arrives that was not the answer to its own asking; the device
+serves at most twice per track, counted from the last AVRCP track change or the
+last transfer that completed. Whichever limit is reached first ends the chain and the
 tile stays empty. This exists because the observed fault is one dropped frame in a
 50 KiB image (bench 21.09.2026: `received 18036, next offset 18537`), and one
 repeat is enough for that; a phone or a link that loses frames steadily is a
