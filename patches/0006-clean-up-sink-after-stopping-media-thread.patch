@@ -1,0 +1,71 @@
+--- a/host/bluedroid/btc/profile/std/a2dp/btc_a2dp_sink.c
++++ b/host/bluedroid/btc/profile/std/a2dp/btc_a2dp_sink.c
+@@ -129,6 +129,9 @@
+ #define A2DP_TASK_WORKQUEUE_NUM          (2)
+ #define A2DP_TASK_WORKQUEUE0_LEN         (1)
+ #define A2DP_TASK_WORKQUEUE1_LEN         (4)
++/* How long shutdown waits for the control work queued ahead of it: the same
++ * bound osi_thread_stop() gives a thread to exit. */
++#define A2DP_TASK_DRAIN_MS               (1000)
+ 
+ typedef struct {
+     uint32_t sig;
+@@ -422,6 +425,12 @@
+     return false;
+ }
+ 
++/* Runs on the media thread behind the control work already queued there. */
++static void btc_a2dp_sink_drained(void *context)
++{
++    osi_sem_give((osi_sem_t *)context);
++}
++
+ void btc_a2dp_sink_shutdown(void)
+ {
+     APPL_TRACE_EVENT("## A2DP SINK STOP MEDIA THREAD ##\n");
+@@ -429,19 +438,35 @@
+     // Exit thread
+     btc_a2dp_sink_state = BTC_A2DP_SINK_STATE_SHUTTING_DOWN;
+ 
+-    /* Post cleanup BEFORE freeing the thread so it actually runs */
+-    BT_HDR *p_buf = (BT_HDR*)osi_malloc(sizeof(BT_HDR));
+-    if (p_buf) {
+-        p_buf->event = BTC_MEDIA_TASK_SINK_CLEAN_UP;
+-        osi_thread_post(a2dp_sink_local_param.btc_aa_snk_task_hdl,
+-                        btc_a2dp_sink_ctrl, p_buf, 0, OSI_THREAD_MAX_TIMEOUT);
++    /*
++     * Stop the media thread, then clean up here on the calling task. That is
++     * what stock Bluedroid does: its sink has no thread of its own and runs the
++     * cleanup synchronously.
++     *
++     * Posting the cleanup and freeing the thread straight after is the AOSP
++     * idiom, where a thread runs what is queued before it exits. This osi does
++     * not: osi_thread_run() tests the stop flag before every item, so unless
++     * the thread won the race the cleanup was dropped unrun. The state stayed
++     * SHUTTING_DOWN, the next startup refused with "media task already
++     * running", and the decoder, decode_buf, RxSbcQ and data_ready_event leaked.
++     *
++     * Control work already queued still runs first, because each item carries
++     * a buffer that only its handler frees. Both waits are bounded, and the
++     * semaphore is freed only once the thread is gone, so a late signal cannot
++     * land on freed memory. Nothing in the cleanup is tied to the task that
++     * runs it, and with the thread joined nothing else touches that state.
++     */
++    osi_sem_t drained = NULL;
++    if (osi_sem_new(&drained, 1, 0) == 0 &&
++        osi_thread_post(a2dp_sink_local_param.btc_aa_snk_task_hdl, btc_a2dp_sink_drained,
++                        &drained, 0, A2DP_TASK_DRAIN_MS)) {
++        osi_sem_take(&drained, A2DP_TASK_DRAIN_MS);
+     }
+-
+     osi_thread_free(a2dp_sink_local_param.btc_aa_snk_task_hdl);
+-
+-    APPL_TRACE_EVENT("## A2DP SINK MEDIA THREAD STARTED ##\n");
+-
+     a2dp_sink_local_param.btc_aa_snk_task_hdl = NULL;
++    osi_sem_free(&drained);
++
++    btc_a2dp_sink_thread_cleanup(NULL);
+ 
+ #if A2D_DYNAMIC_MEMORY == TRUE
+     osi_free(a2dp_sink_local_param_ptr);

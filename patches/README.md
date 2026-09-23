@@ -9,6 +9,14 @@ then copy `bt_overlay/`. `tools/setup.ps1 -Clean` reproduces the local ignored
 - `0002-notify-btc-on-queued-stream-reopen.patch`: complete the existing incoming
   configuration notification when CONFIG is dispatched from INIT after a queued
   CLOSE. This prevents BTC remaining IDLE during a peer codec switch.
+- `0006-clean-up-sink-after-stopping-media-thread.patch`: 0001 gives the sink a
+  media thread of its own and shuts it down by posting the cleanup and freeing the
+  thread at once. This osi drops queued work when a thread stops, so unless the
+  thread won that race the cleanup never ran: an `esp_a2d_sink_deinit()`/init
+  pair, including the endpoint re-registration in `main/endpoint_policy.h`, then
+  ended in "media task already running" and no A2DP until reboot. Queued control
+  work is let through, the thread is stopped, then the cleanup runs on the
+  calling task, as in stock IDF.
 
 Patch paths are relative to `components/bt`; setup uses
 `git apply --directory=components/bt` and stops on a rejected hunk.
