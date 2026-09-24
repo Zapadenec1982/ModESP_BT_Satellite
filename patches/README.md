@@ -17,6 +17,13 @@ then copy `bt_overlay/`. `tools/setup.ps1 -Clean` reproduces the local ignored
   ended in "media task already running" and no A2DP until reboot. Queued control
   work is let through, the thread is stopped, then the cleanup runs on the
   calling task, as in stock IDF.
+- `0007-hand-just-works-and-peer-name-to-the-application.patch`: stock BTC answers
+  a Just Works confirmation itself (`btc_dm_sp_cfm_req_evt`) and never tells the
+  application, so with the host confirming pairings (protocol 1.8) a peer that
+  claims no display would pair past it. The request now reaches the application
+  flagged `just_works`, and the confirmation and the passkey notification both
+  carry the peer name BTA has already read. The application must answer every
+  confirmation, Just Works included.
 
 Patch paths are relative to `components/bt`; setup uses
 `git apply --directory=components/bt` and stops on a rejected hunk.

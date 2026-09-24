@@ -1,0 +1,65 @@
+--- a/host/bluedroid/api/include/api/esp_gap_bt_api.h
++++ b/host/bluedroid/api/include/api/esp_gap_bt_api.h
+@@ -471,6 +471,8 @@
+     struct cfm_req_param {
+         esp_bd_addr_t bda;                     /*!< remote bluetooth device address*/
+         uint32_t num_val;                      /*!< the numeric value for comparison. */
++        bool just_works;                       /*!< Just Works: nothing to compare, num_val means nothing; still needs a reply */
++        uint8_t device_name[ESP_BT_GAP_MAX_BDNAME_LEN + 1]; /*!< peer name as read during pairing, empty if unknown */
+     } cfm_req;                                 /*!< confirm request parameter struct */
+ 
+     /**
+@@ -479,6 +481,7 @@
+     struct key_notif_param {
+         esp_bd_addr_t bda;                     /*!< remote bluetooth device address*/
+         uint32_t passkey;                      /*!< the numeric value for passkey entry. */
++        uint8_t device_name[ESP_BT_GAP_MAX_BDNAME_LEN + 1]; /*!< peer name as read during pairing, empty if unknown */
+     } key_notif;                               /*!< passkey notif parameter struct */
+ 
+     /**
+--- a/host/bluedroid/btc/core/btc_dm.c
++++ b/host/bluedroid/btc/core/btc_dm.c
+@@ -500,12 +500,11 @@
+ #if (CLASSIC_BT_INCLUDED == TRUE)
+ static void btc_dm_sp_cfm_req_evt(tBTA_DM_SP_CFM_REQ *p_cfm_req)
+ {
+-    if (p_cfm_req->just_works) {
+-        // just work, not show to users.
+-        BTA_DmConfirm(p_cfm_req->bd_addr, true);
+-        return;
+-    }
+-
++    /* Just Works goes to the application as well, flagged, rather than being
++     * answered yes here. An application that puts pairing in front of a person
++     * has to see every request: answered here, a peer that claims to have no
++     * display would pair past that person without being asked. The application
++     * replies to both kinds with esp_bt_gap_ssp_confirm_reply(). */
+     esp_bt_gap_cb_param_t param;
+     bt_status_t ret;
+     btc_msg_t *msg;
+@@ -518,8 +517,13 @@
+     msg->sig = BTC_SIG_API_CB;
+     msg->pid = BTC_PID_GAP_BT;
+     msg->act = BTC_GAP_BT_CFM_REQ_EVT;
++    memset(&param, 0, sizeof(param));
+     param.cfm_req.num_val = p_cfm_req->num_val;
++    param.cfm_req.just_works = p_cfm_req->just_works;
+     memcpy(param.cfm_req.bda, p_cfm_req->bd_addr, ESP_BD_ADDR_LEN);
++    /* BTA reads the peer's name before it passes the request up, when it can. */
++    memcpy(param.cfm_req.device_name, p_cfm_req->bd_name, ESP_BT_GAP_MAX_BDNAME_LEN);
++    param.cfm_req.device_name[ESP_BT_GAP_MAX_BDNAME_LEN] = '\0';
+     memcpy(msg->arg, &param, sizeof(esp_bt_gap_cb_param_t));
+ 
+     ret = btc_inter_profile_call(msg);
+@@ -544,8 +548,11 @@
+     msg->sig = BTC_SIG_API_CB;
+     msg->pid = BTC_PID_GAP_BT;
+     msg->act = BTC_GAP_BT_KEY_NOTIF_EVT;
++    memset(&param, 0, sizeof(param));
+     param.key_notif.passkey = p_key_notif->passkey;
+     memcpy(param.key_notif.bda, p_key_notif->bd_addr, ESP_BD_ADDR_LEN);
++    memcpy(param.key_notif.device_name, p_key_notif->bd_name, ESP_BT_GAP_MAX_BDNAME_LEN);
++    param.key_notif.device_name[ESP_BT_GAP_MAX_BDNAME_LEN] = '\0';
+     memcpy(msg->arg, &param, sizeof(esp_bt_gap_cb_param_t));
+ 
+     ret = btc_inter_profile_call(msg);
