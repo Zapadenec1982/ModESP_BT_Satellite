@@ -14,6 +14,7 @@ int g_checks, g_failures;
 #define LINK_HELLO_MIN_GAP_US (1000 * 1000)
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGE(...) ((void)0)
+#define ESP_LOGW(...) ((void)0)
 #define portENTER_CRITICAL(lock) ((void)(lock))
 #define portEXIT_CRITICAL(lock) ((void)(lock))
 static int s_hello_mux;
@@ -21,7 +22,7 @@ static atomic_bool s_host_present, s_peer_incompatible;
 static uint32_t s_host_caps, s_own_caps, s_ping_outstanding;
 static uint8_t s_host_minor;
 static int64_t s_last_hello_us, clock_us;
-static struct { unsigned rx_bad, hello_sent, pings_unanswered; } s_stats;
+static struct { unsigned rx_bad, hello_sent, rx_echoes, pings_unanswered; } s_stats;
 static struct { void (*on_hello)(const satlink_hello_t *); } s_handlers;
 typedef struct { char version[32], idf_ver[32]; } esp_app_desc_t;
 static const esp_app_desc_t *esp_app_get_description(void) {
@@ -95,6 +96,19 @@ int main(void) {
     receive_hello(1, 8, 0x80); CHECK(s_host_caps == 0x80);
     receive_hello(1, 9, 0xfb); CHECK(s_host_caps == 0xfb); CHECK(s_host_minor == 9);
     receive_hello(1, 6, 0xfb); CHECK(s_host_caps == 0x7b); CHECK(s_host_minor == 6);
+    // Our own greeting heard back off a floating wire is not a host: nothing
+    // changes, and above all our BT_SETTINGS is not taken for PAIR_CONFIRM.
+    reset_case(); s_own_caps = 0xdf; answer_hello(); CHECK(hellos == 1);
+    uint8_t own[LINK_BUF_HELLO];
+    size_t own_len = encode_own_hello(own, sizeof own);
+    CHECK(own_len != 0);
+    handle_hello(own, own_len);
+    CHECK(!s_host_present); CHECK(s_host_caps == 0); CHECK(s_host_minor == 0);
+    CHECK(callbacks == 0); CHECK(s_stats.rx_echoes == 1); CHECK(s_stats.rx_bad == 0);
+    beat(); CHECK(hellos == 2);                 // still greeting: no host has answered
+    // A real host with the very same caps but its own build is still a host.
+    receive_hello(1, 8, 0xdf); CHECK(s_host_present); CHECK(s_host_caps == 0xdf);
+    s_own_caps = 0;
     // A known incompatible host is not a lost greeting; do not retry forever.
     reset_case(); answer_hello(); receive_hello(2, 0, 0);
     CHECK(s_peer_incompatible); CHECK(!s_host_present); CHECK(callbacks == 0);

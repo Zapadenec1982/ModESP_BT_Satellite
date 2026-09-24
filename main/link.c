@@ -435,7 +435,8 @@ void link_send_bond_list(const satlink_bond_list_t *m)
     free(payload);
 }
 
-static void send_hello(void)
+/* Our greeting, byte for byte as it goes on the wire. 0 if it will not fit. */
+static size_t encode_own_hello(uint8_t *payload, size_t cap)
 {
     const esp_app_desc_t *app = esp_app_get_description();
     /* Both fields are 32 bytes in the descriptor, so this is sized to hold them
@@ -451,8 +452,13 @@ static void send_hello(void)
         .caps  = s_own_caps,
         .build = satlink_str_clip(build, LINK_BUILD_MAX),
     };
+    return satlink_enc_hello(payload, cap, &m);
+}
+
+static void send_hello(void)
+{
     uint8_t payload[LINK_BUF_HELLO];
-    size_t len = satlink_enc_hello(payload, sizeof(payload), &m);
+    size_t len = encode_own_hello(payload, sizeof(payload));
     if (len == 0) {
         /* Never observed, but it would have been invisible if it happened: the
          * link would simply never come up and each side would blame the other. */
@@ -487,6 +493,24 @@ static void answer_hello(void)
 
 static void handle_hello(const uint8_t *payload, size_t len)
 {
+    /*
+     * Our own greeting, come back off the wire. A receive line that nothing
+     * drives picks up the transmit line beside it; on the bench, before the
+     * panel's first greeting, one came back whole and passed its CRC. Taken for
+     * the host's, it had this device trusting its own capabilities as the
+     * host's -- and our BT_SETTINGS is the host's PAIR_CONFIRM, bit for bit, so
+     * pairing went to a confirmer that was not there. A host never sends our
+     * build string, so a payload identical to ours is ours.
+     */
+    uint8_t own[LINK_BUF_HELLO];
+    size_t own_len = encode_own_hello(own, sizeof(own));
+    if (own_len != 0 && own_len == len && memcmp(own, payload, len) == 0) {
+        if (s_stats.rx_echoes++ == 0) {
+            ESP_LOGW(TAG, "our own HELLO came back: the receive line hears the transmit line");
+        }
+        return;
+    }
+
     satlink_hello_t h = {0};
     if (!satlink_dec_hello(payload, len, &h)) {
         s_stats.rx_bad++;
@@ -770,12 +794,12 @@ static void report_stats(void)
 
     ESP_LOGI(TAG, "tx %" PRIu32 " (dropped %" PRIu32 "/%" PRIu32 ", hello %" PRIu32 "), "
                   "rx %" PRIu32 " bytes %" PRIu32 " frames "
-                  "(bad %" PRIu32 ", gaps %" PRIu32 ", unknown %" PRIu32 ", overrun %" PRIu32 "), "
-                  "pings unanswered %" PRIu32,
+                  "(bad %" PRIu32 ", gaps %" PRIu32 ", unknown %" PRIu32 ", overrun %" PRIu32
+                  ", own hello %" PRIu32 "), pings unanswered %" PRIu32,
              s_stats.tx_frames, s_stats.tx_dropped_bulk, s_stats.tx_dropped_critical,
              s_stats.hello_sent,
              s_stats.rx_bytes, s_stats.rx_frames, s_stats.rx_bad, s_stats.rx_seq_gaps,
-             s_stats.rx_unknown, s_stats.rx_overruns, s_stats.pings_unanswered);
+             s_stats.rx_unknown, s_stats.rx_overruns, s_stats.rx_echoes, s_stats.pings_unanswered);
     if (s_host_present) {
         ESP_LOGI(TAG, "round trip %" PRIu32 " ms", s_stats.rtt_ms);
     }

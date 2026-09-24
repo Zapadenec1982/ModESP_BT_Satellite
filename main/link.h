@@ -122,6 +122,9 @@ typedef struct {
      * and "we answered and it was lost" are different faults with the same
      * symptom, and this is what tells them apart. */
     uint32_t hello_sent;
+    /* Our own HELLOs heard back, which a floating receive line does: counted
+     * and ignored, never taken for the host's. */
+    uint32_t rx_echoes;
     uint32_t pings_unanswered;
     uint32_t rtt_ms;               /* last round trip, from our PING to its PONG */
 } link_stats_t;
