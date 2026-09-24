@@ -276,6 +276,120 @@ bool satlink_dec_volume_state(const uint8_t *buf, size_t len, satlink_volume_sta
     return rd_finish(&r);
 }
 
+/* ------------------------------------------------ PAIR_REQUEST .. BOND_LIST, 1.8 */
+
+size_t satlink_enc_pair_request(uint8_t *buf, size_t cap, const satlink_pair_request_t *m)
+{
+    satlink_wr_t w;
+    satlink_wr_init(&w, buf, cap);
+    satlink_wr_bytes(&w, m->addr, sizeof(m->addr));
+    satlink_wr_u8(&w, m->kind);
+    satlink_wr_u32(&w, m->passkey);
+    wr_str(&w, &m->name);
+    return wr_finish(&w);
+}
+
+bool satlink_dec_pair_request(const uint8_t *buf, size_t len, satlink_pair_request_t *m)
+{
+    satlink_rd_t r;
+    satlink_rd_init(&r, buf, len);
+    if (!satlink_rd_bytes(&r, m->addr, sizeof(m->addr))) { return false; }
+    m->kind    = satlink_rd_u8(&r);
+    m->passkey = satlink_rd_u32(&r);
+    if (!rd_str(&r, &m->name)) { return false; }
+    if (!rd_finish(&r)) { return false; }
+    /* The ranges are the contract's, and each one is a code a person would read
+     * off a screen and compare: a number with seven digits, or a code on a request
+     * that has none, is a broken frame and not something to show. */
+    if (m->kind > SATLINK_PAIR_PASSKEY || m->passkey > SATLINK_PASSKEY_MAX) { return false; }
+    if (m->kind == SATLINK_PAIR_CONSENT && m->passkey != 0) { return false; }
+    return m->name.len <= SATLINK_BT_NAME_MAX;
+}
+
+size_t satlink_enc_pair_result(uint8_t *buf, size_t cap, const satlink_pair_result_t *m)
+{
+    satlink_wr_t w;
+    satlink_wr_init(&w, buf, cap);
+    satlink_wr_bytes(&w, m->addr, sizeof(m->addr));
+    satlink_wr_u8(&w, m->status);
+    return wr_finish(&w);
+}
+
+bool satlink_dec_pair_result(const uint8_t *buf, size_t len, satlink_pair_result_t *m)
+{
+    satlink_rd_t r;
+    satlink_rd_init(&r, buf, len);
+    if (!satlink_rd_bytes(&r, m->addr, sizeof(m->addr))) { return false; }
+    /* Not range-checked: from 4 up is reserved and read as FAILED, which is a
+     * meaning, not an error. */
+    m->status = satlink_rd_u8(&r);
+    return rd_finish(&r);
+}
+
+size_t satlink_enc_bt_config(uint8_t *buf, size_t cap, const satlink_bt_config_t *m)
+{
+    satlink_wr_t w;
+    satlink_wr_init(&w, buf, cap);
+    satlink_wr_u8(&w, m->radio);
+    satlink_wr_u8(&w, m->discoverable);
+    satlink_wr_u8(&w, m->auto_reconnect);
+    satlink_wr_u8(&w, m->codecs_supported);
+    satlink_wr_u8(&w, m->codecs_enabled);
+    wr_str(&w, &m->name);
+    return wr_finish(&w);
+}
+
+bool satlink_dec_bt_config(const uint8_t *buf, size_t len, satlink_bt_config_t *m)
+{
+    satlink_rd_t r;
+    satlink_rd_init(&r, buf, len);
+    m->radio            = satlink_rd_u8(&r);
+    m->discoverable     = satlink_rd_u8(&r);
+    m->auto_reconnect   = satlink_rd_u8(&r);
+    m->codecs_supported = satlink_rd_u8(&r);
+    m->codecs_enabled   = satlink_rd_u8(&r);
+    if (!rd_str(&r, &m->name)) { return false; }
+    if (!rd_finish(&r)) { return false; }
+    if (m->radio > 1 || m->discoverable > 1 || m->auto_reconnect > 1) { return false; }
+    /* SBC is the floor every A2DP sink must offer, so a report without it, or one
+     * enabling a codec the build does not have, describes no device that exists. */
+    if (!(m->codecs_supported & SATLINK_CODEC_BIT_SBC) ||
+        !(m->codecs_enabled & SATLINK_CODEC_BIT_SBC) ||
+        (m->codecs_enabled & ~m->codecs_supported) != 0) { return false; }
+    return m->name.len >= 1 && m->name.len <= SATLINK_BT_NAME_MAX;
+}
+
+size_t satlink_enc_bond_list(uint8_t *buf, size_t cap, const satlink_bond_list_t *m)
+{
+    if (m->count > SATLINK_BOND_LIST_MAX) { return 0; }
+    satlink_wr_t w;
+    satlink_wr_init(&w, buf, cap);
+    satlink_wr_u8(&w, m->total);
+    satlink_wr_u8(&w, m->count);
+    for (uint8_t i = 0; i < m->count; i++) {
+        satlink_wr_bytes(&w, m->bonds[i].addr, sizeof(m->bonds[i].addr));
+        satlink_wr_u8(&w, m->bonds[i].flags);
+        wr_str(&w, &m->bonds[i].name);
+    }
+    return wr_finish(&w);
+}
+
+bool satlink_dec_bond_list(const uint8_t *buf, size_t len, satlink_bond_list_t *m)
+{
+    satlink_rd_t r;
+    satlink_rd_init(&r, buf, len);
+    m->total = satlink_rd_u8(&r);
+    m->count = satlink_rd_u8(&r);
+    if (!r.ok || m->count > SATLINK_BOND_LIST_MAX || m->count > m->total) { return false; }
+    for (uint8_t i = 0; i < m->count; i++) {
+        if (!satlink_rd_bytes(&r, m->bonds[i].addr, sizeof(m->bonds[i].addr))) { return false; }
+        m->bonds[i].flags = satlink_rd_u8(&r);
+        if (!rd_str(&r, &m->bonds[i].name)) { return false; }
+        if (m->bonds[i].name.len > SATLINK_BT_NAME_MAX) { return false; }
+    }
+    return rd_finish(&r);
+}
+
 /* ------------------------------------------------------------- host commands */
 
 size_t satlink_enc_cmd_transport(uint8_t *buf, size_t cap, const satlink_cmd_transport_t *m)
@@ -351,6 +465,75 @@ bool satlink_dec_cover_retry(const uint8_t *buf, size_t len, satlink_cover_retry
      * all-zero frame -- the shape a truncated or padded one takes -- fail here
      * rather than name a pair and cost the phone an OBEX round trip. */
     return rd_finish(&r) && m->boot_nonce != 0 && m->track_generation != 0;
+}
+
+/* ---------------------------------------------- PAIR_REPLY .. BT_REFRESH, 1.8 */
+
+size_t satlink_enc_pair_reply(uint8_t *buf, size_t cap, const satlink_pair_reply_t *m)
+{
+    satlink_wr_t w;
+    satlink_wr_init(&w, buf, cap);
+    satlink_wr_bytes(&w, m->addr, sizeof(m->addr));
+    satlink_wr_u8(&w, m->accept);
+    return wr_finish(&w);
+}
+
+bool satlink_dec_pair_reply(const uint8_t *buf, size_t len, satlink_pair_reply_t *m)
+{
+    satlink_rd_t r;
+    satlink_rd_init(&r, buf, len);
+    if (!satlink_rd_bytes(&r, m->addr, sizeof(m->addr))) { return false; }
+    m->accept = satlink_rd_u8(&r);
+    /* Strictly 0 or 1. Everywhere else "nonzero is yes" is harmless; here yes means
+     * a new phone joins, and a stray byte must not be the thing that says so. A
+     * refused reply leaves the request to time out, which is a no. */
+    return rd_finish(&r) && m->accept <= 1;
+}
+
+size_t satlink_enc_bt_config_set(uint8_t *buf, size_t cap, const satlink_bt_config_set_t *m)
+{
+    satlink_wr_t w;
+    satlink_wr_init(&w, buf, cap);
+    satlink_wr_u8(&w, m->radio);
+    satlink_wr_u8(&w, m->discoverable);
+    satlink_wr_u8(&w, m->auto_reconnect);
+    satlink_wr_u8(&w, m->codecs_enabled);
+    wr_str(&w, &m->name);
+    return wr_finish(&w);
+}
+
+bool satlink_dec_bt_config_set(const uint8_t *buf, size_t len, satlink_bt_config_set_t *m)
+{
+    satlink_rd_t r;
+    satlink_rd_init(&r, buf, len);
+    m->radio          = satlink_rd_u8(&r);
+    m->discoverable   = satlink_rd_u8(&r);
+    m->auto_reconnect = satlink_rd_u8(&r);
+    m->codecs_enabled = satlink_rd_u8(&r);
+    if (!rd_str(&r, &m->name)) { return false; }
+    return rd_finish(&r);
+}
+
+size_t satlink_enc_bond_remove(uint8_t *buf, size_t cap, const satlink_bond_remove_t *m)
+{
+    satlink_wr_t w;
+    satlink_wr_init(&w, buf, cap);
+    satlink_wr_bytes(&w, m->addr, sizeof(m->addr));
+    return wr_finish(&w);
+}
+
+bool satlink_dec_bond_remove(const uint8_t *buf, size_t len, satlink_bond_remove_t *m)
+{
+    satlink_rd_t r;
+    satlink_rd_init(&r, buf, len);
+    if (!satlink_rd_bytes(&r, m->addr, sizeof(m->addr))) { return false; }
+    return rd_finish(&r);
+}
+
+bool satlink_dec_bt_refresh(const uint8_t *buf, size_t len)
+{
+    (void)buf;
+    return len == 0;
 }
 
 /* --------------------------------------------------------------- GPIO_IN, OUT */

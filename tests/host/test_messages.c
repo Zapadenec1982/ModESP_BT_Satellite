@@ -318,13 +318,234 @@ static void test_msg_cover_retry(void)
 static void test_proto_1_7_constants(void)
 {
     CHECK_EQ(SATLINK_PROTO_MAJOR, 1);
-    CHECK_EQ(SATLINK_PROTO_MINOR, 7);
+    CHECK(SATLINK_PROTO_MINOR >= 7);
     CHECK_EQ(SATLINK_MSG_COVER_RETRY, 0x24);
     CHECK_EQ(SATLINK_CAP_COVER_RETRY, 1u << 6);   /* device word */
     CHECK_EQ(SATLINK_CAP_COVER_ART, 1u << 3);
     CHECK_EQ(COVER_STREAM_CAP, 1u << 6);          /* host word, and a different word */
     CHECK_EQ(SATLINK_HOST_CAP_COVER, 1u << 1);
     CHECK_EQ(COVER_RETRY_MAX, 2u);
+}
+
+/* 1.8 gives bit 7 a meaning in both words, and they are different meanings: the
+ * device says it has settings, the host says it will show a pairing code. The
+ * numbering is the panel's as much as ours. */
+static void test_proto_1_8_constants(void)
+{
+    CHECK_EQ(SATLINK_PROTO_MINOR, 8);
+    CHECK_EQ(SATLINK_CAP_BT_SETTINGS, 1u << 7);
+    CHECK_EQ(SATLINK_HOST_CAP_PAIR_CONFIRM, 1u << 7);
+    CHECK_EQ(SATLINK_MSG_PAIR_REQUEST, 0x1A);
+    CHECK_EQ(SATLINK_MSG_PAIR_RESULT, 0x1B);
+    CHECK_EQ(SATLINK_MSG_BT_CONFIG, 0x1C);
+    CHECK_EQ(SATLINK_MSG_BOND_LIST, 0x1D);
+    CHECK_EQ(SATLINK_MSG_PAIR_REPLY, 0x25);
+    CHECK_EQ(SATLINK_MSG_BT_CONFIG_SET, 0x26);
+    CHECK_EQ(SATLINK_MSG_BOND_REMOVE, 0x27);
+    CHECK_EQ(SATLINK_MSG_BT_REFRESH, 0x28);
+    CHECK_EQ(SATLINK_CODEC_BIT_SBC | SATLINK_CODEC_BIT_AAC | SATLINK_CODEC_BIT_APTX |
+             SATLINK_CODEC_BIT_APTX_HD | SATLINK_CODEC_BIT_LHDC_V5, 0x1F);
+    CHECK_EQ(SATLINK_BOND_LIST_BYTES_MAX, 658);
+    CHECK(SATLINK_BOND_LIST_BYTES_MAX <= SATLINK_PAYLOAD_MAX);
+}
+
+static const uint8_t k_addr[6] = { 0xDC, 0xE5, 0x5B, 0xEA, 0xC9, 0x3B };
+
+static void test_msg_pair_request_result(void)
+{
+    satlink_pair_request_t req = { .kind = SATLINK_PAIR_NUMERIC, .passkey = 123456,
+                                   .name = satlink_str("Pixel") };
+    memcpy(req.addr, k_addr, 6);
+    size_t len = satlink_enc_pair_request(g_buf, sizeof(g_buf), &req);
+    CHECK_EQ(len, 6 + 1 + 4 + 2 + 5);
+    static const uint8_t wire[] = { 0xDC, 0xE5, 0x5B, 0xEA, 0xC9, 0x3B, 0x00,
+                                    0x40, 0xE2, 0x01, 0x00, 0x05, 0x00,
+                                    'P', 'i', 'x', 'e', 'l' };
+    CHECK(len == sizeof(wire) && memcmp(g_buf, wire, sizeof(wire)) == 0);
+
+    satlink_pair_request_t out = {0};
+    CHECK(satlink_dec_pair_request(g_buf, len, &out));
+    CHECK(memcmp(out.addr, k_addr, 6) == 0);
+    CHECK_EQ(out.kind, SATLINK_PAIR_NUMERIC);
+    CHECK_EQ(out.passkey, 123456);
+    CHECK(out.name.len == 5 && memcmp(out.name.ptr, "Pixel", 5) == 0);
+    CHECK_STRICT_LEN(satlink_dec_pair_request, out, len);
+
+    /* The three shapes the contract allows, and the ones it does not. */
+    satlink_pair_request_t r = req;
+    r.kind = SATLINK_PAIR_CONSENT; r.passkey = 0;
+    CHECK(satlink_dec_pair_request(g_buf, satlink_enc_pair_request(g_buf, sizeof(g_buf), &r), &out));
+    r.passkey = 5;                                          /* a code on a request that has none */
+    CHECK(!satlink_dec_pair_request(g_buf, satlink_enc_pair_request(g_buf, sizeof(g_buf), &r), &out));
+    r.kind = SATLINK_PAIR_PASSKEY; r.passkey = 999999;
+    CHECK(satlink_dec_pair_request(g_buf, satlink_enc_pair_request(g_buf, sizeof(g_buf), &r), &out));
+    r.passkey = 1000000;                                    /* seven digits */
+    CHECK(!satlink_dec_pair_request(g_buf, satlink_enc_pair_request(g_buf, sizeof(g_buf), &r), &out));
+    r.passkey = 1; r.kind = 3;
+    CHECK(!satlink_dec_pair_request(g_buf, satlink_enc_pair_request(g_buf, sizeof(g_buf), &r), &out));
+    r.kind = SATLINK_PAIR_NUMERIC;
+    r.name = satlink_str("");                               /* the phone's name may be unknown */
+    CHECK(satlink_dec_pair_request(g_buf, satlink_enc_pair_request(g_buf, sizeof(g_buf), &r), &out));
+    r.name = satlink_str("0123456789abcdef0123456789abcdef");        /* 32: the limit */
+    CHECK(satlink_dec_pair_request(g_buf, satlink_enc_pair_request(g_buf, sizeof(g_buf), &r), &out));
+    r.name = satlink_str("0123456789abcdef0123456789abcdefX");       /* 33 */
+    CHECK(!satlink_dec_pair_request(g_buf, satlink_enc_pair_request(g_buf, sizeof(g_buf), &r), &out));
+
+    satlink_pair_result_t res = { .status = SATLINK_PAIR_FAILED };
+    memcpy(res.addr, k_addr, 6);
+    len = satlink_enc_pair_result(g_buf, sizeof(g_buf), &res);
+    CHECK_EQ(len, 7);
+    CHECK(memcmp(g_buf, k_addr, 6) == 0 && g_buf[6] == 3);
+    satlink_pair_result_t res_out = {0};
+    CHECK(satlink_dec_pair_result(g_buf, len, &res_out));
+    CHECK_EQ(res_out.status, SATLINK_PAIR_FAILED);
+    CHECK_STRICT_LEN(satlink_dec_pair_result, res_out, len);
+    g_buf[6] = 9;                                           /* reserved, still a frame */
+    CHECK(satlink_dec_pair_result(g_buf, len, &res_out));
+    CHECK_EQ(res_out.status, 9);
+}
+
+static void test_msg_bt_config(void)
+{
+    satlink_bt_config_t cfg = { .radio = 1, .discoverable = 0, .auto_reconnect = 1,
+                                .codecs_supported = 0x1F, .codecs_enabled = 0x0F,
+                                .name = satlink_str("modesp satellite") };
+    size_t len = satlink_enc_bt_config(g_buf, sizeof(g_buf), &cfg);
+    CHECK_EQ(len, 5 + 2 + 16);
+    static const uint8_t head[] = { 0x01, 0x00, 0x01, 0x1F, 0x0F, 0x10, 0x00, 'm' };
+    CHECK(memcmp(g_buf, head, sizeof(head)) == 0);
+
+    satlink_bt_config_t out = {0};
+    CHECK(satlink_dec_bt_config(g_buf, len, &out));
+    CHECK_EQ(out.radio, 1);
+    CHECK_EQ(out.discoverable, 0);
+    CHECK_EQ(out.auto_reconnect, 1);
+    CHECK_EQ(out.codecs_supported, 0x1F);
+    CHECK_EQ(out.codecs_enabled, 0x0F);
+    CHECK(out.name.len == 16 && memcmp(out.name.ptr, "modesp satellite", 16) == 0);
+    CHECK_STRICT_LEN(satlink_dec_bt_config, out, len);
+
+    satlink_bt_config_t bad = cfg;
+    bad.radio = 2;
+    CHECK(!satlink_dec_bt_config(g_buf, satlink_enc_bt_config(g_buf, sizeof(g_buf), &bad), &out));
+    bad = cfg; bad.codecs_enabled = 0x0E;                   /* SBC switched off */
+    CHECK(!satlink_dec_bt_config(g_buf, satlink_enc_bt_config(g_buf, sizeof(g_buf), &bad), &out));
+    bad = cfg; bad.codecs_supported = 0x07;                 /* enabled beyond the build */
+    CHECK(!satlink_dec_bt_config(g_buf, satlink_enc_bt_config(g_buf, sizeof(g_buf), &bad), &out));
+    bad = cfg; bad.codecs_supported = 0x1E; bad.codecs_enabled = 0x02;
+    CHECK(!satlink_dec_bt_config(g_buf, satlink_enc_bt_config(g_buf, sizeof(g_buf), &bad), &out));
+    bad = cfg; bad.name = satlink_str("");                  /* a device always has a name */
+    CHECK(!satlink_dec_bt_config(g_buf, satlink_enc_bt_config(g_buf, sizeof(g_buf), &bad), &out));
+    bad = cfg; bad.name = satlink_str("0123456789abcdef0123456789abcdefX");
+    CHECK(!satlink_dec_bt_config(g_buf, satlink_enc_bt_config(g_buf, sizeof(g_buf), &bad), &out));
+}
+
+static void test_msg_bond_list(void)
+{
+    static satlink_bond_list_t in, out;
+    memset(&in, 0, sizeof(in));
+    in.total = 3;
+    in.count = 2;
+    memcpy(in.bonds[0].addr, k_addr, 6);
+    in.bonds[0].flags = SATLINK_BOND_CONNECTED | SATLINK_BOND_LAST;
+    in.bonds[0].name = satlink_str("Pixel");
+    memset(in.bonds[1].addr, 0x34, 6);
+    in.bonds[1].flags = 0;
+    in.bonds[1].name = satlink_str(NULL);                   /* a pre-1.8 bond: no name yet */
+
+    size_t len = satlink_enc_bond_list(g_buf, sizeof(g_buf), &in);
+    CHECK_EQ(len, 2 + (6 + 1 + 2 + 5) + (6 + 1 + 2 + 0));
+    CHECK(g_buf[0] == 3 && g_buf[1] == 2);
+    CHECK(memcmp(g_buf + 2, k_addr, 6) == 0 && g_buf[8] == 0x03);
+    CHECK(satlink_dec_bond_list(g_buf, len, &out));
+    CHECK_EQ(out.total, 3);
+    CHECK_EQ(out.count, 2);
+    CHECK_EQ(out.bonds[0].flags, SATLINK_BOND_CONNECTED | SATLINK_BOND_LAST);
+    CHECK(out.bonds[0].name.len == 5 && memcmp(out.bonds[0].name.ptr, "Pixel", 5) == 0);
+    CHECK_EQ(out.bonds[1].name.len, 0);
+    CHECK(memcmp(out.bonds[1].addr, in.bonds[1].addr, 6) == 0);
+    CHECK_STRICT_LEN(satlink_dec_bond_list, out, len);
+
+    /* The worst case the contract counts on: 16 bonds with 32-byte names. */
+    in.total = 20;
+    in.count = SATLINK_BOND_LIST_MAX;
+    for (int i = 0; i < SATLINK_BOND_LIST_MAX; i++) {
+        memset(in.bonds[i].addr, i, 6);
+        in.bonds[i].flags = 0;
+        in.bonds[i].name = satlink_str("0123456789abcdef0123456789abcdef");
+    }
+    len = satlink_enc_bond_list(g_buf, sizeof(g_buf), &in);
+    CHECK_EQ(len, SATLINK_BOND_LIST_BYTES_MAX);
+    CHECK(satlink_dec_bond_list(g_buf, len, &out));
+    uint8_t wire[SATLINK_WIRE_MAX];
+    size_t wire_len = 0;
+    CHECK(satlink_frame_encode(SATLINK_MSG_BOND_LIST, 0, g_buf, len, wire, sizeof(wire), &wire_len));
+
+    in.count = SATLINK_BOND_LIST_MAX + 1;                   /* more than one frame carries */
+    CHECK_EQ(satlink_enc_bond_list(g_buf, sizeof(g_buf), &in), 0);
+
+    static const uint8_t over[] = { 17, 17 };               /* count above the limit */
+    CHECK(!satlink_dec_bond_list(over, sizeof(over), &out));
+    static const uint8_t more[] = { 1, 2 };                 /* count above total */
+    CHECK(!satlink_dec_bond_list(more, sizeof(more), &out));
+    static const uint8_t empty[] = { 0, 0 };                /* no bonds is a list too */
+    CHECK(satlink_dec_bond_list(empty, sizeof(empty), &out));
+    CHECK_EQ(out.count, 0);
+
+    in.total = 1;
+    in.count = 1;
+    in.bonds[0].name = satlink_str("0123456789abcdef0123456789abcdefX");
+    len = satlink_enc_bond_list(g_buf, sizeof(g_buf), &in);
+    CHECK(len > 0);
+    CHECK(!satlink_dec_bond_list(g_buf, len, &out));
+}
+
+static void test_msg_settings_commands(void)
+{
+    satlink_pair_reply_t reply = { .accept = 1 };
+    memcpy(reply.addr, k_addr, 6);
+    size_t len = satlink_enc_pair_reply(g_buf, sizeof(g_buf), &reply);
+    CHECK_EQ(len, 7);
+    satlink_pair_reply_t reply_out = {0};
+    CHECK(satlink_dec_pair_reply(g_buf, len, &reply_out));
+    CHECK_EQ(reply_out.accept, 1);
+    CHECK_STRICT_LEN(satlink_dec_pair_reply, reply_out, len);
+    g_buf[6] = 2;                            /* not a yes: a new phone must not ride on a stray byte */
+    CHECK(!satlink_dec_pair_reply(g_buf, len, &reply_out));
+
+    satlink_bt_config_set_t set = { .radio = 1, .discoverable = 1, .auto_reconnect = 0,
+                                    .codecs_enabled = 0x1E, .name = satlink_str("Kitchen") };
+    len = satlink_enc_bt_config_set(g_buf, sizeof(g_buf), &set);
+    CHECK_EQ(len, 4 + 2 + 7);
+    static const uint8_t set_wire[] = { 1, 1, 0, 0x1E, 7, 0, 'K' };
+    CHECK(memcmp(g_buf, set_wire, sizeof(set_wire)) == 0);
+    satlink_bt_config_set_t set_out = {0};
+    CHECK(satlink_dec_bt_config_set(g_buf, len, &set_out));
+    CHECK_EQ(set_out.codecs_enabled, 0x1E);                /* SBC off on the wire; the device puts it back */
+    CHECK(set_out.name.len == 7 && memcmp(set_out.name.ptr, "Kitchen", 7) == 0);
+    CHECK_STRICT_LEN(satlink_dec_bt_config_set, set_out, len);
+    /* A name the device will refuse still decodes: refusing it must not cost the
+     * host the radio and codec fields that came with it. */
+    set.name = satlink_str("a name much longer than thirty-two bytes, on purpose");
+    len = satlink_enc_bt_config_set(g_buf, sizeof(g_buf), &set);
+    CHECK(satlink_dec_bt_config_set(g_buf, len, &set_out));
+    set.name = satlink_str(NULL);                           /* keep the current name */
+    len = satlink_enc_bt_config_set(g_buf, sizeof(g_buf), &set);
+    CHECK_EQ(len, 6);
+    CHECK(satlink_dec_bt_config_set(g_buf, len, &set_out));
+    CHECK_EQ(set_out.name.len, 0);
+
+    satlink_bond_remove_t rm;
+    memset(rm.addr, 0xFF, 6);
+    len = satlink_enc_bond_remove(g_buf, sizeof(g_buf), &rm);
+    CHECK_EQ(len, 6);
+    satlink_bond_remove_t rm_out = {0};
+    CHECK(satlink_dec_bond_remove(g_buf, len, &rm_out));
+    CHECK(rm_out.addr[0] == 0xFF && rm_out.addr[5] == 0xFF);
+    CHECK_STRICT_LEN(satlink_dec_bond_remove, rm_out, len);
+
+    CHECK(satlink_dec_bt_refresh(g_buf, 0));
+    CHECK(!satlink_dec_bt_refresh(g_buf, 1));
 }
 
 static void test_msg_gpio_in_out(void)
@@ -493,6 +714,21 @@ static void test_encoders_refuse_small_buffers(void)
 
     satlink_log_t log = { .text = satlink_str("hello") };
     CHECK_EQ(satlink_enc_log(tiny, sizeof(tiny), &log), 0);
+
+    satlink_pair_request_t req = { .name = satlink_str("x") };
+    CHECK_EQ(satlink_enc_pair_request(tiny, sizeof(tiny), &req), 0);
+    satlink_pair_result_t res = {0};
+    CHECK_EQ(satlink_enc_pair_result(tiny, sizeof(tiny), &res), 0);
+    satlink_bt_config_t cfg = { .name = satlink_str("x") };
+    CHECK_EQ(satlink_enc_bt_config(tiny, sizeof(tiny), &cfg), 0);
+    static satlink_bond_list_t bonds = { .total = 1, .count = 1 };
+    CHECK_EQ(satlink_enc_bond_list(tiny, sizeof(tiny), &bonds), 0);
+    satlink_pair_reply_t reply = {0};
+    CHECK_EQ(satlink_enc_pair_reply(tiny, sizeof(tiny), &reply), 0);
+    satlink_bt_config_set_t set = {0};
+    CHECK_EQ(satlink_enc_bt_config_set(tiny, sizeof(tiny), &set), 0);
+    satlink_bond_remove_t rm = {0};
+    CHECK_EQ(satlink_enc_bond_remove(tiny, sizeof(tiny), &rm), 0);
 }
 
 static void test_utf8_clip(void)
@@ -553,6 +789,11 @@ const test_case_t message_tests[] = {
     { "host commands",         test_msg_commands },
     { "cover retry",           test_msg_cover_retry },
     { "protocol 1.7 constants", test_proto_1_7_constants },
+    { "protocol 1.8 constants", test_proto_1_8_constants },
+    { "pair request, result",  test_msg_pair_request_result },
+    { "bt config",             test_msg_bt_config },
+    { "bond list",             test_msg_bond_list },
+    { "settings commands",     test_msg_settings_commands },
     { "gpio in and out",       test_msg_gpio_in_out },
     { "gpio cfg",              test_msg_gpio_cfg },
     { "gpio map",              test_msg_gpio_map },

@@ -136,6 +136,61 @@ typedef struct {
 size_t satlink_enc_volume_state(uint8_t *buf, size_t cap, const satlink_volume_state_t *m);
 bool   satlink_dec_volume_state(const uint8_t *buf, size_t len, satlink_volume_state_t *m);
 
+/* ----------------------------------------------------- 0x1A..0x1D, protocol 1.8 */
+
+/* The decoders hold the contract's own ranges -- kind, passkey, name length, the
+ * codec masks -- so that a malformed frame is refused here rather than shown to a
+ * person as a pairing code. The encoders write what they are given; clipping names
+ * to SATLINK_BT_NAME_MAX is the caller's job, with satlink_str_clip. */
+
+typedef struct {
+    uint8_t       addr[6];
+    uint8_t       kind;         /* satlink_pair_kind_t */
+    uint32_t      passkey;      /* 0..999999; 0 for SATLINK_PAIR_CONSENT */
+    satlink_str_t name;         /* <= SATLINK_BT_NAME_MAX, may be empty */
+} satlink_pair_request_t;
+
+size_t satlink_enc_pair_request(uint8_t *buf, size_t cap, const satlink_pair_request_t *m);
+bool   satlink_dec_pair_request(const uint8_t *buf, size_t len, satlink_pair_request_t *m);
+
+typedef struct {
+    uint8_t addr[6];
+    uint8_t status;             /* satlink_pair_status_t; 4 and up reserved */
+} satlink_pair_result_t;
+
+size_t satlink_enc_pair_result(uint8_t *buf, size_t cap, const satlink_pair_result_t *m);
+bool   satlink_dec_pair_result(const uint8_t *buf, size_t len, satlink_pair_result_t *m);
+
+typedef struct {
+    uint8_t       radio;
+    uint8_t       discoverable;
+    uint8_t       auto_reconnect;
+    uint8_t       codecs_supported;   /* SATLINK_CODEC_BIT_* */
+    uint8_t       codecs_enabled;     /* a subset of the above, SBC always in */
+    satlink_str_t name;               /* 1..SATLINK_BT_NAME_MAX */
+} satlink_bt_config_t;
+
+size_t satlink_enc_bt_config(uint8_t *buf, size_t cap, const satlink_bt_config_t *m);
+bool   satlink_dec_bt_config(const uint8_t *buf, size_t len, satlink_bt_config_t *m);
+
+typedef struct {
+    uint8_t       addr[6];
+    uint8_t       flags;        /* SATLINK_BOND_CONNECTED, SATLINK_BOND_LAST */
+    satlink_str_t name;         /* <= SATLINK_BT_NAME_MAX, empty = unknown */
+} satlink_bond_t;
+
+typedef struct {
+    uint8_t        total;       /* bonds the device holds; may exceed count */
+    uint8_t        count;       /* <= SATLINK_BOND_LIST_MAX */
+    satlink_bond_t bonds[SATLINK_BOND_LIST_MAX];
+} satlink_bond_list_t;
+
+/* Worst case 2 + 16 x (6 + 1 + 2 + 32) = 658 bytes, inside SATLINK_PAYLOAD_MAX. */
+#define SATLINK_BOND_LIST_BYTES_MAX (2 + SATLINK_BOND_LIST_MAX * (6 + 1 + 2 + SATLINK_BT_NAME_MAX))
+
+size_t satlink_enc_bond_list(uint8_t *buf, size_t cap, const satlink_bond_list_t *m);
+bool   satlink_dec_bond_list(const uint8_t *buf, size_t len, satlink_bond_list_t *m);
+
 /* -------------------------------------------------------- 0x20..0x22 host commands */
 
 typedef struct {
@@ -174,6 +229,42 @@ typedef struct {
 
 size_t satlink_enc_cover_retry(uint8_t *buf, size_t cap, const satlink_cover_retry_t *m);
 bool   satlink_dec_cover_retry(const uint8_t *buf, size_t len, satlink_cover_retry_t *m);
+
+/* ----------------------------------------------------- 0x25..0x28, protocol 1.8 */
+
+typedef struct {
+    uint8_t addr[6];
+    uint8_t accept;             /* 0 no, 1 yes; anything else is refused */
+} satlink_pair_reply_t;
+
+size_t satlink_enc_pair_reply(uint8_t *buf, size_t cap, const satlink_pair_reply_t *m);
+bool   satlink_dec_pair_reply(const uint8_t *buf, size_t len, satlink_pair_reply_t *m);
+
+/* The whole state, not a delta. In the three flags 0 is no and anything else yes.
+ * The name is not range-checked here on purpose: a name the device will not take
+ * must not cost the host the rest of the message, so that judgement is the
+ * device's, and an empty one means "keep the current name". */
+typedef struct {
+    uint8_t       radio;
+    uint8_t       discoverable;
+    uint8_t       auto_reconnect;
+    uint8_t       codecs_enabled;
+    satlink_str_t name;
+} satlink_bt_config_set_t;
+
+size_t satlink_enc_bt_config_set(uint8_t *buf, size_t cap, const satlink_bt_config_set_t *m);
+bool   satlink_dec_bt_config_set(const uint8_t *buf, size_t len, satlink_bt_config_set_t *m);
+
+typedef struct {
+    uint8_t addr[6];            /* FF x 6 = forget every bond */
+} satlink_bond_remove_t;
+
+size_t satlink_enc_bond_remove(uint8_t *buf, size_t cap, const satlink_bond_remove_t *m);
+bool   satlink_dec_bond_remove(const uint8_t *buf, size_t len, satlink_bond_remove_t *m);
+
+/* BT_REFRESH carries nothing, and an encoder returning 0 for "nothing" would be
+ * indistinguishable from failure, so there is only the decoder: empty or refused. */
+bool   satlink_dec_bt_refresh(const uint8_t *buf, size_t len);
 
 /* ---------------------------------------------------------------- 0x30 GPIO_IN */
 
