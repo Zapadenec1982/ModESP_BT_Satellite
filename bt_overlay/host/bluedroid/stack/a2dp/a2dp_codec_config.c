@@ -70,6 +70,14 @@ void A2DP_SinkOfferAac(bool offer) {
 #endif
 }
 
+void A2DP_SinkOfferLhdcV5(bool offer) {
+#if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
+  A2DP_LhdcV5SinkOffer(offer);
+#else
+  (void)offer;
+#endif
+}
+
 void A2DP_SinkAllow96kHz(bool allow) {
 #if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
   A2DP_LhdcV5SinkAllow96kHz(allow);

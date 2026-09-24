@@ -241,6 +241,7 @@ void A2DP_SinkAllow48kHz(bool allow);
 void A2DP_SinkOfferAptxHd(bool offer);
 void A2DP_SinkOfferAptx(bool offer);
 void A2DP_SinkOfferAac(bool offer);
+void A2DP_SinkOfferLhdcV5(bool offer);
 void A2DP_SbcSinkAllow48kHz(bool allow);
 #if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)
 void A2DP_AacSinkAllow48kHz(bool allow);

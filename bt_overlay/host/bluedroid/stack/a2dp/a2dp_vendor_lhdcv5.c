@@ -14,6 +14,13 @@
 static bool allow48, allow96;
 void A2DP_LhdcV5SinkAllow48kHz(bool allow) { allow48 = allow; }
 void A2DP_LhdcV5SinkAllow96kHz(bool allow) { allow96 = allow; }
+
+/* Whether to register the endpoint at all: the host can switch LHDC V5 off, as it
+ * can AAC and the two aptX, and a phone then picks the next best. Read at
+ * registration like the rates, so a change takes effect when the endpoints are
+ * registered again. */
+static bool offered = true;
+void A2DP_LhdcV5SinkOffer(bool offer) { offered = offer; }
 static uint8_t allowed_rates(void) {
   return A2DP_LHDCV5_SAMPLING_FREQ_44100 |
       (allow48 ? A2DP_LHDCV5_SAMPLING_FREQ_48000 : 0) |
@@ -208,6 +215,9 @@ bool A2DP_VendorInitCodecConfigLhdcV5(btav_a2dp_codec_index_t codec_index,
 }
 
 bool A2DP_VendorInitCodecConfigLhdcV5Sink(uint8_t* p_codec_info) {
+  if (!offered) {
+    return false;
+  }
   tA2DP_LHDCV5_CIE caps = a2dp_lhdcv5_default_config;
   caps.sampleRate = allowed_rates();
   caps.bitsPerSample = A2DP_LHDCV5_BITS_PER_SAMPLE_16 | A2DP_LHDCV5_BITS_PER_SAMPLE_24;

@@ -35,6 +35,7 @@ extern "C" {
 
 void A2DP_LhdcV5SinkAllow48kHz(bool allow);
 void A2DP_LhdcV5SinkAllow96kHz(bool allow);
+void A2DP_LhdcV5SinkOffer(bool offer);
 
 tA2D_STATUS A2DP_BuildInfoLhdcV5(uint8_t media_type,
                                  const tA2DP_LHDCV5_CIE* p_ie,
