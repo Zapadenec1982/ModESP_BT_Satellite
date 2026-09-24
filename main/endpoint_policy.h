@@ -10,6 +10,11 @@
  * esp_a2d_sink_init(), which tears the endpoints down for a moment and is
  * therefore done only with no phone attached.
  *
+ * Since protocol 1.8 the offered codecs are part of the same decision: the host
+ * can switch them off and on, the A2DP_SinkOffer* switches are read at
+ * registration too, and a change waits for the same moment -- no phone attached --
+ * rather than dropping one.
+ *
  * Pure state, no IDF: bt_av.c issues the calls on its own task and feeds the
  * outcomes back here, and tests/host/test_endpoints.c walks every path.
  */
@@ -45,6 +50,7 @@ typedef enum {
 typedef struct {
     ep_state_t state;
     uint32_t   decided;     /* the EP_DECIDING_CAPS bits the endpoints were registered from */
+    uint8_t    codecs;      /* and the codecs they offered, SATLINK_CODEC_BIT_* (1.8) */
     bool       retry_armed; /* a refusal set retry_at_ms; nothing before it */
     uint32_t   retry_at_ms;
 } ep_fsm_t;
@@ -54,21 +60,24 @@ static inline uint32_t ep_deciding(uint32_t host_caps)
     return host_caps & EP_DECIDING_CAPS;
 }
 
-/* bt_av_start registered the endpoints, from these caps. */
-static inline void ep_registered(ep_fsm_t *f, uint32_t host_caps)
+/* bt_av_start registered the endpoints, from these caps and these codecs. */
+static inline void ep_registered(ep_fsm_t *f, uint32_t host_caps, uint8_t codecs)
 {
     f->state = EP_STATE_IDLE;
     f->decided = ep_deciding(host_caps);
+    f->codecs = codecs;
     f->retry_armed = false;
     f->retry_at_ms = 0;
 }
 
 /* Would the endpoints be registered differently from what the host says now?
  * Narrower counts as well as wider: a replacement host that cannot relock
- * must not be offered 48 kHz just because its predecessor could take it. */
-static inline bool ep_stale(const ep_fsm_t *f, uint32_t host_caps)
+ * must not be offered 48 kHz just because its predecessor could take it. The
+ * same for codecs, in both directions. */
+static inline bool ep_stale(const ep_fsm_t *f, uint32_t host_caps, uint8_t codecs)
 {
-    return f->state != EP_STATE_BOOT && ep_deciding(host_caps) != f->decided;
+    return f->state != EP_STATE_BOOT &&
+           (ep_deciding(host_caps) != f->decided || codecs != f->codecs);
 }
 
 /* Signed comparison so the millisecond clock may wrap under a long uptime; an
@@ -80,11 +89,12 @@ static inline bool ep_retry_due(const ep_fsm_t *f, uint32_t now_ms)
 
 /* Periodic. `idle` is "no A2DP connection in any stage and no AVRCP": tearing
  * the endpoints down under a phone would drop it. */
-static inline ep_action_t ep_poll(ep_fsm_t *f, uint32_t host_caps, bool idle, uint32_t now_ms)
+static inline ep_action_t ep_poll(ep_fsm_t *f, uint32_t host_caps, uint8_t codecs, bool idle,
+                                  uint32_t now_ms)
 {
     switch (f->state) {
     case EP_STATE_IDLE:
-        if (!ep_stale(f, host_caps) || !idle || !ep_retry_due(f, now_ms)) {
+        if (!ep_stale(f, host_caps, codecs) || !idle || !ep_retry_due(f, now_ms)) {
             return EP_ACT_NONE;
         }
         f->retry_armed = false;
@@ -120,11 +130,13 @@ static inline ep_action_t ep_on_prof_state(ep_fsm_t *f, bool deinit_success)
     return EP_ACT_NONE;
 }
 
-/* esp_a2d_sink_init() accepted the request, with the switches set from these caps. */
-static inline void ep_init_sent(ep_fsm_t *f, uint32_t host_caps)
+/* esp_a2d_sink_init() accepted the request, with the switches set from these caps
+ * and these codecs. */
+static inline void ep_init_sent(ep_fsm_t *f, uint32_t host_caps, uint8_t codecs)
 {
     f->state = EP_STATE_INIT_WAIT;
     f->decided = ep_deciding(host_caps);
+    f->codecs = codecs;
 }
 
 /* The API refused the action just returned. A refused deinit leaves the old

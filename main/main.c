@@ -55,6 +55,9 @@ static void on_hello(const satlink_hello_t *hello)
      * late greeting is now enough to widen. Does nothing when already correct. */
     bt_av_apply_host_caps();
     bt_av_report_stream_fmt();
+    /* Protocol 1.8 asks for BT_CONFIG and BOND_LIST after every greeting, and the
+     * pairing mode follows the host that greeted last: not rate limited. */
+    bt_av_host_hello();
 
     static int64_t next_announce_us;
     int64_t now = esp_timer_get_time();
@@ -100,7 +103,9 @@ static uint32_t own_caps(void)
             /* Alongside COVER_ART and never without it: the host's gate requires
              * both, and this build answers COVER_RETRY only for a track whose cover
              * it was sending in the first place. */
-            SATLINK_CAP_COVER_RETRY;
+            SATLINK_CAP_COVER_RETRY |
+            /* Protocol 1.8: settings, bonds and host-confirmed pairing. */
+            SATLINK_CAP_BT_SETTINGS;
 #endif
     return caps;
 }
@@ -124,6 +129,10 @@ void app_main(void)
 #if !CONFIG_SAT_LINK_ONLY
         .on_format_ready = bt_av_format_ready,
         .on_cover_retry  = bt_av_cover_retry,
+        .on_pair_reply    = bt_av_pair_reply,
+        .on_bt_config_set = bt_av_config_set,
+        .on_bond_remove   = bt_av_bond_remove,
+        .on_bt_refresh    = bt_av_bt_refresh,
 #endif
         .on_transport = on_transport,
         .on_volume    = on_volume,

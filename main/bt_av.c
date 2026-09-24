@@ -1,14 +1,20 @@
 #include "bt_av.h"
+#include "bond_table.h"
+#include "bt_settings.h"
 #include "cover_stream.h"
 #include "endpoint_policy.h"
 #include "esp_heap_caps.h"
+#include "pair_policy.h"
+#include "reconnect_policy.h"
 #include "satlink/cover_wire.h"
 
 #include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "audio_out.h"
 #include "link.h"
+#include "nvs.h"
 
 #include "esp_a2dp_api.h"
 #include "esp_avrc_api.h"
@@ -60,6 +66,18 @@ extern void A2DP_SinkAllow96kHz(bool allow);
 extern void A2DP_SinkOfferAptxHd(bool offer);
 extern void A2DP_SinkOfferAptx(bool offer);
 extern void A2DP_SinkOfferAac(bool offer);
+extern void A2DP_SinkOfferLhdcV5(bool offer);
+
+/*
+ * Stock Bluedroid, declared here for the same reason as the switches above: the
+ * stack's own header is not on the application's include path, and ESP-IDF has no
+ * API for it. esp_bt_gap_set_scan_mode() leaves it alone (it passes BTA_DM_IGNORE),
+ * so what is set here stays set.
+ *
+ * `connect_only_paired` stays false. It admits only link keys made with MITM
+ * protection, and every bond made before protocol 1.8 was made without.
+ */
+extern void BTM_SetPairableMode(bool allow_pairing, bool connect_only_paired);
 
 /*
  * Which stream endpoints to offer.
@@ -84,9 +102,35 @@ extern void A2DP_SinkOfferAac(bool offer);
 #define BT_AV_OFFER_APTX        true
 #define BT_AV_OFFER_AAC         true
 
+/*
+ * The codecs this build can offer, as BT_CONFIG counts them (protocol 1.8): a
+ * decoder that is built in and not withheld above. The host switches these off
+ * and on; the rest it is never shown.
+ */
+#if defined(CONFIG_BT_A2DP_AAC_DECODER)
+#define BT_AV_BUILD_AAC     (BT_AV_OFFER_AAC ? SATLINK_CODEC_BIT_AAC : 0u)
+#else
+#define BT_AV_BUILD_AAC     0u
+#endif
+#if defined(CONFIG_BT_A2DP_APTX_DECODER)
+#define BT_AV_BUILD_APTX    ((BT_AV_OFFER_APTX ? SATLINK_CODEC_BIT_APTX : 0u) | \
+                             (BT_AV_OFFER_APTX_HD ? SATLINK_CODEC_BIT_APTX_HD : 0u))
+#else
+#define BT_AV_BUILD_APTX    0u
+#endif
+#if defined(CONFIG_BT_A2DP_LHDCV5_DECODER)
+#define BT_AV_BUILD_LHDC    SATLINK_CODEC_BIT_LHDC_V5
+#else
+#define BT_AV_BUILD_LHDC    0u
+#endif
+#define BT_AV_BUILD_CODECS  ((uint8_t)(SATLINK_CODEC_BIT_SBC | BT_AV_BUILD_AAC | \
+                                       BT_AV_BUILD_APTX | BT_AV_BUILD_LHDC))
+
 static const char *TAG = "sat.bt";
 
-#define BT_TASK_STACK       3584
+/* 3584 until protocol 1.8, which added the settings, the bonds and their NVS
+ * writes to this task. */
+#define BT_TASK_STACK       4096
 #define BT_TASK_PRIO        (configMAX_PRIORITIES - 4)
 #define BT_QUEUE_DEPTH      12
 
@@ -144,6 +188,7 @@ typedef struct {
     fmt_ready_t ready;
     uint32_t codec_epoch;
     uint32_t host_caps;         /* BT_EVENT_ENDPOINTS_REGISTERED */
+    uint8_t  codecs;            /*   ... and the codecs it offered */
 } bt_a2d_msg_t;
 
 static QueueHandle_t s_queue;
@@ -175,6 +220,32 @@ static fmt_barrier_t s_format;
 static uint32_t s_nonce, s_generation, s_gate_token, s_retry_ms;
 static uint8_t s_decoder_bits = 16;
 static bool s_format_pending;
+
+/*
+ * Protocol 1.8: the settings the host shows, the bonds it lists, the pairing it is
+ * asked about, and the call to the last phone.
+ *
+ * Loaded by bt_av_start before this task exists, and from then on this task's
+ * alone. The link task and the stack's callback task hand it events through
+ * s_cfg_queue and touch none of it; nothing is taken from the queue until the
+ * stack is up (s_stack_up), so a host that greets during the start waits there.
+ */
+#define BT_NVS_NAMESPACE    "sat_bt"
+#define BT_NVS_SETTINGS     "settings"
+#define BT_NVS_BONDS        "bonds"
+#define BT_CFG_QUEUE_DEPTH  8
+
+static bt_settings_t s_settings;
+static bond_table_t  s_bonds;
+static bool          s_bonds_dirty;     /* saved when no stream is playing */
+static pair_fsm_t    s_pair;
+static rc_fsm_t      s_reconnect;
+static uint8_t       s_io_cap = 0xFF;   /* what the stack was last told, 0xFF = nothing */
+/* What the radio is doing now. The settings, except after a CMD_RADIO, which acts
+ * as it did in 1.7 and is not saved. */
+static bool          s_live_radio, s_live_disc;
+static QueueHandle_t s_cfg_queue;
+static atomic_bool   s_stack_up;
 
 
 /* Everything the host is ever told about, in one place. */
@@ -364,22 +435,31 @@ void bt_av_format_ready(const fmt_ready_t *ready)
     xQueueSend(s_queue, &msg, 0);
 }
 
-/* Sets the stack's switches from the host's HELLO. Read while esp_a2d_sink_init()
- * registers the endpoints and never again, so it must run before every init. */
-static void decide_endpoints(uint32_t host_caps)
+/* Sets the stack's switches from the host's HELLO and the codecs the settings
+ * leave on. Read while esp_a2d_sink_init() registers the endpoints and never
+ * again, so it must run before every init. */
+static void decide_endpoints(uint32_t host_caps, uint8_t codecs)
 {
     A2DP_SinkAllow48kHz((host_caps & SATLINK_HOST_CAP_RELOCK) != 0);
     A2DP_SinkAllow96kHz((host_caps & SATLINK_HOST_CAP_96KHZ) != 0);
-    A2DP_SinkOfferAptxHd(BT_AV_OFFER_APTX_HD);
-    A2DP_SinkOfferAptx(BT_AV_OFFER_APTX);
-    A2DP_SinkOfferAac(BT_AV_OFFER_AAC);
-    ESP_LOGI(TAG, "endpoints: SBC%s%s%s" BT_AV_LHDC_NAME ", %s, %u-bit slots",
-             BT_AV_OFFER_AAC ? " AAC" : "",
-             BT_AV_OFFER_APTX ? " aptX" : "",
-             BT_AV_OFFER_APTX_HD ? " aptX-HD" : "",
+    A2DP_SinkOfferAptxHd((codecs & SATLINK_CODEC_BIT_APTX_HD) != 0);
+    A2DP_SinkOfferAptx((codecs & SATLINK_CODEC_BIT_APTX) != 0);
+    A2DP_SinkOfferAac((codecs & SATLINK_CODEC_BIT_AAC) != 0);
+    A2DP_SinkOfferLhdcV5((codecs & SATLINK_CODEC_BIT_LHDC_V5) != 0);
+    ESP_LOGI(TAG, "endpoints: SBC%s%s%s%s, %s, %u-bit slots",
+             (codecs & SATLINK_CODEC_BIT_AAC) ? " AAC" : "",
+             (codecs & SATLINK_CODEC_BIT_APTX) ? " aptX" : "",
+             (codecs & SATLINK_CODEC_BIT_APTX_HD) ? " aptX-HD" : "",
+             (codecs & SATLINK_CODEC_BIT_LHDC_V5) ? " LHDC-V5" : "",
              (host_caps & SATLINK_HOST_CAP_96KHZ) ? "44.1/48 kHz + LHDC 96 kHz" :
              (host_caps & SATLINK_HOST_CAP_RELOCK) ? "44.1 and 48 kHz" : "44.1 kHz only",
              audio_out_slot_bits());
+}
+
+/* The codecs to offer a phone: the build's, less what the host switched off. */
+static uint8_t offered_codecs(void)
+{
+    return bt_codecs_enabled(&s_settings, BT_AV_BUILD_CODECS);
 }
 
 /* No phone in any stage of attachment. Re-registering under one would drop it. */
@@ -388,6 +468,17 @@ static bool bt_av_idle(void)
     return s_now.state <= SATLINK_BT_DISCOVERABLE && !s_now.avrcp_up;
 }
 
+/* What BT_STATE says with no phone: the radio as it is right now. */
+static uint8_t idle_state(void)
+{
+    return !s_live_radio ? SATLINK_BT_OFF :
+           s_live_disc   ? SATLINK_BT_DISCOVERABLE : SATLINK_BT_IDLE;
+}
+
+/* Protocol 1.8, further down: the bonds hear about phones coming and going. */
+static void cfg_phone_connected(const uint8_t addr[6]);
+static void cfg_phone_gone(void);
+
 static void a2d_data_cb(const uint8_t *buf, uint32_t len);
 
 /* Carries out what the endpoint machine asked for, and reports back to it. */
@@ -395,13 +486,14 @@ static void run_endpoint_action(ep_action_t action)
 {
     const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
     const uint32_t caps = link_host_caps();
+    const uint8_t codecs = offered_codecs();
     esp_err_t err;
 
     switch (action) {
     case EP_ACT_DEINIT:
-        ESP_LOGI(TAG, "host decides endpoints with 0x%02" PRIx32 " now, they were registered "
-                      "from 0x%02" PRIx32 " and no phone is attached: registering again",
-                 ep_deciding(caps), s_endpoints.decided);
+        ESP_LOGI(TAG, "endpoints want caps 0x%02" PRIx32 " and codecs 0x%02x now, were registered "
+                      "from 0x%02" PRIx32 " and 0x%02x, and no phone is attached: registering again",
+                 ep_deciding(caps), codecs, s_endpoints.decided, s_endpoints.codecs);
         err = esp_a2d_sink_deinit();
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "endpoints: deinit refused: %s", esp_err_to_name(err));
@@ -410,7 +502,7 @@ static void run_endpoint_action(ep_action_t action)
         break;
 
     case EP_ACT_INIT:
-        decide_endpoints(caps);
+        decide_endpoints(caps, codecs);
         err = esp_a2d_sink_init();
         if (err == ESP_OK) {
             /* The data callback survives a deinit in this stack, but a stack
@@ -422,7 +514,7 @@ static void run_endpoint_action(ep_action_t action)
                      esp_err_to_name(err));
             ep_action_failed(&s_endpoints, now);
         } else {
-            ep_init_sent(&s_endpoints, caps);
+            ep_init_sent(&s_endpoints, caps, codecs);
         }
         break;
 
@@ -633,7 +725,7 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
 
     switch (msg->event) {
     case BT_EVENT_ENDPOINTS_REGISTERED:
-        ep_registered(&s_endpoints, msg->host_caps);
+        ep_registered(&s_endpoints, msg->host_caps, msg->codecs);
         break;
 
     case ESP_A2D_PROF_STATE_EVT: {
@@ -663,6 +755,7 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
         case ESP_A2D_CONNECTION_STATE_CONNECTED:
             memcpy(s_now.addr, bda, sizeof(s_now.addr));
             s_now.state = SATLINK_BT_CONNECTED;
+            cfg_phone_connected(bda);
             break;
         case ESP_A2D_CONNECTION_STATE_CONNECTING:
             s_now.state = SATLINK_BT_CONNECTING;
@@ -677,13 +770,16 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
             uint32_t ignored_token;
             audio_out_begin_format(&ignored_token);
             audio_out_set_streaming(false);
-            s_now.state = SATLINK_BT_DISCOVERABLE;
+            s_now.state = idle_state();
             s_now.play_state = SATLINK_PLAY_STOPPED;
             s_now.title[0] = s_now.artist[0] = s_now.album[0] = '\0';
             link_send_track_meta("", "", "");
             break;
         }
         bt_av_report_state();
+        if (p->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+            cfg_phone_gone();
+        }
         break;
     }
 
@@ -800,6 +896,8 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
     }
 }
 
+static void cfg_poll(void);
+
 static void bt_av_task(void *arg)
 {
     (void)arg;
@@ -810,7 +908,10 @@ static void bt_av_task(void *arg)
             handle_a2d_event(&msg);
         }
         poll_format();
-        run_endpoint_action(ep_poll(&s_endpoints, link_host_caps(), bt_av_idle(),
+        if (atomic_load(&s_stack_up)) {
+            cfg_poll();
+        }
+        run_endpoint_action(ep_poll(&s_endpoints, link_host_caps(), offered_codecs(), bt_av_idle(),
                                     (uint32_t)(esp_timer_get_time() / 1000)));
     }
 }
@@ -1100,8 +1201,626 @@ static void avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *par
     }
 }
 
+/* ------------------------------------------- protocol 1.8: settings and bonds */
+
+#define BDA_FMT         "%02x:%02x:%02x:%02x:%02x:%02x"
+#define BDA_ARGS(a)     (a)[0], (a)[1], (a)[2], (a)[3], (a)[4], (a)[5]
+
+typedef enum {
+    CFG_HELLO = 1,      /* the host greeted: pairing mode, and the 1.8 state for a 1.8 host */
+    CFG_REFRESH,        /* BT_REFRESH */
+    CFG_SET,            /* BT_CONFIG_SET */
+    CFG_REMOVE,         /* BOND_REMOVE */
+    CFG_REPLY,          /* PAIR_REPLY */
+    CFG_RADIO,          /* CMD_RADIO, protocol 1.0 */
+    CFG_CONFIRM,        /* ESP_BT_GAP_CFM_REQ_EVT */
+    CFG_PASSKEY,        /* ESP_BT_GAP_KEY_NOTIF_EVT */
+    CFG_AUTH,           /* ESP_BT_GAP_AUTH_CMPL_EVT */
+    CFG_NAME,           /* ESP_BT_GAP_READ_REMOTE_NAME_EVT */
+    CFG_UNBONDED,       /* ESP_BT_GAP_REMOVE_BOND_DEV_COMPLETE_EVT */
+} cfg_event_t;
+
+typedef struct {
+    uint8_t  type;              /* cfg_event_t */
+    uint8_t  addr[6];
+    bool     ok;                /* AUTH, NAME, UNBONDED: success; REPLY: accept;
+                                   CONFIRM: Just Works */
+    uint8_t  set[4];            /* SET: radio, discoverable, auto_reconnect, codecs_enabled;
+                                   RADIO: on, discoverable, disconnect */
+    uint32_t value;             /* CONFIRM: the number; PASSKEY: the passkey */
+    bool     name_refused;      /* SET: longer than any name the device takes */
+    uint8_t  name_len;
+    char     name[SATLINK_BT_NAME_MAX + 1];
+} cfg_msg_t;
+
+/* False before bt_av_start made the queue, which is not worth a word: what the
+ * host said then is answered when the task starts (cfg_poll). */
+static bool cfg_post(const cfg_msg_t *m)
+{
+    if (s_cfg_queue == NULL) {
+        return false;
+    }
+    if (xQueueSend(s_cfg_queue, m, 0) == pdTRUE) {
+        return true;
+    }
+    ESP_LOGW(TAG, "bt settings: queue full, dropped event %u", m->type);
+    return false;
+}
+
+/* A name from the stack: up to 248 bytes, meant to be UTF-8. Kept to 32 bytes on
+ * a character boundary, and dropped when it is not text: the host shows it. */
+static void cfg_take_name(cfg_msg_t *m, const uint8_t *name)
+{
+    size_t len = strnlen((const char *)name, ESP_BT_GAP_MAX_BDNAME_LEN);
+    len = bt_utf8_clip((const char *)name, len, SATLINK_BT_NAME_MAX);
+    if (!bt_utf8_valid((const char *)name, len)) {
+        len = 0;
+    }
+    memcpy(m->name, name, len);
+    m->name[len] = '\0';
+    m->name_len = (uint8_t)len;
+}
+
+static bool host_confirms(void)
+{
+    return (link_host_caps() & SATLINK_HOST_CAP_PAIR_CONFIRM) != 0;
+}
+
+static uint32_t now_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+/* ---- NVS. Two records, each written whole, each read back only if it is
+ * exactly what this build writes; anything else is the factory state. */
+
+static bool nvs_save(const char *key, const void *blob, size_t len)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(BT_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(h, key, blob, len);
+        if (err == ESP_OK) {
+            err = nvs_commit(h);
+        }
+        nvs_close(h);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "bt settings: cannot save %s: %s", key, esp_err_to_name(err));
+    }
+    return err == ESP_OK;
+}
+
+static size_t nvs_load(const char *key, void *blob, size_t cap)
+{
+    nvs_handle_t h;
+    if (nvs_open(BT_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return 0;       /* first boot: the namespace does not exist yet */
+    }
+    size_t len = cap;
+    esp_err_t err = nvs_get_blob(h, key, blob, &len);
+    nvs_close(h);
+    return err == ESP_OK ? len : 0;
+}
+
+static void save_settings(void)
+{
+    uint8_t blob[BT_SETTINGS_BLOB_MAX];
+    size_t len = bt_settings_pack(&s_settings, blob, sizeof(blob));
+    if (len != 0) {
+        nvs_save(BT_NVS_SETTINGS, blob, len);
+    }
+}
+
+/* Deferred while a stream plays: a flash write stalls both cores' caches, and the
+ * bonds' order and names can wait for a pause. The bonds themselves are the
+ * stack's and are saved by it. */
+static bool save_bonds(void)
+{
+    uint8_t *blob = malloc(BOND_TABLE_BLOB_MAX);
+    if (blob == NULL) {
+        return false;
+    }
+    size_t len = bond_table_pack(&s_bonds, blob, BOND_TABLE_BLOB_MAX);
+    if (len != 0 && nvs_save(BT_NVS_BONDS, blob, len)) {
+        s_bonds_dirty = false;
+        /* The deepest this task goes is here or in a BOND_LIST, and its stack
+         * grew for protocol 1.8: say what is left of it. */
+        ESP_LOGI(TAG, "bond names saved, %u of them; bt task stack headroom %u bytes",
+                 s_bonds.count, (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    }
+    free(blob);
+    return !s_bonds_dirty;
+}
+
+/* Before the task exists: the settings decide the name, the endpoints and the
+ * scan mode the stack starts with. */
+static void load_settings(const char *factory_name)
+{
+    bt_settings_defaults(&s_settings, factory_name);
+    uint8_t blob[BT_SETTINGS_BLOB_MAX];
+    size_t len = nvs_load(BT_NVS_SETTINGS, blob, sizeof(blob));
+    if (len != 0 && !bt_settings_unpack(&s_settings, blob, len)) {
+        ESP_LOGW(TAG, "bt settings: stored record not understood, factory state");
+    }
+
+    uint8_t *bonds = malloc(BOND_TABLE_BLOB_MAX);
+    if (bonds != NULL) {
+        len = nvs_load(BT_NVS_BONDS, bonds, BOND_TABLE_BLOB_MAX);
+        if (len != 0 && !bond_table_unpack(&s_bonds, bonds, len)) {
+            ESP_LOGW(TAG, "bt settings: stored bond names not understood, starting without");
+        }
+        free(bonds);
+    }
+    s_live_radio = s_settings.radio != 0;
+    s_live_disc = s_settings.discoverable != 0;
+    ESP_LOGI(TAG, "bt settings: radio %u, discoverable %u, reconnect %u, codecs 0x%02x of 0x%02x, "
+                  "name \"%s\", %u bond name(s)",
+             s_settings.radio, s_settings.discoverable, s_settings.auto_reconnect,
+             offered_codecs(), BT_AV_BUILD_CODECS, s_settings.name, s_bonds.count);
+}
+
+/* ---- The stack's side: its bonds, scan mode, pairing mode. */
+
+/* The stack's bonds, at most BOND_TABLE_MAX of them: past that the table cannot
+ * follow anyway. -1 when the stack will not say. */
+static int stack_bonds(esp_bd_addr_t *list)
+{
+    int n = BOND_TABLE_MAX;
+    if (esp_bt_gap_get_bond_device_list(&n, list) != ESP_OK) {
+        return -1;
+    }
+    return n;
+}
+
+static void sync_bonds(void)
+{
+    esp_bd_addr_t list[BOND_TABLE_MAX];
+    int n = stack_bonds(list);
+    if (n >= 0 && bond_sync(&s_bonds, (const uint8_t (*)[6])list, n)) {
+        s_bonds_dirty = true;
+    }
+}
+
+/* Scan mode from the radio as it is now; pairing from the saved setting, which a
+ * 1.7 host's CMD_RADIO never touched and still does not. */
+static void apply_radio(void)
+{
+    esp_err_t err = esp_bt_gap_set_scan_mode(
+        s_live_radio ? ESP_BT_CONNECTABLE : ESP_BT_NON_CONNECTABLE,
+        s_live_radio && s_live_disc ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "scan mode refused: %s", esp_err_to_name(err));
+    }
+    BTM_SetPairableMode(s_settings.discoverable != 0, false);
+    if (s_now.state <= SATLINK_BT_DISCOVERABLE) {
+        s_now.state = idle_state();
+    }
+}
+
+/* DisplayYesNo when the host can show a question, NoInputNoOutput when nobody
+ * can. The stack reads it at the start of each pairing, so a change takes effect
+ * from the next one. */
+static bool apply_io_cap(void)
+{
+    esp_bt_io_cap_t cap = host_confirms() ? ESP_BT_IO_CAP_IO : ESP_BT_IO_CAP_NONE;
+    if (cap == s_io_cap) {
+        return true;
+    }
+    esp_err_t err = esp_bt_gap_set_security_param(ESP_BT_SP_IOCAP_MODE, &cap, sizeof(cap));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "pairing mode refused: %s", esp_err_to_name(err));
+        return false;
+    }
+    s_io_cap = cap;
+    ESP_LOGI(TAG, "pairing: %s", cap == ESP_BT_IO_CAP_IO ? "DisplayYesNo, the host confirms"
+                                                         : "NoInputNoOutput, nobody is asked");
+    return true;
+}
+
+/* ---- What the host is told. */
+
+static void send_bt_config(void)
+{
+    satlink_bt_config_t m = {
+        .radio = s_settings.radio,
+        .discoverable = s_settings.discoverable,
+        .auto_reconnect = s_settings.auto_reconnect,
+        .codecs_supported = BT_AV_BUILD_CODECS,
+        .codecs_enabled = offered_codecs(),
+        .name = satlink_str(s_settings.name),
+    };
+    if (link_host_minor() >= 8) {
+        ESP_LOGI(TAG, "bt config to the host: radio %u, discoverable %u, reconnect %u, "
+                      "codecs 0x%02x of 0x%02x", m.radio, m.discoverable, m.auto_reconnect,
+                 m.codecs_enabled, m.codecs_supported);
+    }
+    link_send_bt_config(&m);
+}
+
+static void send_bond_list(void)
+{
+    if (link_host_minor() < 8) {
+        return;
+    }
+    static satlink_bond_list_t list;        /* this task only; 300 bytes off its stack */
+    uint8_t order[BOND_TABLE_MAX];
+    int n = bond_order(&s_bonds, order);
+    int last = bond_last(&s_bonds);
+    int total = esp_bt_gap_get_bond_device_num();
+    if (total < n) {
+        total = n;
+    }
+    list.total = (uint8_t)(total > 255 ? 255 : total);
+    list.count = (uint8_t)(n > SATLINK_BOND_LIST_MAX ? SATLINK_BOND_LIST_MAX : n);
+    const bool attached = s_now.state >= SATLINK_BT_CONNECTED;
+    for (int k = 0; k < list.count; k++) {
+        const bond_entry_t *e = &s_bonds.e[order[k]];
+        satlink_bond_t *b = &list.bonds[k];
+        memcpy(b->addr, e->addr, sizeof(b->addr));
+        b->flags = (uint8_t)(((attached && memcmp(e->addr, s_now.addr, 6) == 0) ? SATLINK_BOND_CONNECTED : 0) |
+                             (order[k] == last ? SATLINK_BOND_LAST : 0));
+        b->name = satlink_str(e->name);
+    }
+    ESP_LOGI(TAG, "bond list to the host: %u of %u", list.count, list.total);
+    link_send_bond_list(&list);
+}
+
+static void send_pair_request(void)
+{
+    satlink_pair_request_t m = { .kind = s_pair.kind, .passkey = s_pair.passkey,
+                                 .name = satlink_str(s_pair.name) };
+    memcpy(m.addr, s_pair.addr, sizeof(m.addr));
+    link_send_pair_request(&m);
+}
+
+static const char *pair_status_name(uint8_t status)
+{
+    switch (status) {
+    case SATLINK_PAIR_OK:       return "paired";
+    case SATLINK_PAIR_REJECTED: return "refused by the host";
+    case SATLINK_PAIR_TIMEOUT:  return "no answer from the host, refused";
+    default:                    return "failed";
+    }
+}
+
+/* What the pairing machine asked for, in its order: the stack first, then the
+ * host. */
+static void carry_out(const pair_out_t *out)
+{
+    if (out->reply) {
+        esp_bt_gap_ssp_confirm_reply((uint8_t *)out->addr, out->accept);
+    }
+    if (out->ask) {
+        ESP_LOGI(TAG, "pairing " BDA_FMT " \"%s\": asking the host (kind %u)",
+                 BDA_ARGS(s_pair.addr), s_pair.name, s_pair.kind);
+        send_pair_request();
+    }
+    if (out->result) {
+        ESP_LOGI(TAG, "pairing " BDA_FMT ": %s", BDA_ARGS(out->addr), pair_status_name(out->status));
+        link_send_pair_result(out->addr, out->status);
+    }
+}
+
+/* ---- Phones coming and going, from handle_a2d_event on this task. */
+
+static void cfg_phone_connected(const uint8_t addr[6])
+{
+    rc_stop(&s_reconnect);                  /* a phone is here: nobody else is called */
+    sync_bonds();
+    int i = bond_index(&s_bonds, addr);
+    if (i >= 0) {
+        bond_touch(&s_bonds, addr);
+        s_bonds_dirty = true;
+        if (s_bonds.e[i].name[0] != '\0') {
+            if (s_now.name[0] == '\0') {
+                memcpy(s_now.name, s_bonds.e[i].name, sizeof(s_bonds.e[i].name));
+            }
+        } else {
+            /* A bond from before 1.8, or one whose name never came: ask the phone. */
+            esp_bt_gap_read_remote_name((uint8_t *)addr);
+        }
+    }
+    if (!s_settings.radio) {
+        /* Radio switched off while this phone was on its way in. */
+        ESP_LOGI(TAG, "radio is off: letting " BDA_FMT " go", BDA_ARGS(addr));
+        esp_a2d_sink_disconnect((uint8_t *)addr);
+    }
+    send_bond_list();
+}
+
+static void cfg_phone_gone(void)
+{
+    send_bond_list();
+}
+
+/* ---- Events, one at a time, on this task. */
+
+static void cfg_on_set(const cfg_msg_t *m, uint32_t now)
+{
+    const bool was_on = s_live_radio;
+    unsigned changed = bt_settings_apply(&s_settings, BT_AV_BUILD_CODECS, m->set[0], m->set[1],
+                                         m->set[2], m->set[3], m->name, m->name_len);
+    if (m->name_refused || (m->name_len != 0 && !bt_name_ok(m->name, m->name_len))) {
+        ESP_LOGW(TAG, "bt settings: name refused, keeping \"%s\"", s_settings.name);
+    }
+    if (changed != 0) {
+        save_settings();
+    }
+    if (changed & BT_CHANGED_NAME) {
+        esp_err_t err = esp_bt_gap_set_device_name(s_settings.name);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "device name refused by the stack: %s", esp_err_to_name(err));
+        }
+    }
+
+    /* The whole state, so the radio follows it even when only a 1.7 CMD_RADIO
+     * had moved it. */
+    s_live_radio = s_settings.radio != 0;
+    s_live_disc = s_settings.discoverable != 0;
+    apply_radio();
+    if (!s_live_radio) {
+        rc_stop(&s_reconnect);
+        if (s_now.state >= SATLINK_BT_CONNECTED) {
+            esp_a2d_sink_disconnect(s_now.addr);
+        }
+    } else if (!was_on && s_settings.auto_reconnect) {
+        rc_arm(&s_reconnect, now);
+    }
+    if ((changed & BT_CHANGED_RECONNECT) && !s_settings.auto_reconnect) {
+        rc_stop(&s_reconnect);
+    }
+
+    ESP_LOGI(TAG, "bt settings from the host: radio %u, discoverable %u, reconnect %u, "
+                  "codecs 0x%02x%s, name \"%s\"",
+             s_settings.radio, s_settings.discoverable, s_settings.auto_reconnect, offered_codecs(),
+             (changed & BT_CHANGED_CODECS) ? " from the next connection" : "", s_settings.name);
+    send_bt_config();
+    if (changed & (BT_CHANGED_RADIO | BT_CHANGED_DISCOVERABLE)) {
+        bt_av_report_state();
+    }
+}
+
+static void cfg_on_remove(const cfg_msg_t *m)
+{
+    static const uint8_t all[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    const bool every = memcmp(m->addr, all, sizeof(all)) == 0;
+    esp_bd_addr_t list[BOND_TABLE_MAX];
+    int n = stack_bonds(list);
+    int issued = 0;
+    for (int i = 0; i < n; i++) {
+        if (every || memcmp(m->addr, list[i], 6) == 0) {
+            /* A connected phone is let go first by the stack itself. */
+            if (esp_bt_gap_remove_bond_device(list[i]) == ESP_OK) {
+                issued++;
+            }
+        }
+    }
+    ESP_LOGI(TAG, "bond removal for %s" BDA_FMT ": %d issued",
+             every ? "all, " : "", BDA_ARGS(m->addr), issued);
+    if (issued == 0) {
+        /* Nothing to wait for; the host still gets its answer. */
+        sync_bonds();
+        send_bond_list();
+    }
+}
+
+static void cfg_handle(const cfg_msg_t *m, uint32_t now)
+{
+    pair_out_t out;
+
+    switch (m->type) {
+    case CFG_HELLO:
+        apply_io_cap();
+        if (link_host_minor() >= 8) {
+            sync_bonds();
+            send_bt_config();
+            send_bond_list();
+            /* The host may have restarted with a question on screen. */
+            if (pair_should_repeat(&s_pair) && host_confirms()) {
+                send_pair_request();
+            }
+        }
+        break;
+
+    case CFG_REFRESH:
+        sync_bonds();
+        send_bt_config();
+        send_bond_list();
+        break;
+
+    case CFG_SET:
+        cfg_on_set(m, now);
+        break;
+
+    case CFG_REMOVE:
+        cfg_on_remove(m);
+        break;
+
+    case CFG_REPLY:
+        out = pair_on_reply(&s_pair, m->addr, m->ok, now);
+        if (!out.reply) {
+            ESP_LOGW(TAG, "PAIR_REPLY for " BDA_FMT " answers nothing open, ignored", BDA_ARGS(m->addr));
+        }
+        carry_out(&out);
+        break;
+
+    case CFG_RADIO: {
+        const bool on = m->set[0], disc = m->set[1], disconnect = m->set[2];
+        const bool was_on = s_live_radio;
+        if (disconnect && s_now.state >= SATLINK_BT_CONNECTED) {
+            esp_a2d_sink_disconnect(s_now.addr);
+        }
+        s_live_radio = on;
+        s_live_disc = disc;
+        apply_radio();
+        if (!on) {
+            rc_stop(&s_reconnect);
+        } else if (!was_on && s_settings.auto_reconnect) {
+            rc_arm(&s_reconnect, now);
+        }
+        ESP_LOGI(TAG, "radio %s at the host's request", !on ? "off" :
+                 disc ? "on, discoverable" : "on, connectable only");
+        bt_av_report_state();
+        break;
+    }
+
+    case CFG_CONFIRM:
+        out = pair_on_confirm(&s_pair, m->addr, m->value, m->ok, m->name, host_confirms(), now);
+        carry_out(&out);
+        break;
+
+    case CFG_PASSKEY:
+        out = pair_on_passkey(&s_pair, m->addr, m->value, m->name, host_confirms(), now);
+        carry_out(&out);
+        break;
+
+    case CFG_AUTH:
+        if (m->ok) {
+            sync_bonds();
+            if (bond_index(&s_bonds, m->addr) >= 0 && m->name_len != 0 &&
+                bond_set_name(&s_bonds, m->addr, m->name, m->name_len)) {
+                s_bonds_dirty = true;
+            }
+        }
+        out = pair_on_done(&s_pair, m->addr, m->ok);
+        carry_out(&out);
+        if (m->ok) {
+            send_bond_list();
+        }
+        break;
+
+    case CFG_NAME:
+        if (!m->ok || m->name_len == 0) {
+            break;
+        }
+        if (bond_index(&s_bonds, m->addr) >= 0 &&
+            bond_set_name(&s_bonds, m->addr, m->name, m->name_len)) {
+            s_bonds_dirty = true;
+            send_bond_list();
+        }
+        if (s_now.state >= SATLINK_BT_CONNECTED && memcmp(s_now.addr, m->addr, 6) == 0 &&
+            s_now.name[0] == '\0') {
+            memcpy(s_now.name, m->name, (size_t)m->name_len + 1);
+            bt_av_report_state();
+        }
+        break;
+
+    case CFG_UNBONDED:
+        ESP_LOGI(TAG, "bond " BDA_FMT " %s", BDA_ARGS(m->addr), m->ok ? "removed" : "not removed");
+        sync_bonds();
+        send_bond_list();
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* Calls the last phone back while `auto_reconnect` holds, and only into a quiet
+ * moment: radio on, nobody attached or pairing, endpoints registered and not about
+ * to be registered again. */
+static void poll_reconnect(uint32_t now)
+{
+    int last = bond_last(&s_bonds);
+    bool can_call = s_live_radio && s_settings.auto_reconnect && bt_av_idle() &&
+                    s_endpoints.state == EP_STATE_IDLE &&
+                    !ep_stale(&s_endpoints, link_host_caps(), offered_codecs()) &&
+                    s_pair.phase == PAIR_IDLE && last >= 0;
+    if (!rc_due(&s_reconnect, now, can_call)) {
+        return;
+    }
+    esp_err_t err = esp_a2d_sink_connect(s_bonds.e[last].addr);
+    ESP_LOGI(TAG, "auto-reconnect: calling " BDA_FMT " \"%s\", %u more after this: %s",
+             BDA_ARGS(s_bonds.e[last].addr), s_bonds.e[last].name, s_reconnect.left,
+             esp_err_to_name(err));
+}
+
+static void cfg_poll(void)
+{
+    static bool started;
+    const uint32_t now = now_ms();
+
+    if (!started) {
+        started = true;
+        /* A HELLO that came before the queue existed went nowhere; answer it as
+         * if it had just arrived. Twice is harmless, never is not. */
+        const cfg_msg_t hello = { .type = CFG_HELLO };
+        cfg_handle(&hello, now);
+        sync_bonds();
+        if (s_settings.radio && s_settings.auto_reconnect) {
+            rc_arm(&s_reconnect, now);
+        }
+    }
+
+    cfg_msg_t m;
+    while (xQueueReceive(s_cfg_queue, &m, 0) == pdTRUE) {
+        cfg_handle(&m, now);
+    }
+
+    pair_out_t out = pair_on_tick(&s_pair, now);
+    carry_out(&out);
+    poll_reconnect(now);
+
+    /* A failed write waits before the next: this loop turns every 10 ms, and
+     * each failure is a log line on the host's link. */
+    static bool save_backoff;
+    static uint32_t save_retry_ms;
+    if (s_bonds_dirty && s_now.state != SATLINK_BT_STREAMING &&
+        (!save_backoff || (int32_t)(now - save_retry_ms) >= 0)) {
+        save_backoff = !save_bonds();
+        save_retry_ms = now + 10000;
+    }
+}
+
+/* ---- From the link's task. Queued, never waited on. */
+
+void bt_av_host_hello(void)
+{
+    cfg_msg_t m = { .type = CFG_HELLO };
+    cfg_post(&m);
+}
+
+void bt_av_bt_refresh(void)
+{
+    cfg_msg_t m = { .type = CFG_REFRESH };
+    cfg_post(&m);
+}
+
+void bt_av_pair_reply(const uint8_t addr[6], bool accept)
+{
+    cfg_msg_t m = { .type = CFG_REPLY, .ok = accept };
+    memcpy(m.addr, addr, sizeof(m.addr));
+    cfg_post(&m);
+}
+
+void bt_av_config_set(const satlink_bt_config_set_t *set)
+{
+    cfg_msg_t m = { .type = CFG_SET,
+                    .set = { set->radio, set->discoverable, set->auto_reconnect, set->codecs_enabled } };
+    if (set->name.len > SATLINK_BT_NAME_MAX) {
+        m.name_refused = true;          /* refused whole, never clipped: the contract */
+    } else {
+        memcpy(m.name, set->name.ptr, set->name.len);
+        m.name[set->name.len] = '\0';
+        m.name_len = (uint8_t)set->name.len;
+    }
+    cfg_post(&m);
+}
+
+void bt_av_bond_remove(const uint8_t addr[6])
+{
+    cfg_msg_t m = { .type = CFG_REMOVE };
+    memcpy(m.addr, addr, sizeof(m.addr));
+    cfg_post(&m);
+}
+
+/* ------------------------------------------------------------------- GAP */
+
 static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 {
+    cfg_msg_t m = {0};
+
     switch (event) {
     case ESP_BT_GAP_AUTH_CMPL_EVT:
         if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
@@ -1112,13 +1831,66 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
         } else {
             ESP_LOGE(TAG, "pairing failed, status %d", param->auth_cmpl.stat);
         }
+        m.type = CFG_AUTH;
+        m.ok = param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS;
+        memcpy(m.addr, param->auth_cmpl.bda, sizeof(m.addr));
+        cfg_take_name(&m, param->auth_cmpl.device_name);
+        cfg_post(&m);
         break;
 
     case ESP_BT_GAP_CFM_REQ_EVT:
-        /* Just works / numeric comparison. There are no buttons on this device
-         * yet, so the only sane answer is yes. */
-        ESP_LOGI(TAG, "confirm request, value %" PRIu32, param->cfm_req.num_val);
-        esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
+        /* Numeric comparison or Just Works; since patches/0007 the stack confirms
+         * neither by itself. Who answers is the pairing machine's call. */
+        if (param->cfm_req.just_works) {
+            ESP_LOGI(TAG, "confirm request from " BDA_FMT ", Just Works", BDA_ARGS(param->cfm_req.bda));
+        } else {
+            ESP_LOGI(TAG, "confirm request from " BDA_FMT ", value %06" PRIu32,
+                     BDA_ARGS(param->cfm_req.bda), param->cfm_req.num_val);
+        }
+        m.type = CFG_CONFIRM;
+        m.ok = param->cfm_req.just_works;
+        m.value = param->cfm_req.num_val;
+        memcpy(m.addr, param->cfm_req.bda, sizeof(m.addr));
+        cfg_take_name(&m, param->cfm_req.device_name);
+        if (!cfg_post(&m)) {
+            /* Unanswered, the phone would wait out the stack's 35 s. Nobody can be
+             * asked now, so answer as 1.7 would, or refuse if a host should have. */
+            esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, !host_confirms());
+        }
+        break;
+
+    case ESP_BT_GAP_KEY_NOTIF_EVT:
+        ESP_LOGI(TAG, "passkey for " BDA_FMT ": %06" PRIu32,
+                 BDA_ARGS(param->key_notif.bda), param->key_notif.passkey);
+        m.type = CFG_PASSKEY;
+        m.value = param->key_notif.passkey;
+        memcpy(m.addr, param->key_notif.bda, sizeof(m.addr));
+        cfg_take_name(&m, param->key_notif.device_name);
+        cfg_post(&m);
+        break;
+
+    case ESP_BT_GAP_KEY_REQ_EVT:
+        /* Only a device with a keyboard is asked to type a passkey, and this one
+         * never says it has one. */
+        ESP_LOGW(TAG, "passkey entry asked of " BDA_FMT ", refused", BDA_ARGS(param->key_req.bda));
+        esp_bt_gap_ssp_passkey_reply(param->key_req.bda, false, 0);
+        break;
+
+    case ESP_BT_GAP_READ_REMOTE_NAME_EVT:
+        m.type = CFG_NAME;
+        m.ok = param->read_rmt_name.stat == ESP_BT_STATUS_SUCCESS;
+        memcpy(m.addr, param->read_rmt_name.bda, sizeof(m.addr));
+        if (m.ok) {
+            cfg_take_name(&m, param->read_rmt_name.rmt_name);
+        }
+        cfg_post(&m);
+        break;
+
+    case ESP_BT_GAP_REMOVE_BOND_DEV_COMPLETE_EVT:
+        m.type = CFG_UNBONDED;
+        m.ok = param->remove_bond_dev_cmpl.status == ESP_BT_STATUS_SUCCESS;
+        memcpy(m.addr, param->remove_bond_dev_cmpl.bda, sizeof(m.addr));
+        cfg_post(&m);
         break;
 
     case ESP_BT_GAP_MODE_CHG_EVT:
@@ -1190,24 +1962,12 @@ void bt_av_set_volume(uint8_t volume)
     link_send_volume_state(volume, 0);
 }
 
+/* Carried out on the Bluetooth task, which owns the radio state since protocol
+ * 1.8 (CFG_RADIO). Not saved: that is what BT_CONFIG_SET is for. */
 void bt_av_set_radio(bool on, bool discoverable, bool disconnect)
 {
-    if (disconnect && s_now.state >= SATLINK_BT_CONNECTED) {
-        esp_a2d_sink_disconnect(s_now.addr);
-    }
-
-    if (!on) {
-        esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
-        s_now.state = SATLINK_BT_OFF;
-        ESP_LOGI(TAG, "radio off at the host's request");
-    } else {
-        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE,
-                                 discoverable ? ESP_BT_GENERAL_DISCOVERABLE
-                                              : ESP_BT_NON_DISCOVERABLE);
-        s_now.state = discoverable ? SATLINK_BT_DISCOVERABLE : SATLINK_BT_IDLE;
-        ESP_LOGI(TAG, "radio on, %s", discoverable ? "discoverable" : "connectable only");
-    }
-    bt_av_report_state();
+    cfg_msg_t m = { .type = CFG_RADIO, .set = { on, discoverable, disconnect } };
+    cfg_post(&m);
 }
 
 /* ------------------------------------------------------------------- startup */
@@ -1219,8 +1979,14 @@ esp_err_t bt_av_start(const char *device_name)
     s_now.codec = SATLINK_CODEC_NONE;
     s_now.play_state = SATLINK_PLAY_STOPPED;
 
+    /* Before the task: from here on the settings are its alone. `device_name` is
+     * the factory one; the host may since have given the device another. */
+    load_settings(device_name);
+
     s_queue = xQueueCreate(BT_QUEUE_DEPTH, sizeof(bt_a2d_msg_t));
     ESP_RETURN_ON_FALSE(s_queue != NULL, ESP_ERR_NO_MEM, TAG, "no memory for the event queue");
+    s_cfg_queue = xQueueCreate(BT_CFG_QUEUE_DEPTH, sizeof(cfg_msg_t));
+    ESP_RETURN_ON_FALSE(s_cfg_queue != NULL, ESP_ERR_NO_MEM, TAG, "no memory for the settings queue");
     ESP_RETURN_ON_FALSE(
         xTaskCreate(bt_av_task, "bt_av", BT_TASK_STACK, NULL, BT_TASK_PRIO, NULL) == pdPASS,
         ESP_ERR_NO_MEM, TAG, "no memory for the bt task");
@@ -1249,14 +2015,7 @@ esp_err_t bt_av_start(const char *device_name)
     ESP_RETURN_ON_ERROR(esp_bluedroid_enable(), TAG, "bluedroid_enable");
 
     ESP_RETURN_ON_ERROR(esp_bt_gap_register_callback(gap_cb), TAG, "gap_register");
-    ESP_RETURN_ON_ERROR(esp_bt_gap_set_device_name(device_name), TAG, "set_device_name");
-
-    /* Secure Simple Pairing, no keyboard and no display: a phone pairs without
-     * anyone having to type anything. */
-    esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
-    esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE;
-    ESP_RETURN_ON_ERROR(esp_bt_gap_set_security_param(param_type, &iocap, sizeof(iocap)),
-                        TAG, "set_security_param");
+    ESP_RETURN_ON_ERROR(esp_bt_gap_set_device_name(s_settings.name), TAG, "set_device_name");
 
     ESP_RETURN_ON_ERROR(esp_avrc_ct_init(), TAG, "avrc_ct_init");
     ESP_RETURN_ON_ERROR(esp_avrc_ct_register_callback(avrc_ct_cb), TAG, "avrc_ct_register");
@@ -1285,8 +2044,15 @@ esp_err_t bt_av_start(const char *device_name)
      */
     link_wait_for_host(BT_AV_HELLO_WAIT_MS);
     uint32_t host_caps = link_host_caps();
-    decide_endpoints(host_caps);
+    const uint8_t codecs = offered_codecs();
+    decide_endpoints(host_caps, codecs);
     bt_av_apply_host_caps();
+
+    /* Secure Simple Pairing either way. With a host that confirms, DisplayYesNo
+     * and a question on its screen; without one, no keyboard and no display, and
+     * a phone pairs without anyone having to answer anything. Each HELLO sets it
+     * again (apply_io_cap). */
+    ESP_RETURN_ON_FALSE(apply_io_cap(), ESP_FAIL, TAG, "set_security_param");
 
     ESP_RETURN_ON_ERROR(esp_a2d_register_callback(a2d_cb), TAG, "a2d_register");
     ESP_RETURN_ON_ERROR(esp_a2d_sink_init(), TAG, "a2d_sink_init");
@@ -1297,16 +2063,22 @@ esp_err_t bt_av_start(const char *device_name)
 
     /* Hand the endpoint machine its starting point on its own task, so that it
      * never races the registration above. */
-    bt_a2d_msg_t registered = { .event = BT_EVENT_ENDPOINTS_REGISTERED, .host_caps = host_caps };
+    bt_a2d_msg_t registered = { .event = BT_EVENT_ENDPOINTS_REGISTERED, .host_caps = host_caps,
+                                .codecs = codecs };
     ESP_RETURN_ON_FALSE(xQueueSend(s_queue, &registered, pdMS_TO_TICKS(100)) == pdTRUE,
                         ESP_ERR_NO_MEM, TAG, "event queue full at start");
 
-    ESP_RETURN_ON_ERROR(esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE),
-                        TAG, "set_scan_mode");
-    s_now.state = SATLINK_BT_DISCOVERABLE;
+    /* Scan mode and pairing as the saved settings say: factory state is
+     * connectable, discoverable and pairable, as before protocol 1.8. */
+    apply_radio();
     bt_av_report_state();
 
-    ESP_LOGI(TAG, "\"%s\" is discoverable, A2DP sink + AVRCP controller%s",
-             device_name, BT_AV_CODEC_LIST);
+    ESP_LOGI(TAG, "\"%s\" is %s, A2DP sink + AVRCP controller%s", s_settings.name,
+             s_now.state == SATLINK_BT_OFF ? "off" :
+             s_now.state == SATLINK_BT_IDLE ? "connectable only" : "discoverable",
+             BT_AV_CODEC_LIST);
+
+    /* The settings, the bonds and the pairing are the task's from here. */
+    atomic_store(&s_stack_up, true);
     return ESP_OK;
 }

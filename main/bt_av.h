@@ -12,13 +12,16 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "satlink/format_sync.h"
+#include "satlink/messages.h"
 void bt_av_format_ready(const fmt_ready_t *ready);
 
 #include "esp_err.h"
 
 /* Brings up A2DP sink and AVRCP CT, then makes the device connectable and
- * discoverable. audio_out_init() must have run first: the stream can start as
- * soon as this returns. */
+ * discoverable, or whatever the saved Bluetooth settings say instead (protocol
+ * 1.8). `device_name` is the factory name, for a device the host never renamed.
+ * audio_out_init() must have run first: the stream can start as soon as this
+ * returns. */
 esp_err_t bt_av_start(const char *device_name);
 
 /* What the host may ask for, straight from CMD_TRANSPORT, CMD_VOLUME and
@@ -27,6 +30,19 @@ esp_err_t bt_av_start(const char *device_name);
 void bt_av_transport(uint8_t cmd);          /* satlink_transport_t */
 void bt_av_set_volume(uint8_t volume);      /* absolute AVRCP volume, 0..127 */
 void bt_av_set_radio(bool on, bool discoverable, bool disconnect);
+
+/*
+ * Protocol 1.8: the Bluetooth settings, the bonds and pairing, from the link's task.
+ *
+ * Each only queues the request for the Bluetooth task, which owns all of it, and
+ * returns. bt_av_host_hello() goes on every HELLO: the pairing mode follows the
+ * host's PAIR_CONFIRM bit, and a 1.8 host is sent BT_CONFIG and BOND_LIST.
+ */
+void bt_av_host_hello(void);
+void bt_av_pair_reply(const uint8_t addr[6], bool accept);
+void bt_av_config_set(const satlink_bt_config_set_t *set);
+void bt_av_bond_remove(const uint8_t addr[6]);
+void bt_av_bt_refresh(void);
 
 /* Pushes everything the host needs in order to stop guessing, and is safe to call
  * at any time.
