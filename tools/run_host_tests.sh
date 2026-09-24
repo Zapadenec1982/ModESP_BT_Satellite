@@ -63,6 +63,12 @@ fi
     "$repo/tests/host/test_endpoints.c" -o "$out/test_endpoints"
 "$out/test_endpoints"
 
+# Protocol 1.8 on the device side: settings, bonds, pairing, reconnect. Pure C too.
+"$cc" -std=c17 -Wall -Wextra -Werror -g -O1 \
+    "-I$repo/main" "-I$repo/components/satlink/include" "-I$repo/tests/host" \
+    "$repo/tests/host/test_bt_settings.c" -o "$out/test_bt_settings"
+"$out/test_bt_settings"
+
 # Replay the codec-switch race through source extracted from our generated BT.
 "$python" "$repo/tools/run_bta_reopen_tests.py" --cc "$cc"
 # A live PING/PONG link must recover a dropped startup capability greeting.
