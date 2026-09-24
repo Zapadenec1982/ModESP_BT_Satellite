@@ -19,6 +19,7 @@ int g_checks, g_failures;
 static int s_hello_mux;
 static atomic_bool s_host_present, s_peer_incompatible;
 static uint32_t s_host_caps, s_own_caps, s_ping_outstanding;
+static uint8_t s_host_minor;
 static int64_t s_last_hello_us, clock_us;
 static struct { unsigned rx_bad, hello_sent, pings_unanswered; } s_stats;
 static struct { void (*on_hello)(const satlink_hello_t *); } s_handlers;
@@ -41,7 +42,7 @@ static void on_hello(const satlink_hello_t *h) { (void)h; callbacks++; }
 static void reset_case(void) {
     s_hello_mux = 0;
     s_host_present = s_peer_incompatible = false;
-    s_host_caps = s_ping_outstanding = 0;
+    s_host_caps = s_ping_outstanding = 0; s_host_minor = 0;
     s_last_hello_us = 0; clock_us = 1000;
     memset(&s_stats, 0, sizeof s_stats);
     hellos = pings = callbacks = 0; s_handlers.on_hello = on_hello;
@@ -88,6 +89,12 @@ int main(void) {
     receive_hello(1, 5, 0x7b); CHECK(s_host_caps == 0x3b);
     receive_hello(1, 6, 0x7b); CHECK(s_host_caps == 0x7b);
     receive_hello(1, 6, 0x79); CHECK(s_host_caps == 0x39);
+    // Host-confirmed pairing is a 1.8 bit; the minor is kept for the 1.8 senders.
+    receive_hello(1, 7, 0xfb); CHECK(s_host_caps == 0x7b); CHECK(s_host_minor == 7);
+    receive_hello(1, 8, 0xfb); CHECK(s_host_caps == 0xfb); CHECK(s_host_minor == 8);
+    receive_hello(1, 8, 0x80); CHECK(s_host_caps == 0x80);
+    receive_hello(1, 9, 0xfb); CHECK(s_host_caps == 0xfb); CHECK(s_host_minor == 9);
+    receive_hello(1, 6, 0xfb); CHECK(s_host_caps == 0x7b); CHECK(s_host_minor == 6);
     // A known incompatible host is not a lost greeting; do not retry forever.
     reset_case(); answer_hello(); receive_hello(2, 0, 0);
     CHECK(s_peer_incompatible); CHECK(!s_host_present); CHECK(callbacks == 0);

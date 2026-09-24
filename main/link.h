@@ -31,6 +31,12 @@ typedef struct {
      * nothing waits for it, and ignoring it leaves the host exactly where 1.6
      * left it -- with an empty tile. */
     void (*on_cover_retry)(uint32_t boot_nonce, uint32_t track_generation);
+    /* Protocol 1.8. The name in `set` points into the frame and is gone when the
+     * handler returns: copy it. */
+    void (*on_pair_reply)(const uint8_t addr[6], bool accept);
+    void (*on_bt_config_set)(const satlink_bt_config_set_t *set);
+    void (*on_bond_remove)(const uint8_t addr[6]);
+    void (*on_bt_refresh)(void);
 } link_handlers_t;
 
 /* `caps` is what this build can actually do, not what the protocol defines. The
@@ -46,6 +52,10 @@ bool link_host_present(void);
  * that matters is SATLINK_HOST_CAP_RELOCK: without it we promise 44.1 kHz and
  * never move. */
 uint32_t link_host_caps(void);
+
+/* The host's proto_minor from its HELLO, zero when it has not spoken. Messages a
+ * minor introduced go only to a host at that minor or above. */
+uint8_t link_host_minor(void);
 
 /*
  * Blocks until the host has greeted us, or the timeout runs out.
@@ -72,6 +82,13 @@ void link_send_gpio_in(uint32_t values, uint32_t changed);
 void link_send_gpio_map(const satlink_gpio_map_t *map);
 void link_send_adc_value(uint8_t index, uint16_t raw, uint16_t mv);
 void link_send_log(uint8_t level, const char *text);
+
+/* Protocol 1.8. Silent for a host below minor 8, which would not know the types.
+ * None of them is droppable: each answers something the host is waiting on. */
+void link_send_pair_request(const satlink_pair_request_t *m);
+void link_send_pair_result(const uint8_t addr[6], uint8_t status);
+void link_send_bt_config(const satlink_bt_config_t *m);
+void link_send_bond_list(const satlink_bond_list_t *m);
 
 /* Cover art, protocol 1.6 only: RESET on the critical queue, then one DATA per
  * OBEX chunk and an END, all copied into bounded heap frames on the caller's

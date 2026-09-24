@@ -113,6 +113,7 @@ static uint8_t           s_tx_seq;
 static atomic_bool       s_host_present;
 static atomic_bool       s_peer_incompatible;
 static uint32_t          s_host_caps;
+static uint8_t           s_host_minor;
 static portMUX_TYPE s_fmt_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_fmt_nonce, s_fmt_generation, s_fmt_sent_ms;
 static uint32_t          s_own_caps;
@@ -393,6 +394,47 @@ void link_send_log(uint8_t level, const char *text)
     if (len != 0) { tx_push(SATLINK_MSG_LOG, payload, len); }
 }
 
+/* Protocol 1.8. A host below minor 8 would count these as unknown and nothing
+ * else, but it asked for none of them, so it is not sent them. */
+static bool host_speaks_1_8(void) { return link_host_minor() >= 8; }
+
+void link_send_pair_request(const satlink_pair_request_t *m)
+{
+    if (!host_speaks_1_8()) return;
+    uint8_t payload[6 + 1 + 4 + 2 + SATLINK_BT_NAME_MAX];
+    size_t len = satlink_enc_pair_request(payload, sizeof(payload), m);
+    if (len != 0) { tx_push(SATLINK_MSG_PAIR_REQUEST, payload, len); }
+}
+
+void link_send_pair_result(const uint8_t addr[6], uint8_t status)
+{
+    if (!host_speaks_1_8()) return;
+    satlink_pair_result_t m = { .status = status };
+    memcpy(m.addr, addr, sizeof(m.addr));
+    uint8_t payload[8];
+    size_t len = satlink_enc_pair_result(payload, sizeof(payload), &m);
+    if (len != 0) { tx_push(SATLINK_MSG_PAIR_RESULT, payload, len); }
+}
+
+void link_send_bt_config(const satlink_bt_config_t *m)
+{
+    if (!host_speaks_1_8()) return;
+    uint8_t payload[5 + 2 + SATLINK_BT_NAME_MAX];
+    size_t len = satlink_enc_bt_config(payload, sizeof(payload), m);
+    if (len != 0) { tx_push(SATLINK_MSG_BT_CONFIG, payload, len); }
+}
+
+/* 658 bytes at worst, so not on the caller's stack. */
+void link_send_bond_list(const satlink_bond_list_t *m)
+{
+    if (!host_speaks_1_8()) return;
+    uint8_t *payload = malloc(SATLINK_BOND_LIST_BYTES_MAX);
+    if (payload == NULL) return;
+    size_t len = satlink_enc_bond_list(payload, SATLINK_BOND_LIST_BYTES_MAX, m);
+    if (len != 0) { tx_push(SATLINK_MSG_BOND_LIST, payload, len); }
+    free(payload);
+}
+
 static void send_hello(void)
 {
     const esp_app_desc_t *app = esp_app_get_description();
@@ -472,6 +514,9 @@ static void handle_hello(const uint8_t *payload, size_t len)
         caps &= ~SATLINK_HOST_CAP_96KHZ;
     if (h.minor < 5) caps &= ~SATLINK_HOST_CAP_COVER;
     if (h.minor < 6 || !(caps & SATLINK_HOST_CAP_COVER)) caps &= ~COVER_STREAM_CAP;
+    if (h.minor < 8) caps &= ~SATLINK_HOST_CAP_PAIR_CONFIRM;
+    /* Minor first: a sender that sees the new caps must not see the old minor. */
+    __atomic_store_n(&s_host_minor, h.minor, __ATOMIC_SEQ_CST);
     __atomic_store_n(&s_host_caps, caps, __ATOMIC_SEQ_CST);
     ESP_LOGI(TAG, "host %u.%u, caps 0x%08" PRIx32 ", build \"%.*s\"",
              h.major, h.minor, h.caps, (int)h.build.len, h.build.ptr);
@@ -586,6 +631,38 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
         if (s_handlers.on_adc_read != NULL) { s_handlers.on_adc_read(m.index); }
         break;
     }
+
+    /* Protocol 1.8. The host sends these only to a device that claims
+     * BT_SETTINGS, and this one does; nothing else gates them here. */
+    case SATLINK_MSG_PAIR_REPLY: {
+        satlink_pair_reply_t m = {0};
+        if (!satlink_dec_pair_reply(payload, len, &m)) { s_stats.rx_bad++; break; }
+        if (!s_peer_incompatible && s_handlers.on_pair_reply != NULL)
+            s_handlers.on_pair_reply(m.addr, m.accept != 0);
+        break;
+    }
+
+    case SATLINK_MSG_BT_CONFIG_SET: {
+        satlink_bt_config_set_t m = {0};
+        if (!satlink_dec_bt_config_set(payload, len, &m)) { s_stats.rx_bad++; break; }
+        if (!s_peer_incompatible && s_handlers.on_bt_config_set != NULL)
+            s_handlers.on_bt_config_set(&m);
+        break;
+    }
+
+    case SATLINK_MSG_BOND_REMOVE: {
+        satlink_bond_remove_t m = {0};
+        if (!satlink_dec_bond_remove(payload, len, &m)) { s_stats.rx_bad++; break; }
+        if (!s_peer_incompatible && s_handlers.on_bond_remove != NULL)
+            s_handlers.on_bond_remove(m.addr);
+        break;
+    }
+
+    case SATLINK_MSG_BT_REFRESH:
+        if (!satlink_dec_bt_refresh(payload, len)) { s_stats.rx_bad++; break; }
+        if (!s_peer_incompatible && s_handlers.on_bt_refresh != NULL)
+            s_handlers.on_bt_refresh();
+        break;
 
     default:
         /* A message we do not implement is not a protocol error: the other side
@@ -788,6 +865,7 @@ bool link_wait_for_host(uint32_t timeout_ms)
 }
 
 uint32_t link_host_caps(void) { return __atomic_load_n(&s_host_caps, __ATOMIC_SEQ_CST); }
+uint8_t link_host_minor(void) { return __atomic_load_n(&s_host_minor, __ATOMIC_SEQ_CST); }
 
 uint32_t link_bulk_pending(void)
 {
