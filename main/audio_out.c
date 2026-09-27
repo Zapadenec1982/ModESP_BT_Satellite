@@ -1,4 +1,7 @@
 #include "audio_out.h"
+#include "audio_transfer.h"
+#include "audio_telemetry.h"
+#include "audio_refill.h"
 
 #include <inttypes.h>
 #include <string.h>
@@ -31,11 +34,15 @@ static const char *TAG = "sat.i2s";
  * data, so this holds 256 output samples either way. */
 #define AUDIO_CONV_BYTES        512
 
-/* About 136 ms of 44.1 kHz stereo. Deep enough to ride out a busy moment in the
- * Bluetooth task, shallow enough that latency stays sane. */
+/* Fixed WROOM internal-RAM budget: 139 ms at 44.1/16, only 32 ms at 96/32.
+ * Backpressure and a 12 ms reserve absorb bursts without enlarging this ring. */
 #define AUDIO_RING_BYTES        (24 * 1024)
 #define AUDIO_CHUNK_BYTES       1024
-#define AUDIO_WRITE_TIMEOUT_MS  20
+#define AUDIO_WRITE_TIMEOUT_MS  10
+#define AUDIO_TRANSFER_BUDGET_MS 100
+#ifndef AUDIO_DIAGNOSTIC_FIXED_TRIM
+#define AUDIO_DIAGNOSTIC_FIXED_TRIM 0
+#endif
 
 #define AUDIO_TASK_STACK        3072
 #define AUDIO_TASK_PRIO         (configMAX_PRIORITIES - 3)
@@ -65,18 +72,84 @@ static SemaphoreHandle_t  s_producer_lock;
 static atomic_uint       s_gate = 1; /* bit 0 closed; upper bits invalidate old resumes */
 static bool              s_running;
 static bool              s_fault;
+static TaskHandle_t s_writer_task;
+static _Atomic(TaskHandle_t) s_decoder_task;
+static uint32_t s_packet_gate, s_packet_epoch, s_packet_start_ms, s_packet_src_frame;
+static atomic_uint s_play_epoch;
+static uint32_t s_writer_gate, s_writer_epoch;
+static atomic_uint s_decoder_stack;
+static int64_t s_decode_start_us;
+static atomic_uint s_decode_last_us;
+static uint32_t s_packet_wait_us;
+static atomic_uint s_short_writes, s_tx_errors, s_tx_cancelled_bytes;
+static atomic_uint s_pcm_cancelled_frames, s_dropped_frames, s_backpressure;
+static atomic_uint s_tx_events, s_tx_gap_us, s_tx_last_us, s_tx_qovf_us;
+static atomic_uint s_format_qovf, s_rebuffers, s_writer_gap_us;
+static atomic_uint s_decode_gap_us, s_decode_max_us, s_decode_active_max_us;
+static atomic_uint s_encoded_depth, s_encoded_max, s_encoded_drops, s_sequence_gaps;
+static atomic_uint s_servo_changes, s_servo_last_us;
+static bool s_tx_recover;
+static bool s_buffering = true;
+static atomic_uint s_encoded_drop_us, s_pcm_drop_us, s_tx_error_us;
+static atomic_uint s_empty_polls, s_wait_recovered, s_wait_timeout, s_wait_cancel, s_wait_max_us;
+
+/* Independent of s_lock: a delayed stats snapshot must not delay event draining.
+ * 864 bytes of event storage; all copies under this mux, all logging outside it. */
+#define AUDIO_REBUFFER_EVENTS 16u
+#define AUDIO_TRIM_EVENTS 8u
+static portMUX_TYPE s_event_lock = portMUX_INITIALIZER_UNLOCKED;
+static audio_event_fifo_t s_rebuffer_events, s_trim_events;
+static audio_event_t s_rebuffer_history[AUDIO_REBUFFER_EVENTS], s_trim_history[AUDIO_TRIM_EVENTS];
+static audio_event_state_t s_events;
+
+static void audio_record_rebuffer(uint32_t gate, uint32_t epoch, uint32_t fill, unsigned reason)
+{
+    audio_event_t event;
+    uint32_t now = (uint32_t)esp_timer_get_time();
+    portENTER_CRITICAL(&s_event_lock);
+    bool record = audio_event_rebuffer(&s_events, &event, now, gate, epoch, fill, reason);
+    portEXIT_CRITICAL(&s_event_lock);
+    if (!record) return;
+    if (event.kind == AUDIO_EVENT_REBUFFER_BEGIN) {
+        /* Rare read-only query, never inside the event mux. IDF water_mark is
+         * a descriptor/cursor percentage, not a count of remaining valid PCM.
+         * In particular IDF can skip a nearly stale descriptor before qovf. */
+        i2s_tuning_info_t info = {0};
+        if (i2s_channel_tune_rate(s_tx, NULL, &info) == ESP_OK)
+            event.dma_proxy_pct = (int32_t)info.water_mark;
+    }
+    portENTER_CRITICAL(&s_event_lock);
+    audio_event_push(&s_rebuffer_events, s_rebuffer_history, AUDIO_REBUFFER_EVENTS, event);
+    portEXIT_CRITICAL(&s_event_lock);
+}
+
+static void audio_record_trim(uint32_t begin, uint32_t end, int old_ppm, int new_ppm, int result)
+{
+    audio_event_t event = {AUDIO_EVENT_TRIM, begin, end, s_writer_gate, s_writer_epoch,
+                           old_ppm, new_ppm, result, -1};
+    portENTER_CRITICAL(&s_event_lock);
+    audio_event_push(&s_trim_events, s_trim_history, AUDIO_TRIM_EVENTS, event);
+    portEXIT_CRITICAL(&s_event_lock);
+}
+
+static void counter_max(atomic_uint *counter, uint32_t value)
+{
+    unsigned old = atomic_load(counter);
+    while (value > old && !atomic_compare_exchange_weak(counter, &old, value)) {}
+}
 static void flush_ring(void);
+static esp_err_t clear_dma(void);
 static uint32_t           s_rate_hz = AUDIO_RATE_DEFAULT;
-static volatile uint32_t  s_dropped;
+static atomic_uint       s_dropped;
 /* Polls of the ring that came back empty, per report window. See audio_out.h for
  * why this is not the underrun it used to be named after. */
 static volatile uint32_t  s_ring_dry;
 /* TX DMA descriptor-queue overflows: the real starvation, counted in the I2S ISR. */
-static volatile uint32_t  s_dma_starved;
+static atomic_uint       s_dma_starved;
 /* False until the writer has fed the DMA once since the stream started. The first
  * descriptors of a fresh stream are unclaimed by definition, and counting that as
  * a fault is how a counter starts crying wolf. */
-static volatile bool      s_dma_primed;
+static atomic_bool        s_dma_primed;
 static volatile uint32_t  s_fill_min = UINT32_MAX;
 static volatile uint32_t  s_fill_max;
 /* Sum and count of the fills sampled in this window, for the mean. 64-bit because
@@ -84,7 +157,7 @@ static volatile uint32_t  s_fill_max;
  * person to widen either number should not have to check. */
 static volatile uint64_t  s_fill_sum;
 static volatile uint32_t  s_fill_n;
-static volatile bool      s_streaming;   /* an empty ring only matters while playing */
+static atomic_bool        s_streaming;   /* an empty ring only matters while playing */
 static volatile uint32_t  s_peak;
 /*
  * The same figure taken again at the far end of the pipe, on the bytes the DMA is
@@ -111,6 +184,41 @@ static portMUX_TYPE       s_peak_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint8_t   s_slot_bits = AUDIO_BITS_DEFAULT;   /* on the wire */
 static volatile uint8_t   s_src_bits  = 16;                   /* out of the decoder */
 static const char        *s_codec_name = "?";
+
+/* These hooks are called only around decode_packet on A2DP_DECODER. The token
+ * spans all PCM callbacks from that packet, including after a gate reopens. */
+void sat_audio_decode_begin(unsigned depth)
+{
+    s_decoder_task = xTaskGetCurrentTaskHandle();
+    uint32_t old_gate = s_packet_gate, old_epoch = s_packet_epoch;
+    s_packet_gate = atomic_load(&s_gate);
+    s_packet_epoch = atomic_load(&s_play_epoch);
+    s_decode_start_us = esp_timer_get_time();
+    s_packet_start_ms = (uint32_t)(s_decode_start_us / 1000);
+    s_packet_wait_us = 0;
+    s_packet_src_frame = (s_src_bits / 8u) * 2u;
+    if (s_decode_last_us && old_gate == s_packet_gate && old_epoch == s_packet_epoch &&
+        !(s_packet_gate & 1u) && s_streaming)
+        counter_max(&s_decode_gap_us, (uint32_t)s_decode_start_us - atomic_load(&s_decode_last_us));
+    atomic_store(&s_decode_last_us, (uint32_t)s_decode_start_us);
+    atomic_store(&s_encoded_depth, depth);
+    counter_max(&s_encoded_max, depth);
+}
+void sat_audio_decode_end(void)
+{
+    uint32_t elapsed = (uint32_t)(esp_timer_get_time() - s_decode_start_us);
+    atomic_store(&s_decoder_stack, uxTaskGetStackHighWaterMark(NULL));
+    counter_max(&s_decode_max_us, elapsed);
+    counter_max(&s_decode_active_max_us, elapsed - s_packet_wait_us);
+}
+void sat_audio_encoded_event(unsigned depth, unsigned dropped, unsigned gaps)
+{
+    atomic_store(&s_encoded_depth, depth);
+    counter_max(&s_encoded_max, depth);
+    atomic_fetch_add(&s_encoded_drops, dropped);
+    if (dropped) atomic_store(&s_encoded_drop_us, (uint32_t)esp_timer_get_time());
+    atomic_fetch_add(&s_sequence_gaps, gaps);
+}
 
 /*
  * Dither, for the one case that needs it: 24-bit aptX HD samples going out on a
@@ -227,8 +335,12 @@ static inline void audio_servo_sample(uint32_t fill)
 /* With s_lock held: this moves the clock under i2s_channel_write. */
 static void audio_servo_apply(int ppm)
 {
+    const uint32_t begin_us = (uint32_t)esp_timer_get_time();
+    const int old_ppm = s_servo_ppm;
     i2s_tuning_info_t info = {0};
-    if (i2s_channel_tune_rate(s_tx, NULL, &info) != ESP_OK) {
+    esp_err_t err = i2s_channel_tune_rate(s_tx, NULL, &info);
+    if (err != ESP_OK) {
+        audio_record_trim(begin_us, (uint32_t)esp_timer_get_time(), old_ppm, ppm, err);
         s_servo_off = true;
         return;
     }
@@ -248,17 +360,16 @@ static void audio_servo_apply(int ppm)
      * only here and never across a format change: with two holders the driver
      * is not allowed to move the APLL at all. */
     periph_rtc_apll_acquire();
-    const esp_err_t err = i2s_channel_tune_rate(s_tx, &cfg, &info);
+    err = i2s_channel_tune_rate(s_tx, &cfg, &info);
     periph_rtc_apll_release();
+    audio_record_trim(begin_us, (uint32_t)esp_timer_get_time(), old_ppm, ppm, err);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "clock servo: %+d ppm refused: %s; servo off until the next format",
-                 ppm, esp_err_to_name(err));
+        atomic_fetch_add(&s_tx_errors, 1);
         s_servo_off = true;
         return;
     }
-    if (s_servo_ppm == 0 && ppm != 0) {
-        ESP_LOGI(TAG, "clock servo engaged: MCLK %" PRId32 " Hz nominal", origin);
-    }
+    atomic_fetch_add(&s_servo_changes, 1);
+    atomic_store(&s_servo_last_us, (uint32_t)esp_timer_get_time());
     s_servo_ppm      = ppm;
     s_servo_delta_hz = info.delta_mclk_hz;
 }
@@ -300,7 +411,7 @@ static void audio_servo_tick(void)
     s_servo_fill_n   = 0;
     s_servo_fill_acc = 0;
 
-    if (s_servo_off || !s_running || !s_streaming || (atomic_load(&s_gate) & 1u) || n == 0) {
+    if (AUDIO_DIAGNOSTIC_FIXED_TRIM || s_buffering || s_servo_off || !s_running || !s_streaming || (atomic_load(&s_gate) & 1u) || n == 0) {
         return;     /* nothing to track; the integrator keeps what it has learned */
     }
 
@@ -337,6 +448,55 @@ static void audio_servo_tick(void)
  * diagnosis. */
 #define AUDIO_REPORT_US  (10 * 1000 * 1000)
 
+static void audio_report_events(void)
+{
+    static uint32_t last_rebuffer_overflow, last_trim_overflow;
+    /* Bounded drain, including when streaming stops. Never acquire s_lock here.
+     * low32 microseconds wrap after 71.6 min: subtract timestamps modulo 2^32.
+     * begin: a=pre-poll allocated ring bytes, b=last successful enqueue us,
+     * c=empty/startup. Fill predates servo/receive and is not proof of unread
+     * data at failure. The enqueue timestamp is sampled when recording begins.
+     * end: a=accepted zero frames, b=ring bytes, c=ready/cancelled.
+     * trim: a=old ppm, b=requested ppm, c=esp_err_t; begin/end bracket the call. */
+    for (unsigned i = 0; i < AUDIO_REBUFFER_EVENTS + AUDIO_TRIM_EVENTS; ++i) {
+        audio_event_t event;
+        portENTER_CRITICAL(&s_event_lock);
+        bool available = audio_event_pop(&s_rebuffer_events, s_rebuffer_history,
+                                          AUDIO_REBUFFER_EVENTS, &event);
+        if (!available)
+            available = audio_event_pop(&s_trim_events, s_trim_history, AUDIO_TRIM_EVENTS, &event);
+        portEXIT_CRITICAL(&s_event_lock);
+        if (!available) break;
+        if (event.kind == AUDIO_EVENT_TRIM) {
+            ESP_LOGI(TAG, "trim_event begin_us=%u end_us=%u gate=%u epoch=%u old_ppm=%" PRId32
+                     " requested_ppm=%" PRId32 " result=%" PRId32,
+                     (unsigned)event.begin_us, (unsigned)event.end_us,
+                     (unsigned)event.gate, (unsigned)event.epoch, event.a, event.b, event.c);
+        } else if (event.kind == AUDIO_EVENT_REBUFFER_BEGIN) {
+            ESP_LOGI(TAG, "rebuffer_begin us=%u gate=%u epoch=%u fill_bytes=%u pcm_enqueue_us=%u reason=%u dma_proxy_pct=%" PRId32,
+                     (unsigned)event.begin_us, (unsigned)event.gate, (unsigned)event.epoch,
+                     (unsigned)(uint32_t)event.a, (unsigned)(uint32_t)event.b, (unsigned)event.c,
+                     event.dma_proxy_pct);
+        } else {
+            ESP_LOGI(TAG, "rebuffer_end begin_us=%u end_us=%u gate=%u epoch=%u zero_frames=%u fill_bytes=%u reason=%u",
+                     (unsigned)event.begin_us, (unsigned)event.end_us,
+                     (unsigned)event.gate, (unsigned)event.epoch,
+                     (unsigned)(uint32_t)event.a, (unsigned)(uint32_t)event.b, (unsigned)event.c);
+        }
+    }
+    /* Overflow must remain visible even if the stream stopped before draining. */
+    portENTER_CRITICAL(&s_event_lock);
+    uint32_t rebuffer_overflow = s_rebuffer_events.overflow;
+    uint32_t trim_overflow = s_trim_events.overflow;
+    portEXIT_CRITICAL(&s_event_lock);
+    if (rebuffer_overflow != last_rebuffer_overflow || trim_overflow != last_trim_overflow) {
+        ESP_LOGW(TAG, "audio_event_overflow rebuffer=%u trim=%u",
+                 (unsigned)rebuffer_overflow, (unsigned)trim_overflow);
+        last_rebuffer_overflow = rebuffer_overflow;
+        last_trim_overflow = trim_overflow;
+    }
+}
+
 static void audio_report(void)
 {
     static int64_t next_us;
@@ -347,39 +507,92 @@ static void audio_report(void)
     next_us = now + AUDIO_REPORT_US;
 
     audio_out_stats_t st;
-    audio_out_get_stats(&st);
-    /* Peak as a fraction of full scale, in tenths of a percent, so that a glance
-     * says whether the signal is loud without anyone reaching for a calculator. */
-    unsigned peak_permille = (unsigned)((st.peak * 1000u) / 32768u);
+    if (audio_out_get_stats(&st)) {
+        /* Peak as a fraction of full scale, in tenths of a percent, so that a glance
+         * says whether the signal is loud without anyone reaching for a calculator. */
+        unsigned peak_permille = (unsigned)((st.peak * 1000u) / 32768u);
 
-    /* Milliseconds of audio standing in the ring, which is the latency this device
-     * is adding and the number that says whether the buffer is healthy or merely
-     * full. Bytes alone do not, because the same count means different things at
-     * different rates and widths. */
-    unsigned frame_bytes = (unsigned)(s_slot_bits / 8) * 2u;
-    /* The mean, not the peak. Reporting only min and max is what let a ring that
-     * spends most of its time near empty read as "40-60 ms" for a whole session
-     * (item 10.10): those were high-water marks, and the low one beside them was
-     * set by the empty-ring branch itself. */
-    unsigned fill_ms = (frame_bytes && s_rate_hz)
-                     ? (unsigned)((uint64_t)st.fill_avg * 1000u / (frame_bytes * s_rate_hz))
-                     : 0u;
+        /* Milliseconds of audio standing in the ring, which is the latency this device
+         * is adding and the number that says whether the buffer is healthy or merely
+         * full. Bytes alone do not, because the same count means different things at
+         * different rates and widths. */
+        unsigned frame_bytes = (unsigned)(s_slot_bits / 8) * 2u;
+        /* The mean, not the peak. Reporting only min and max is what let a ring that
+         * spends most of its time near empty read as "40-60 ms" for a whole session
+         * (item 10.10): those were high-water marks, and the low one beside them was
+         * set by the empty-ring branch itself. */
+        unsigned fill_ms = (frame_bytes && s_rate_hz)
+                         ? (unsigned)((uint64_t)st.fill_avg * 1000u / (frame_bytes * s_rate_hz))
+                         : 0u;
 
-    ESP_LOGI(TAG, "%s %" PRIu32 " Hz %u-bit slots: ring %u/%u/%u of %u (%u ms mean)"
-                  ", dry %" PRIu32 ", dma starved %" PRIu32
-                  ", dropped %" PRIu32 ", peak %" PRIu32 "/32768 (%u.%u%%), wire %" PRIu32
-                  " [%02x %02x %02x %02x %02x %02x %02x %02x], part %" PRIu32 ", free dma %u"
-                  ", clock %+d ppm (%+" PRId32 " Hz)",
-             s_codec_name, s_rate_hz, s_slot_bits,
-             (unsigned)st.fill_min, (unsigned)st.fill_avg, (unsigned)st.fill_max,
-             (unsigned)AUDIO_RING_BYTES, fill_ms,
-             st.ring_dry, st.dma_starved, st.dropped_bytes, st.peak,
-             peak_permille / 10, peak_permille % 10, st.wire_peak,
-             st.wire_head[0], st.wire_head[1], st.wire_head[2], st.wire_head[3],
-             st.wire_head[4], st.wire_head[5], st.wire_head[6], st.wire_head[7],
-             s_partial_frames,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-             s_servo_ppm, s_servo_delta_hz);
+        ESP_LOGI(TAG, "%s %" PRIu32 " Hz %u-bit slots: ring %u/%u/%u of %u (%u ms mean)"
+                      ", dry %" PRIu32 ", dma starved %" PRIu32
+                      ", dropped %" PRIu32 ", peak %" PRIu32 "/32768 (%u.%u%%), wire %" PRIu32
+                      " [%02x %02x %02x %02x %02x %02x %02x %02x], part %" PRIu32 ", free dma %u"
+                      ", clock %+d ppm (%+" PRId32 " Hz)",
+                 s_codec_name, s_rate_hz, s_slot_bits,
+                 (unsigned)st.fill_min, (unsigned)st.fill_avg, (unsigned)st.fill_max,
+                 (unsigned)AUDIO_RING_BYTES, fill_ms,
+                 st.ring_dry, st.dma_starved, st.dropped_bytes, st.peak,
+                 peak_permille / 10, peak_permille % 10, st.wire_peak,
+                 st.wire_head[0], st.wire_head[1], st.wire_head[2], st.wire_head[3],
+                 st.wire_head[4], st.wire_head[5], st.wire_head[6], st.wire_head[7],
+                 s_partial_frames,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                 s_servo_ppm, s_servo_delta_hz);
+    } else {
+        ESP_LOGI(TAG, "stats snapshot skipped: writer busy; ring/peak window retained");
+    }
+    /* These lifetime counters must remain visible while the writer owns s_lock.
+     * Timestamp their acquisition, not the earlier report scheduling check. */
+    now = esp_timer_get_time();
+    ESP_LOGI(TAG, "uptime_us=%" PRId64 " gate=%u streaming=%u fixed_trim=%u "
+             "pcm_drop_frames=%u cancel_frames=%u backpressure=%u short=%u txerr=%u txcancel_bytes=%u "
+             "txevents=%u txgap_us=%u txlast_us=%u qovf_us=%u fmtqovf=%u writer_gap_us=%u rebuffer=%u "
+             "decode_gap_us=%u decode_us=%u active_us=%u encoded=%u/%u drop=%u seqgap=%u "
+             "trim_changes=%u trim_us=%u internal_min=%u largest=%u writer_stack=%u decoder_stack=%u",
+             now, atomic_load(&s_gate), (unsigned)s_streaming, AUDIO_DIAGNOSTIC_FIXED_TRIM,
+             atomic_load(&s_dropped_frames), atomic_load(&s_pcm_cancelled_frames), atomic_load(&s_backpressure),
+             atomic_load(&s_short_writes), atomic_load(&s_tx_errors), atomic_load(&s_tx_cancelled_bytes),
+             atomic_load(&s_tx_events), atomic_load(&s_tx_gap_us), atomic_load(&s_tx_last_us),
+             atomic_load(&s_tx_qovf_us), atomic_load(&s_format_qovf), atomic_load(&s_writer_gap_us), atomic_load(&s_rebuffers),
+             atomic_load(&s_decode_gap_us), atomic_load(&s_decode_max_us), atomic_load(&s_decode_active_max_us),
+             atomic_load(&s_encoded_depth), atomic_load(&s_encoded_max), atomic_load(&s_encoded_drops), atomic_load(&s_sequence_gaps),
+             atomic_load(&s_servo_changes), atomic_load(&s_servo_last_us),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)uxTaskGetStackHighWaterMark(s_writer_task),
+             atomic_load(&s_decoder_stack));
+    ESP_LOGI(TAG, "event_us: encoded_drop=%u pcm_drop=%u tx_error=%u decode_last=%u",
+             atomic_load(&s_encoded_drop_us), atomic_load(&s_pcm_drop_us),
+             atomic_load(&s_tx_error_us), atomic_load(&s_decode_last_us));
+    audio_event_state_t events;
+    uint32_t rebuffer_overflow, trim_overflow;
+    portENTER_CRITICAL(&s_event_lock);
+    events = s_events;
+    rebuffer_overflow = s_rebuffer_events.overflow;
+    trim_overflow = s_trim_events.overflow;
+    portEXIT_CRITICAL(&s_event_lock);
+    ESP_LOGI(TAG, "silence: frames=%u writes=%u last_us=%u gate=%u epoch=%u cancel_frames=%u "
+             "pcm_enqueue_us=%u rebuffer_begin_us=%u rebuffer_end_us=%u active=%u event_overflow=%u/%u",
+             (unsigned)events.zero_frames, (unsigned)events.zero_writes, (unsigned)events.zero_last_us,
+             (unsigned)events.zero_gate, (unsigned)events.zero_epoch, (unsigned)events.zero_cancel_frames,
+             (unsigned)events.pcm_last_us, (unsigned)events.rebuffer_begin_us,
+             (unsigned)events.rebuffer_end_us, (unsigned)events.active,
+             (unsigned)rebuffer_overflow, (unsigned)trim_overflow);
+    ESP_LOGI(TAG, "refill: empty_poll=%u wait_recovered=%u wait_timeout=%u wait_cancel=%u maxwait_us=%u",
+             atomic_load(&s_empty_polls), atomic_load(&s_wait_recovered), atomic_load(&s_wait_timeout),
+             atomic_load(&s_wait_cancel), atomic_load(&s_wait_max_us));
+}
+
+static void audio_report_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        audio_report_events();
+        audio_report();
+    }
 }
 
 /*
@@ -414,39 +627,124 @@ static uint32_t audio_wire_peak(const uint8_t *p, size_t len)
     return peak;
 }
 
-/*
- * The one measurement that is actually about the pins.
- *
- * The driver hands a finished TX descriptor back through `msg_queue`, and
- * i2s_channel_write takes them from there to refill. The queue holds desc_num-1
- * entries, and the write path deliberately keeps one space free, so it is full
- * only when every buffer has come back and nobody has claimed one: the DMA has
- * looped over descriptors the application never refilled. With auto_clear set,
- * what went out of them was silence.
- *
- * That is the gap in the music the old `underruns` counter promised and never
- * looked at -- it watched the application ring, one stage upstream and ~32 ms
- * of DMA away from the wire.
- *
- * Runs in the I2S ISR. No IRAM_ATTR: CONFIG_I2S_ISR_IRAM_SAFE is off, so the
- * driver's own handler is not IRAM-resident either and marking only this would
- * buy nothing. One compare and one increment; nothing here can block.
- */
+/* Descriptor-return and queue-overflow events are software service evidence,
+ * not proof of a physical BCLK interruption. No logging or buffer writes in ISR.
+ * ESP32 IDF 5.5.5 i2s_common.c keeps auto_clear_after_cb enabled with on_sent. */
+static bool audio_dma_sent(i2s_chan_handle_t handle, i2s_event_data_t *event, void *ctx)
+{
+    (void)handle; (void)event; (void)ctx;
+    uint32_t now = (uint32_t)esp_timer_get_time();
+    uint32_t last = atomic_exchange(&s_tx_last_us, now);
+    atomic_fetch_add(&s_tx_events, 1);
+    if (last) counter_max(&s_tx_gap_us, now - last);
+    return false;
+}
 static bool audio_dma_starved(i2s_chan_handle_t handle, i2s_event_data_t *event, void *ctx)
 {
     (void)handle; (void)event; (void)ctx;
-    if (s_streaming && s_dma_primed) { s_dma_starved++; }
-    return false;   /* nothing woken, so no yield needed */
+    atomic_store(&s_tx_qovf_us, (uint32_t)esp_timer_get_time());
+    if (atomic_load(&s_gate) & 1u) atomic_fetch_add(&s_format_qovf, 1);
+    else if (s_streaming && s_dma_primed) { s_dma_starved++; }
+    return false;
 }
 
-static void i2s_write_locked(const void *data, size_t len)
+typedef struct { uint32_t gate, epoch; bool silence; } transfer_context_t;
+typedef struct { uint32_t gate, epoch; size_t borrowed_len; } refill_context_t;
+
+static bool refill_current(void *ctx)
 {
-    size_t written = 0;
-    esp_err_t err = i2s_channel_write(s_tx, data, len, &written, AUDIO_WRITE_TIMEOUT_MS);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "write failed: %s (%u of %u bytes)", esp_err_to_name(err),
-                 (unsigned)written, (unsigned)len);
+    refill_context_t *c = ctx;
+    return c->gate == atomic_load(&s_gate) && c->epoch == atomic_load(&s_play_epoch) &&
+           !(c->gate & 1u) && s_streaming && s_running;
+}
+static uint32_t refill_now(void *ctx)
+{
+    (void)ctx;
+    return (uint32_t)esp_timer_get_time();
+}
+static void *refill_receive(void *ctx, size_t *len, unsigned ticks, size_t max_bytes)
+{
+    refill_context_t *c = ctx;
+    void *item = xRingbufferReceiveUpTo(s_ring, len, (TickType_t)ticks, max_bytes);
+    c->borrowed_len = item ? *len : 0;
+    return item;
+}
+static void refill_return_item(void *ctx, void *item)
+{
+    refill_context_t *c = ctx;
+    /* A generation changed during receive: the helper owns and returns this
+     * stale borrowed item, so it will not be counted by the next ring flush. */
+    atomic_fetch_add(&s_pcm_cancelled_frames, c->borrowed_len / ((s_slot_bits / 8u) * 2u));
+    vRingbufferReturnItem(s_ring, item);
+}
+static audio_refill_result_t audio_wait_refill(uint32_t gate, uint32_t epoch)
+{
+    /* Called only after a steady nonblocking poll returned NULL, with s_lock
+     * still held. Exactly one RTOS tick, not a millisecond and not a retry loop.
+     * This measures a receive recovery; it does not prove DMA avoided a gap. */
+    atomic_fetch_add(&s_empty_polls, 1);
+    refill_context_t ctx = { gate, epoch, 0 };
+    const audio_refill_ops_t ops = { &ctx, refill_current, refill_now, refill_receive, refill_return_item };
+    audio_refill_result_t result = audio_refill_once(&ops, AUDIO_CHUNK_BYTES);
+    counter_max(&s_wait_max_us, result.elapsed_us);
+    if (result.status == AUDIO_REFILL_RECOVERED) atomic_fetch_add(&s_wait_recovered, 1);
+    else if (result.status == AUDIO_REFILL_TIMEOUT) atomic_fetch_add(&s_wait_timeout, 1);
+    else atomic_fetch_add(&s_wait_cancel, 1);
+    return result;
+}
+static uint32_t transfer_now(void *ctx)
+{
+    (void)ctx;
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+static bool transfer_current(void *ctx)
+{
+    transfer_context_t *c = ctx;
+    return c->gate == atomic_load(&s_gate) && c->epoch == atomic_load(&s_play_epoch) && (c->silence || (!(c->gate & 1u) && s_streaming));
+}
+static bool tx_send(void *ctx, const uint8_t *data, size_t len, size_t *sent)
+{
+    (void)ctx;
+    esp_err_t err = i2s_channel_write(s_tx, data, len, sent, AUDIO_WRITE_TIMEOUT_MS);
+    if (*sent < len) atomic_fetch_add(&s_short_writes, 1);
+    return err == ESP_OK || err == ESP_ERR_TIMEOUT;
+}
+static size_t i2s_write_locked(const void *data, size_t len)
+{
+    transfer_context_t ctx = { s_writer_gate, s_writer_epoch, true };
+    audio_transfer_ops_t ops = { &ctx, transfer_current, transfer_now, tx_send };
+    size_t accepted;
+    audio_transfer_result_t result = audio_transfer(&ops, data, len, transfer_now(NULL),
+                                                    AUDIO_TRANSFER_BUDGET_MS, &accepted);
+    if (result != AUDIO_TRANSFER_OK) {
+        atomic_fetch_add(&s_tx_cancelled_bytes, len - accepted);
+        /* IDF normally accepts frame-aligned DMA prefixes. If a future driver
+         * cancels mid-frame, reset its cursor before submitting new PCM. */
+        if (accepted % ((s_slot_bits / 8u) * 2u)) s_tx_recover = true;
+        if (result != AUDIO_TRANSFER_CANCELLED) {
+            atomic_fetch_add(&s_tx_errors, 1);
+            atomic_store(&s_tx_error_us, (uint32_t)esp_timer_get_time());
+            /* Explicit recovery: invalidate this packet/tail, clear DMA, retry
+             * the same negotiated format. No old sample may follow a new one. */
+            atomic_fetch_add(&s_play_epoch, 1u);
+            s_tx_recover = true;
+        }
     }
+    return accepted;
+}
+
+static void i2s_write_silence_locked(const void *data, size_t len)
+{
+    const uint32_t gate = s_writer_gate, epoch = s_writer_epoch;
+    const bool streaming_open = s_streaming && !(gate & 1u) &&
+                                gate == atomic_load(&s_gate) && epoch == atomic_load(&s_play_epoch);
+    const unsigned frame = (s_slot_bits / 8u) * 2u;
+    size_t accepted = i2s_write_locked(data, len);
+    const bool cancelled = gate != atomic_load(&s_gate) || epoch != atomic_load(&s_play_epoch);
+    uint32_t now = (uint32_t)esp_timer_get_time();
+    portENTER_CRITICAL(&s_event_lock);
+    audio_event_zeros(&s_events, now, gate, epoch, frame, accepted, streaming_open, cancelled);
+    portEXIT_CRITICAL(&s_event_lock);
 }
 
 #if AUDIO_TEST_TONE_HZ
@@ -510,6 +808,8 @@ static void audio_out_task(void *arg)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         if (!(atomic_load(&s_gate) & 1u)) {
             size_t n = audio_tone_fill(tone_buf, sizeof(tone_buf));
+            s_writer_gate = atomic_load(&s_gate);
+            s_writer_epoch = atomic_load(&s_play_epoch);
             i2s_write_locked(tone_buf, n);
         }
         xSemaphoreGive(s_lock);
@@ -517,35 +817,85 @@ static void audio_out_task(void *arg)
     }
 #endif
 
+    static const uint8_t silence[AUDIO_CHUNK_BYTES];
+    bool rebuffer = true;
+    uint32_t writer_gate = atomic_load(&s_gate) & ~1u;
+    uint32_t writer_epoch = atomic_load(&s_play_epoch);
+    int64_t last_service = 0;
     for (;;) {
-        audio_report();
         xSemaphoreTake(s_lock, portMAX_DELAY);
-        audio_servo_tick();
-        if (atomic_load(&s_gate) & 1u) {
-            xSemaphoreGive(s_lock);
-            vTaskDelay(1);
-            continue;
+        int64_t now = esp_timer_get_time();
+        if (last_service && s_streaming && !(atomic_load(&s_gate) & 1u))
+            counter_max(&s_writer_gap_us, now - last_service);
+        last_service = now;
+        uint32_t gate = atomic_load(&s_gate);
+        uint32_t epoch = atomic_load(&s_play_epoch);
+        s_writer_gate = gate;
+        s_writer_epoch = epoch;
+        if ((gate & 1u) || !s_streaming || writer_gate != (gate & ~1u) || writer_epoch != epoch)
+            audio_record_rebuffer(gate, epoch, 0, AUDIO_REBUFFER_CANCELLED);
+        if (writer_gate != (gate & ~1u) || writer_epoch != epoch) {
+            /* Never invert the control task's lock order by waiting here. */
+            if (xSemaphoreTake(s_producer_lock, 0) != pdTRUE) {
+                if (s_running) i2s_write_silence_locked(silence, sizeof silence);
+                xSemaphoreGive(s_lock);
+                continue;
+            }
+            flush_ring();
+            writer_gate = gate & ~1u;
+            writer_epoch = epoch;
+            rebuffer = true;
+            xSemaphoreGive(s_producer_lock);
         }
+        if (s_tx_recover) {
+            esp_err_t err = i2s_channel_disable(s_tx);
+            s_running = false;
+            if (err == ESP_OK) err = clear_dma();
+            if (err == ESP_OK) err = i2s_channel_enable(s_tx);
+            s_running = (err == ESP_OK);
+            s_tx_recover = false;
+            if (err != ESP_OK) { s_fault = true; audio_out_gate(); }
+        }
+        uint32_t fill_now = AUDIO_RING_BYTES - xRingbufferGetCurFreeSize(s_ring);
+        size_t prefill = audio_prefill_bytes(s_rate_hz, (s_slot_bits / 8u) * 2u, AUDIO_RING_BYTES);
+        if (rebuffer && fill_now >= prefill) {
+            audio_record_rebuffer(gate, epoch, fill_now, AUDIO_REBUFFER_READY);
+            rebuffer = false;
+        }
+        s_buffering = rebuffer;
+        audio_servo_tick();
         size_t len = 0;
-        uint8_t *item = xRingbufferReceiveUpTo(s_ring, &len, 0, AUDIO_CHUNK_BYTES);
+        uint8_t *item = NULL;
+        if (!(atomic_load(&s_gate) & 1u) && s_streaming && s_running && !rebuffer) {
+            item = xRingbufferReceiveUpTo(s_ring, &len, 0, AUDIO_CHUNK_BYTES);
+            if (item == NULL) {
+                audio_refill_result_t refill = audio_wait_refill(gate, epoch);
+                if (refill.status == AUDIO_REFILL_CANCELLED) {
+                    /* The helper already returned any item it borrowed. Go
+                     * through generation/stream handling before touching PCM. */
+                    xSemaphoreGive(s_lock);
+                    continue;
+                }
+                item = refill.item;
+                len = refill.len;
+            }
+        }
         if (item == NULL) {
-            /* Nothing left in the ring. This is how every drain cycle ends -- the
-             * poll has no timeout and the loop repeats until it comes back empty
-             * -- so on its own it says nothing about the music. What reaches the
-             * pins is decided a stage later, by whether the DMA still has data,
-             * and s_dma_starved is the counter that watches that.
-             *
-             * Counted per window rather than throttled: the old one-per-100-ms
-             * limit capped the number at 10/s regardless of the fault, so it
-             * reported the throttle instead of the condition. */
-            if (s_streaming) {
+            if (s_streaming && !(atomic_load(&s_gate) & 1u)) {
+                audio_record_rebuffer(gate, epoch, fill_now,
+                                      rebuffer ? AUDIO_REBUFFER_STARTUP : AUDIO_REBUFFER_EMPTY);
+                if (!rebuffer) atomic_fetch_add(&s_rebuffers, 1);
+                rebuffer = true;
                 s_ring_dry++;
                 s_fill_min = 0;
-                s_fill_n++;          /* a zero fill, so the mean counts it too */
+                s_fill_n++;
                 audio_servo_sample(0);
             }
+            /* Keep servicing DMA at its own pace; no sleep/refeed loop and no
+             * clock stop during a routine underrun or FORMAT_READY wait. */
+            if (s_running) i2s_write_silence_locked(silence, sizeof silence);
             xSemaphoreGive(s_lock);
-            vTaskDelay(1);
+            if (!s_running) vTaskDelay(1); /* driver fault, not normal refill */
             continue;
         }
 
@@ -661,7 +1011,7 @@ esp_err_t audio_out_init(void)
     /* Before enable: the driver refuses callbacks on a running channel. They live
      * in the handle and survive the disable/reconfig/enable that a format change
      * does, so this registration is the only one. */
-    const i2s_event_callbacks_t cbs = { .on_send_q_ovf = audio_dma_starved };
+    const i2s_event_callbacks_t cbs = { .on_send_q_ovf = audio_dma_starved, .on_sent = audio_dma_sent };
     ESP_RETURN_ON_ERROR(i2s_channel_register_event_callback(s_tx, &cbs, NULL), TAG, "register_cb");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(s_tx), TAG, "channel_enable");
     s_running = true;
@@ -671,9 +1021,12 @@ esp_err_t audio_out_init(void)
 #endif
 
     if (xTaskCreate(audio_out_task, "audio_out", AUDIO_TASK_STACK, NULL,
-                    AUDIO_TASK_PRIO, NULL) != pdPASS) {
+                    AUDIO_TASK_PRIO, &s_writer_task) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
+
+    if (xTaskCreate(audio_report_task, "audio_stats", 3072, NULL, 2, NULL) != pdPASS)
+        return ESP_ERR_NO_MEM;
 
     ESP_LOGI(TAG, "master out: BCLK %d, WS %d, DOUT %d, %" PRIu32 " Hz, %d-bit stereo",
              BOARD_I2S_BCLK_GPIO, BOARD_I2S_WS_GPIO, BOARD_I2S_DOUT_GPIO,
@@ -687,18 +1040,38 @@ esp_err_t audio_out_init(void)
     return ESP_OK;
 }
 
-/* Zero timeout on purpose, everywhere below. This runs in the Bluetooth stack's
- * task, and rule 1 of the spec is that the device never blocks. */
+static bool pcm_send(void *ctx, const uint8_t *data, size_t len, size_t *sent)
+{
+    (void)ctx;
+    size_t chunk = len > AUDIO_CHUNK_BYTES ? AUDIO_CHUNK_BYTES : len;
+    int64_t start = esp_timer_get_time();
+    TickType_t slice = pdMS_TO_TICKS(AUDIO_WRITE_TIMEOUT_MS);
+    bool ok = xRingbufferSend(s_ring, data, chunk, slice ? slice : 1) == pdTRUE;
+    if (ok) {
+        uint32_t now = (uint32_t)esp_timer_get_time();
+        portENTER_CRITICAL(&s_event_lock);
+        s_events.pcm_last_us = now;
+        portEXIT_CRITICAL(&s_event_lock);
+    }
+    s_packet_wait_us += (uint32_t)(esp_timer_get_time() - start);
+    *sent = ok ? chunk : 0;
+    if (!ok) atomic_fetch_add(&s_backpressure, 1);
+    return true;
+}
 static void audio_ring_put(const void *data, size_t len)
 {
-    if (xRingbufferSend(s_ring, data, len, 0) == pdTRUE) {
-        return;
-    }
-    uint32_t before = s_dropped;
-    s_dropped += len;
-    /* One line per kilobyte lost, not one per packet. */
-    if ((before >> 10) != (s_dropped >> 10)) {
-        ESP_LOGW(TAG, "ring full, dropped %" PRIu32 " bytes so far", s_dropped);
+    transfer_context_t ctx = { s_packet_gate, s_packet_epoch, false };
+    audio_transfer_ops_t ops = { &ctx, transfer_current, transfer_now, pcm_send };
+    size_t accepted;
+    audio_transfer_result_t result = audio_transfer(&ops, data, len, s_packet_start_ms,
+                                                    AUDIO_TRANSFER_BUDGET_MS, &accepted);
+    unsigned frame = (s_slot_bits / 8u) * 2u;
+    if (result == AUDIO_TRANSFER_CANCELLED) {
+        atomic_fetch_add(&s_pcm_cancelled_frames, (len - accepted) / frame);
+    } else if (result != AUDIO_TRANSFER_OK) {
+        atomic_store(&s_pcm_drop_us, (uint32_t)esp_timer_get_time());
+        s_dropped += len - accepted;
+        atomic_fetch_add(&s_dropped_frames, (len - accepted) / frame);
     }
 }
 
@@ -787,9 +1160,16 @@ uint32_t audio_out_gate(void)
 
 void audio_out_write(const uint8_t *pcm, size_t len)
 {
-    if (!s_producer_lock || (atomic_load(&s_gate) & 1u)) return;
-    if (xSemaphoreTake(s_producer_lock, 0) != pdTRUE) return;
-    if (!(atomic_load(&s_gate) & 1u)) audio_write_packet(pcm, len);
+    /* Only the decoder worker may backpressure. Stack/control callbacks never
+     * wait here. Packet hooks are in patch 0008, not an application callback. */
+    if (!s_producer_lock || xTaskGetCurrentTaskHandle() != s_decoder_task) return;
+    transfer_context_t ctx = { s_packet_gate, s_packet_epoch, false };
+    if (!transfer_current(&ctx) || xSemaphoreTake(s_producer_lock, 0) != pdTRUE) {
+        atomic_fetch_add(&s_pcm_cancelled_frames, len / s_packet_src_frame);
+        return;
+    }
+    if (transfer_current(&ctx)) audio_write_packet(pcm, len);
+    else atomic_fetch_add(&s_pcm_cancelled_frames, len / s_packet_src_frame);
     xSemaphoreGive(s_producer_lock);
 }
 
@@ -895,6 +1275,7 @@ static void flush_ring(void)
     size_t len = 0;
     void *item;
     while ((item = xRingbufferReceiveUpTo(s_ring, &len, 0, AUDIO_CHUNK_BYTES)) != NULL) {
+        atomic_fetch_add(&s_pcm_cancelled_frames, len / ((s_slot_bits / 8u) * 2u));
         vRingbufferReturnItem(s_ring, item);
     }
     /* And the half frame held back from the old format, which belongs to it. */
@@ -913,13 +1294,14 @@ void audio_out_set_streaming(bool streaming)
      * how a counter starts crying wolf. The writer sets it again on its first
      * write, which is the moment the DMA first holds this stream's audio. */
     s_dma_primed = false;
+    atomic_fetch_add(&s_play_epoch, 1u); /* preserve correlated FORMAT_READY token */
     s_streaming  = streaming;
 }
 
-void audio_out_get_stats(audio_out_stats_t *out)
+bool audio_out_get_stats(audio_out_stats_t *out)
 {
-    if (out == NULL) {
-        return;
+    if (out == NULL || s_lock == NULL || xSemaphoreTake(s_lock, 0) != pdTRUE) {
+        return false;
     }
     out->dropped_bytes = s_dropped;
     out->ring_dry      = s_ring_dry;
@@ -942,4 +1324,6 @@ void audio_out_get_stats(audio_out_stats_t *out)
     s_fill_max = 0;
     s_fill_sum = 0;
     s_fill_n   = 0;
+    xSemaphoreGive(s_lock);
+    return true;
 }
