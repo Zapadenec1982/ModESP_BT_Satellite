@@ -977,13 +977,15 @@ static void audio_out_task(void *arg)
         size_t prefill = audio_prefill_bytes(s_rate_hz, (s_slot_bits / 8u) * 2u, AUDIO_RING_BYTES);
         bool go = fill_now >= prefill;
         if (s_slave) {
-            /* The reserve, not the ring: half of it before a sample leaves. Unless
-             * it has not come 250 ms after the ring passed the old threshold: then that
-             * threshold, so a misjudged reserve costs latency at worst, never the sound. */
+            /* The ring must hold the old threshold, and on top of it the reserve (ring plus
+             * queue) must reach half its target -- or 250 ms must pass. The ring condition
+             * is not optional: queued packets are audio only if the decoder keeps up, and
+             * when it did not, a full queue restarted playback on an empty ring forty times
+             * a second (30.09.2026). */
             const bool reserve = slave_buffered(fill_now) >= slave_target() / 2u;
             if (!go) reserve_since_us = 0;
             else if (reserve_since_us == 0) reserve_since_us = now;
-            go = reserve || (go && now - reserve_since_us >= 250000);
+            go = go && (reserve || now - reserve_since_us >= 250000);
         }
         if (rebuffer && go) {
             audio_record_rebuffer(gate, epoch, fill_now, AUDIO_REBUFFER_READY);
@@ -1234,8 +1236,14 @@ esp_err_t audio_out_init(void)
     audio_tone_init();
 #endif
 
-    if (xTaskCreate(audio_out_task, "audio_out", AUDIO_TASK_STACK, NULL,
-                    AUDIO_TASK_PRIO, &s_writer_task) != pdPASS) {
+    /* Core 0, away from the decoder. The A2DP decode task is pinned to core 1 and decodes
+     * both LHDC channels there (LHDC_DEC_DUAL_CORE is 0); the writer, unpinned, settled on
+     * core 1 too once the converter made it a float user. With a heavier LHDC stream on
+     * 30.09.2026 core 1 ran at 100 % -- the task watchdog named A2DP_DECODER and audio_out
+     * on CPU 1 while CPU 0 sat in its idle hook -- the decoder fell behind, the queue filled
+     * and dropped, and the ring ran dry forty times a second. */
+    if (xTaskCreatePinnedToCore(audio_out_task, "audio_out", AUDIO_TASK_STACK, NULL,
+                                AUDIO_TASK_PRIO, &s_writer_task, 0) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
 

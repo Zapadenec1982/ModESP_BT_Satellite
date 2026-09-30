@@ -3,6 +3,15 @@
 
 #include <string.h>
 
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+/* In IRAM: the loop runs for every output frame, and fetching it through the flash cache
+ * competes with whatever else that core runs from flash. */
+#define ASRC_HOT IRAM_ATTR
+#else
+#define ASRC_HOT
+#endif
+
 _Static_assert(AUDIO_ASRC_TABLE_TAPS == AUDIO_ASRC_TAPS, "regenerate audio_asrc_table.h");
 _Static_assert((1u << AUDIO_ASRC_TABLE_PHASE_BITS) == AUDIO_ASRC_TABLE_PHASES,
                "the phase is the top bits of the fraction");
@@ -59,8 +68,8 @@ static inline int32_t to_int(float v)
     return (int32_t)v;
 }
 
-size_t audio_asrc_run(audio_asrc_t *a, const uint8_t *in, size_t in_frames,
-                      int32_t *out, size_t out_cap, size_t *used)
+ASRC_HOT size_t audio_asrc_run(audio_asrc_t *a, const uint8_t *in, size_t in_frames,
+                               int32_t *out, size_t out_cap, size_t *used)
 {
     size_t made = 0, taken = 0;
     for (;;) {
