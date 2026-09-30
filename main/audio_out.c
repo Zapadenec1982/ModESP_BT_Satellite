@@ -331,12 +331,16 @@ static inline int16_t audio_narrow_32_to_16(int32_t v)
  * 48 kHz the same ring holds two to four times as long, which is why 48 kHz sounded clean.
  * There is no RAM for a bigger ring, but the packets waiting in the A2DP queue hold the same
  * audio seven times denser: while the ring is full the decoder waits and packets queue. So
- * the servo counts both, ring and queue, and holds their sum at 80 ms, of which at most 8
- * packets queue (the queue holds 18 before it drops). Playback starts at three quarters of
- * it. At 44.1 and 48 kHz the ring alone holds 80 ms and the queue stays empty.
+ * the servo counts both, ring and queue, and holds their sum at 150 ms, of which at most 12
+ * packets queue (the queue holds 18 before it drops). 80 ms was not enough: over 10 minutes
+ * of music at 96 kHz the phone fell behind by more than 500 ppm for a minute at a time and
+ * caught up in bursts, and three of those deficits emptied an 80 ms reserve (30.09.2026).
+ * A queued LHDC packet cost about 0.5 KB of heap there. Playback starts at half the reserve,
+ * because the decoder may wait on a full ring only 100 ms per packet before it drops PCM;
+ * the servo builds the rest.
  */
-#define AUDIO_SLAVE_TARGET_MS     80u
-#define AUDIO_SLAVE_RESERVE_PKTS  8u
+#define AUDIO_SLAVE_TARGET_MS     150u
+#define AUDIO_SLAVE_RESERVE_PKTS  12u
 
 /* Ring bytes plus the queued packets' PCM, in ring bytes. Writer task. */
 static uint32_t slave_buffered(uint32_t fill)
@@ -360,16 +364,15 @@ static uint32_t slave_target(void)
 #define AUDIO_SERVO_STEP_PPM    2           /* smallest change worth an APLL rewrite */
 
 /* The same loop as a slave (1.9), where its output is the converter's ratio instead of the
- * APLL. A ratio costs nothing to change, so it gets the exact value every second and a loop
- * four times faster: critically damped at a 50 s time constant, where the APLL loop takes
- * 200 s. The ring is only 32 ms at 96 kHz / 32-bit, and 100 ppm of difference between the
- * phone and the host moves it 0.1 ms a second: at these gains the fill strays under 2 ms
- * while the integrator learns the difference, at the APLL's it would stray 7. The 1-second
- * mean of the fill wobbles by a fraction of a millisecond, which moves the ratio by tens
- * of ppm: a pitch change of hundredths of a cent. */
-#define AUDIO_ASRC_KP           40.0f       /* ppm per millisecond of fill error */
-#define AUDIO_ASRC_KI           0.4f        /* ppm per millisecond, per second */
-#define AUDIO_ASRC_MAX_PPM      500.0f
+ * APLL. A ratio costs nothing to change, so it gets the exact value every second: critically
+ * damped at a 100 s time constant, twice as fast as the APLL loop. What it measures moves in
+ * whole packets, 15 ms each for LHDC at 96 kHz, so the gain stays low enough that half a
+ * packet of noise moves the ratio by ~150 ppm, a quarter of a cent. Its authority is
+ * 1000 ppm (1.7 cents, still inaudible), because the phone was seen to fall 500 ppm behind
+ * for a minute at a time. */
+#define AUDIO_ASRC_KP           20.0f       /* ppm per millisecond of fill error */
+#define AUDIO_ASRC_KI           0.1f        /* ppm per millisecond, per second */
+#define AUDIO_ASRC_MAX_PPM      1000.0f
 
 static audio_asrc_t s_asrc;             /* writer task only, or with both locks held */
 static int32_t      s_asrc_out[(AUDIO_ASRC_BLOCK + 2u) * 2u];
@@ -974,10 +977,10 @@ static void audio_out_task(void *arg)
         size_t prefill = audio_prefill_bytes(s_rate_hz, (s_slot_bits / 8u) * 2u, AUDIO_RING_BYTES);
         bool go = fill_now >= prefill;
         if (s_slave) {
-            /* The reserve, not the ring: three quarters of it before a sample leaves. Unless
+            /* The reserve, not the ring: half of it before a sample leaves. Unless
              * it has not come 250 ms after the ring passed the old threshold: then that
              * threshold, so a misjudged reserve costs latency at worst, never the sound. */
-            const bool reserve = slave_buffered(fill_now) >= slave_target() / 4u * 3u;
+            const bool reserve = slave_buffered(fill_now) >= slave_target() / 2u;
             if (!go) reserve_since_us = 0;
             else if (reserve_since_us == 0) reserve_since_us = now;
             go = reserve || (go && now - reserve_since_us >= 250000);
