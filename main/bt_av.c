@@ -534,7 +534,9 @@ static void poll_format(void)
     if (atomic_exchange(&s_caps_pending, false) && s_now.rate_hz) {
         uint32_t caps = link_host_caps();
         bool ack = (caps & FMT_HOST_CAP) != 0;
-        uint8_t bits = fmt_slot_bits(s_decoder_bits, (caps & SATLINK_HOST_CAP_WIDE) != 0, ack);
+        /* 1.9: a host that clocks the link does it in 32-bit slots, whatever the decoder. */
+        uint8_t bits = audio_out_is_slave() ? 32
+                     : fmt_slot_bits(s_decoder_bits, (caps & SATLINK_HOST_CAP_WIDE) != 0, ack);
         if (!fmt_valid(&s_format.request) || bits != s_now.bits || ack != s_format.require_ack ||
             (s_now.rate_hz == 96000 && !(caps & SATLINK_HOST_CAP_96KHZ)))
             begin_format(s_now.rate_hz, bits, s_now.channels, s_decoder_bits);
@@ -883,7 +885,8 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
             }
             uint32_t caps = link_host_caps();
             bool acknowledged = (caps & FMT_HOST_CAP) != 0;
-            uint8_t bits = fmt_slot_bits(src_bits, (caps & SATLINK_HOST_CAP_WIDE) != 0, acknowledged);
+            uint8_t bits = audio_out_is_slave() ? 32
+                         : fmt_slot_bits(src_bits, (caps & SATLINK_HOST_CAP_WIDE) != 0, acknowledged);
             begin_format(rate, bits, channels, src_bits);
         }
         bt_av_report_state();

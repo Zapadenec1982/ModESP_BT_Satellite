@@ -2,6 +2,7 @@
 #include "audio_transfer.h"
 #include "audio_telemetry.h"
 #include "audio_refill.h"
+#include "audio_asrc.h"
 
 #include <inttypes.h>
 #include <string.h>
@@ -10,10 +11,12 @@
 #include "board.h"
 
 #include "driver/i2s_std.h"
+#include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "esp_cpu.h"
 #include "clk_ctrl_os.h"            /* periph_rtc_apll_acquire, see audio_servo_apply */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -71,10 +74,13 @@ static SemaphoreHandle_t  s_lock;       /* guards the channel against retune-whi
 static SemaphoreHandle_t  s_producer_lock;
 static atomic_uint       s_gate = 1; /* bit 0 closed; upper bits invalidate old resumes */
 static bool              s_running;
+static bool              s_slave = true;   /* protocol 1.9, see i2s_open() */
 static bool              s_fault;
 static TaskHandle_t s_writer_task;
 static _Atomic(TaskHandle_t) s_decoder_task;
 static uint32_t s_packet_gate, s_packet_epoch, s_packet_start_ms, s_packet_src_frame;
+static uint32_t s_packet_frames;        /* PCM frames the packet being decoded produced */
+static atomic_uint s_frames_per_packet_q4;  /* their running mean, x16: what one queued packet holds */
 static atomic_uint s_play_epoch;
 static uint32_t s_writer_gate, s_writer_epoch;
 static atomic_uint s_decoder_stack;
@@ -197,6 +203,7 @@ void sat_audio_decode_begin(unsigned depth)
     s_packet_start_ms = (uint32_t)(s_decode_start_us / 1000);
     s_packet_wait_us = 0;
     s_packet_src_frame = (s_src_bits / 8u) * 2u;
+    s_packet_frames = 0;
     if (s_decode_last_us && old_gate == s_packet_gate && old_epoch == s_packet_epoch &&
         !(s_packet_gate & 1u) && s_streaming)
         counter_max(&s_decode_gap_us, (uint32_t)s_decode_start_us - atomic_load(&s_decode_last_us));
@@ -210,6 +217,11 @@ void sat_audio_decode_end(void)
     atomic_store(&s_decoder_stack, uxTaskGetStackHighWaterMark(NULL));
     counter_max(&s_decode_max_us, elapsed);
     counter_max(&s_decode_active_max_us, elapsed - s_packet_wait_us);
+    if (s_packet_frames != 0u) {
+        const uint32_t now = s_packet_frames * 16u;
+        const uint32_t mean = atomic_load(&s_frames_per_packet_q4);
+        atomic_store(&s_frames_per_packet_q4, mean ? mean - mean / 8u + now / 8u : now);
+    }
 }
 void sat_audio_encoded_event(unsigned depth, unsigned dropped, unsigned gaps)
 {
@@ -311,10 +323,59 @@ static inline int16_t audio_narrow_32_to_16(int32_t v)
  */
 #define AUDIO_SERVO_PERIOD_US   (1000 * 1000)
 #define AUDIO_SERVO_TARGET      (AUDIO_RING_BYTES / 2)
+
+/*
+ * The reserve, as a slave (1.9). The ring alone is 32 ms at 96 kHz / 32-bit, and the phone's
+ * packets arrive with gaps of 50-85 ms (bench logs of 30.09.2026): each gap longer than what
+ * the ring held was a rebuffer, 7 to 110 ms of zeros in the music, every few seconds. At
+ * 48 kHz the same ring holds two to four times as long, which is why 48 kHz sounded clean.
+ * There is no RAM for a bigger ring, but the packets waiting in the A2DP queue hold the same
+ * audio seven times denser: while the ring is full the decoder waits and packets queue. So
+ * the servo counts both, ring and queue, and holds their sum at 80 ms, of which at most 8
+ * packets queue (the queue holds 18 before it drops). Playback starts at three quarters of
+ * it. At 44.1 and 48 kHz the ring alone holds 80 ms and the queue stays empty.
+ */
+#define AUDIO_SLAVE_TARGET_MS     80u
+#define AUDIO_SLAVE_RESERVE_PKTS  8u
+
+/* Ring bytes plus the queued packets' PCM, in ring bytes. Writer task. */
+static uint32_t slave_buffered(uint32_t fill)
+{
+    const uint32_t frame = (s_slot_bits / 8u) * 2u;
+    const uint32_t per_packet = (atomic_load(&s_frames_per_packet_q4) * frame) >> 4;
+    return fill + atomic_load(&s_encoded_depth) * per_packet;
+}
+
+static uint32_t slave_target(void)
+{
+    const uint32_t frame = (s_slot_bits / 8u) * 2u;
+    const uint32_t per_packet = (atomic_load(&s_frames_per_packet_q4) * frame) >> 4;
+    const uint32_t want  = AUDIO_SLAVE_TARGET_MS * (s_rate_hz * frame / 1000u);
+    const uint32_t reach = AUDIO_RING_BYTES + AUDIO_SLAVE_RESERVE_PKTS * per_packet;
+    return want < reach ? want : reach;
+}
 #define AUDIO_SERVO_MAX_PPM     200
 #define AUDIO_SERVO_KP          10.0f       /* ppm per millisecond of fill error */
 #define AUDIO_SERVO_KI          0.025f      /* ppm per millisecond, per second */
 #define AUDIO_SERVO_STEP_PPM    2           /* smallest change worth an APLL rewrite */
+
+/* The same loop as a slave (1.9), where its output is the converter's ratio instead of the
+ * APLL. A ratio costs nothing to change, so it gets the exact value every second and a loop
+ * four times faster: critically damped at a 50 s time constant, where the APLL loop takes
+ * 200 s. The ring is only 32 ms at 96 kHz / 32-bit, and 100 ppm of difference between the
+ * phone and the host moves it 0.1 ms a second: at these gains the fill strays under 2 ms
+ * while the integrator learns the difference, at the APLL's it would stray 7. The 1-second
+ * mean of the fill wobbles by a fraction of a millisecond, which moves the ratio by tens
+ * of ppm: a pitch change of hundredths of a cent. */
+#define AUDIO_ASRC_KP           40.0f       /* ppm per millisecond of fill error */
+#define AUDIO_ASRC_KI           0.4f        /* ppm per millisecond, per second */
+#define AUDIO_ASRC_MAX_PPM      500.0f
+
+static audio_asrc_t s_asrc;             /* writer task only, or with both locks held */
+static int32_t      s_asrc_out[(AUDIO_ASRC_BLOCK + 2u) * 2u];
+static atomic_uint  s_asrc_us;          /* time spent converting, lifetime */
+static atomic_uint  s_asrc_best_cpf = UINT32_MAX;   /* fewest CPU cycles per output frame */
+static atomic_uint  s_servo_fill_last;  /* the servo's last one-second mean fill, bytes */
 
 static int      s_servo_ppm;            /* the correction last asked of the driver */
 static int32_t  s_servo_delta_hz;       /* what the driver says it applied, MCLK */
@@ -383,6 +444,8 @@ static void audio_servo_reset(void)
     s_servo_ppm = 0;
     s_servo_delta_hz = 0;
     s_servo_integral = 0.0f;
+    audio_asrc_set_ppm(&s_asrc, 0.0f);
+    audio_asrc_reset(&s_asrc);
     s_servo_fill_acc = 0;
     s_servo_fill_n = 0;
     s_servo_off = false;
@@ -411,32 +474,47 @@ static void audio_servo_tick(void)
     s_servo_fill_n   = 0;
     s_servo_fill_acc = 0;
 
-    if (AUDIO_DIAGNOSTIC_FIXED_TRIM || s_buffering || s_servo_off || !s_running || !s_streaming || (atomic_load(&s_gate) & 1u) || n == 0) {
+    if (s_buffering || !s_running || !s_streaming || (atomic_load(&s_gate) & 1u) || n == 0) {
         return;     /* nothing to track; the integrator keeps what it has learned */
     }
+    /* A slave has no clock of its own to tune: the host's clocks the link (1.9), and the
+     * correction goes to the converter instead, which no diagnostic switch pins. */
+    if (!s_slave && (AUDIO_DIAGNOSTIC_FIXED_TRIM || s_servo_off)) {
+        return;
+    }
+    const float kp  = s_slave ? AUDIO_ASRC_KP : AUDIO_SERVO_KP;
+    const float ki  = s_slave ? AUDIO_ASRC_KI : AUDIO_SERVO_KI;
+    const float lim = s_slave ? AUDIO_ASRC_MAX_PPM : (float)AUDIO_SERVO_MAX_PPM;
 
     const unsigned frame_bytes = (unsigned)(s_slot_bits / 8) * 2u;
     const float byte_rate = (float)s_rate_hz * (float)frame_bytes;
     const float fill      = (float)(acc / n);
+    atomic_store(&s_servo_fill_last, (uint32_t)(acc / n));
     /* Positive: the ring is fuller than wanted, the phone is ahead, and the
      * bus has to run faster to catch up. */
-    const float err_ms    = (fill - (float)AUDIO_SERVO_TARGET) * 1000.0f / byte_rate;
+    const float target    = s_slave ? (float)slave_target() : (float)AUDIO_SERVO_TARGET;
+    const float err_ms    = (fill - target) * 1000.0f / byte_rate;
 
-    float out = AUDIO_SERVO_KP * err_ms + s_servo_integral;
+    float out = kp * err_ms + s_servo_integral;
     /* Anti-windup: pinned against the limit in the direction of the error, the
      * integrator would only be storing up an overshoot. */
-    const bool pinned = (out >=  AUDIO_SERVO_MAX_PPM && err_ms > 0.0f) ||
-                        (out <= -AUDIO_SERVO_MAX_PPM && err_ms < 0.0f);
+    const bool pinned = (out >=  lim && err_ms > 0.0f) ||
+                        (out <= -lim && err_ms < 0.0f);
     if (!pinned) {
-        s_servo_integral += AUDIO_SERVO_KI * err_ms;    /* dt is the one-second period */
-        if (s_servo_integral >  AUDIO_SERVO_MAX_PPM) { s_servo_integral =  AUDIO_SERVO_MAX_PPM; }
-        if (s_servo_integral < -AUDIO_SERVO_MAX_PPM) { s_servo_integral = -AUDIO_SERVO_MAX_PPM; }
-        out = AUDIO_SERVO_KP * err_ms + s_servo_integral;
+        s_servo_integral += ki * err_ms;    /* dt is the one-second period */
+        if (s_servo_integral >  lim) { s_servo_integral =  lim; }
+        if (s_servo_integral < -lim) { s_servo_integral = -lim; }
+        out = kp * err_ms + s_servo_integral;
     }
-    if (out >  AUDIO_SERVO_MAX_PPM) { out =  AUDIO_SERVO_MAX_PPM; }
-    if (out < -AUDIO_SERVO_MAX_PPM) { out = -AUDIO_SERVO_MAX_PPM; }
+    if (out >  lim) { out =  lim; }
+    if (out < -lim) { out = -lim; }
 
     const int ppm  = (int)(out >= 0.0f ? out + 0.5f : out - 0.5f);
+    if (s_slave) {
+        audio_asrc_set_ppm(&s_asrc, out);   /* with s_lock held, like every converter call */
+        s_servo_ppm = ppm;
+        return;
+    }
     const int step = ppm - s_servo_ppm;
     if (step >= AUDIO_SERVO_STEP_PPM || step <= -AUDIO_SERVO_STEP_PPM) {
         audio_servo_apply(ppm);
@@ -529,7 +607,7 @@ static void audio_report(void)
                       ", dry %" PRIu32 ", dma starved %" PRIu32
                       ", dropped %" PRIu32 ", peak %" PRIu32 "/32768 (%u.%u%%), wire %" PRIu32
                       " [%02x %02x %02x %02x %02x %02x %02x %02x], part %" PRIu32 ", free dma %u"
-                      ", clock %+d ppm (%+" PRId32 " Hz)",
+                      ", %s %+d ppm (%+" PRId32 " Hz)",
                  s_codec_name, s_rate_hz, s_slot_bits,
                  (unsigned)st.fill_min, (unsigned)st.fill_avg, (unsigned)st.fill_max,
                  (unsigned)AUDIO_RING_BYTES, fill_ms,
@@ -539,19 +617,20 @@ static void audio_report(void)
                  st.wire_head[4], st.wire_head[5], st.wire_head[6], st.wire_head[7],
                  s_partial_frames,
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-                 s_servo_ppm, s_servo_delta_hz);
+                 s_slave ? "asrc" : "clock", s_servo_ppm, s_servo_delta_hz);
     } else {
         ESP_LOGI(TAG, "stats snapshot skipped: writer busy; ring/peak window retained");
     }
     /* These lifetime counters must remain visible while the writer owns s_lock.
      * Timestamp their acquisition, not the earlier report scheduling check. */
     now = esp_timer_get_time();
-    ESP_LOGI(TAG, "uptime_us=%" PRId64 " gate=%u streaming=%u fixed_trim=%u "
+    ESP_LOGI(TAG, "uptime_us=%" PRId64 " gate=%u streaming=%u slave=%u fixed_trim=%u "
              "pcm_drop_frames=%u cancel_frames=%u backpressure=%u short=%u txerr=%u txcancel_bytes=%u "
              "txevents=%u txgap_us=%u txlast_us=%u qovf_us=%u fmtqovf=%u writer_gap_us=%u rebuffer=%u "
              "decode_gap_us=%u decode_us=%u active_us=%u encoded=%u/%u drop=%u seqgap=%u "
-             "trim_changes=%u trim_us=%u internal_min=%u largest=%u writer_stack=%u decoder_stack=%u",
-             now, atomic_load(&s_gate), (unsigned)s_streaming, AUDIO_DIAGNOSTIC_FIXED_TRIM,
+             "trim_changes=%u trim_us=%u internal_min=%u largest=%u writer_stack=%u decoder_stack=%u "
+             "asrc_us=%u asrc_cpf=%u servo_ppm=%d servo_fill=%u packet_frames=%u",
+             now, atomic_load(&s_gate), (unsigned)s_streaming, (unsigned)s_slave, AUDIO_DIAGNOSTIC_FIXED_TRIM,
              atomic_load(&s_dropped_frames), atomic_load(&s_pcm_cancelled_frames), atomic_load(&s_backpressure),
              atomic_load(&s_short_writes), atomic_load(&s_tx_errors), atomic_load(&s_tx_cancelled_bytes),
              atomic_load(&s_tx_events), atomic_load(&s_tx_gap_us), atomic_load(&s_tx_last_us),
@@ -562,7 +641,9 @@ static void audio_report(void)
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)uxTaskGetStackHighWaterMark(s_writer_task),
-             atomic_load(&s_decoder_stack));
+             atomic_load(&s_decoder_stack), atomic_load(&s_asrc_us),
+             atomic_exchange(&s_asrc_best_cpf, UINT32_MAX), s_servo_ppm,
+             atomic_load(&s_servo_fill_last), atomic_load(&s_frames_per_packet_q4) / 16u);
     ESP_LOGI(TAG, "event_us: encoded_drop=%u pcm_drop=%u tx_error=%u decode_last=%u",
              atomic_load(&s_encoded_drop_us), atomic_load(&s_pcm_drop_us),
              atomic_load(&s_tx_error_us), atomic_load(&s_decode_last_us));
@@ -747,6 +828,38 @@ static void i2s_write_silence_locked(const void *data, size_t len)
     portEXIT_CRITICAL(&s_event_lock);
 }
 
+/* Whole frames of ring PCM to the pins. Straight through while this device makes the clock;
+ * through the converter while a host does (1.9), because then the samples are all that is
+ * left to follow the phone with. Writer task, s_lock held. */
+static void pcm_write_locked(const uint8_t *wire, size_t len)
+{
+    if (!s_slave || s_slot_bits != 32u) {
+        i2s_write_locked(wire, len);
+        return;
+    }
+    size_t frames = len / 8u;
+    uint32_t spent = 0;
+    while (frames != 0u) {
+        size_t used = 0;
+        const uint32_t t0 = (uint32_t)esp_timer_get_time();
+        const uint32_t c0 = esp_cpu_get_cycle_count();
+        const size_t made = audio_asrc_run(&s_asrc, wire, frames, s_asrc_out,
+                                           AUDIO_ASRC_BLOCK + 2u, &used);
+        const uint32_t cycles = esp_cpu_get_cycle_count() - c0;
+        spent += (uint32_t)esp_timer_get_time() - t0;
+        /* The fewest cycles a frame took this window: the cost without whatever preempted. */
+        if (made >= 32u) {
+            const uint32_t cpf = cycles / (uint32_t)made;
+            if (cpf < atomic_load(&s_asrc_best_cpf)) atomic_store(&s_asrc_best_cpf, cpf);
+        }
+        if (made != 0u) i2s_write_locked(s_asrc_out, made * 8u);
+        wire += used * 8u;
+        frames -= used;
+        if (used == 0u && made == 0u) break;
+    }
+    atomic_fetch_add(&s_asrc_us, spent);
+}
+
 #if AUDIO_TEST_TONE_HZ
 #include <math.h>
 
@@ -819,6 +932,7 @@ static void audio_out_task(void *arg)
 
     static const uint8_t silence[AUDIO_CHUNK_BYTES];
     bool rebuffer = true;
+    int64_t reserve_since_us = 0;
     uint32_t writer_gate = atomic_load(&s_gate) & ~1u;
     uint32_t writer_epoch = atomic_load(&s_play_epoch);
     int64_t last_service = 0;
@@ -858,9 +972,20 @@ static void audio_out_task(void *arg)
         }
         uint32_t fill_now = AUDIO_RING_BYTES - xRingbufferGetCurFreeSize(s_ring);
         size_t prefill = audio_prefill_bytes(s_rate_hz, (s_slot_bits / 8u) * 2u, AUDIO_RING_BYTES);
-        if (rebuffer && fill_now >= prefill) {
+        bool go = fill_now >= prefill;
+        if (s_slave) {
+            /* The reserve, not the ring: three quarters of it before a sample leaves. Unless
+             * it has not come 250 ms after the ring passed the old threshold: then that
+             * threshold, so a misjudged reserve costs latency at worst, never the sound. */
+            const bool reserve = slave_buffered(fill_now) >= slave_target() / 4u * 3u;
+            if (!go) reserve_since_us = 0;
+            else if (reserve_since_us == 0) reserve_since_us = now;
+            go = reserve || (go && now - reserve_since_us >= 250000);
+        }
+        if (rebuffer && go) {
             audio_record_rebuffer(gate, epoch, fill_now, AUDIO_REBUFFER_READY);
             rebuffer = false;
+            reserve_since_us = 0;
         }
         s_buffering = rebuffer;
         audio_servo_tick();
@@ -884,7 +1009,11 @@ static void audio_out_task(void *arg)
             if (s_streaming && !(atomic_load(&s_gate) & 1u)) {
                 audio_record_rebuffer(gate, epoch, fill_now,
                                       rebuffer ? AUDIO_REBUFFER_STARTUP : AUDIO_REBUFFER_EMPTY);
-                if (!rebuffer) atomic_fetch_add(&s_rebuffers, 1);
+                if (!rebuffer) {
+                    atomic_fetch_add(&s_rebuffers, 1);
+                    /* What the converter still holds is from before the gap. */
+                    audio_asrc_reset(&s_asrc);
+                }
                 rebuffer = true;
                 s_ring_dry++;
                 s_fill_min = 0;
@@ -916,7 +1045,7 @@ static void audio_out_task(void *arg)
             size_t need = frame - s_carry_len;
             if (len >= need) {
                 memcpy(s_carry + s_carry_len, item, need);
-                i2s_write_locked(s_carry, frame);
+                pcm_write_locked(s_carry, frame);
                 s_carry_len = 0;
                 off = need;
             } else {
@@ -945,7 +1074,7 @@ static void audio_out_task(void *arg)
         if (fill > s_fill_max) { s_fill_max = fill; }
         s_fill_sum += fill;
         s_fill_n++;
-        audio_servo_sample(fill);
+        audio_servo_sample(s_slave ? slave_buffered(fill) : fill);
 
         if (len != 0) {
             const uint8_t *wire = (const uint8_t *)item + off;
@@ -956,7 +1085,7 @@ static void audio_out_task(void *arg)
                 memcpy(s_wire_head, wire, (len < sizeof(s_wire_head)) ? len : sizeof(s_wire_head));
             }
             portEXIT_CRITICAL(&s_peak_lock);
-            i2s_write_locked(wire, len);
+            pcm_write_locked(wire, len);
             /* The DMA now holds something this stream put there, so an overflow
              * of its descriptor queue from here on is a real starve and not the
              * empty pool every stream begins with. */
@@ -965,6 +1094,119 @@ static void audio_out_task(void *arg)
         vRingbufferReturnItem(s_ring, item);
         xSemaphoreGive(s_lock);
     }
+}
+
+/*
+ * Protocol 1.9: the channel in either role.
+ *
+ * MASTER (hosts before 1.9): this device makes BCLK and WS from the APLL, and the clock
+ * servo absorbs the phone's drift by tuning that APLL (DEVICE_SPEC, "Вихід I2S").
+ *
+ * SLAVE (1.9 hosts): the host makes BCLK and WS from the PLL that also clocks its DAC and
+ * reads DATA on its own clock -- measured on 30.09.2026, the host as a SLAVE received
+ * ~95 856 of the 96 000 frames a second these pins carried. The slave samples the host's
+ * bit clock with an internal clock of bclk x bclk_div, which the 160 MHz PLL must exceed
+ * by 1.99x (i2s_std.c); IDF's floor is 8, and the most that fits gives the finest look at
+ * the host's clock and the least lag on DOUT ("increase this field when data sent by slave
+ * lag behind", IDF i2s_std.h). Always 32-bit slots: that is what a 1.9 host clocks.
+ */
+static i2s_std_clk_config_t slave_clock(uint32_t rate)
+{
+    i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(rate);
+    clk.clk_src = I2S_CLK_SRC_DEFAULT;                  /* the 160 MHz PLL on this chip */
+    const uint64_t bclk = (uint64_t)rate * 64u;         /* 32-bit stereo */
+    uint32_t div = (uint32_t)((160000000ull * 100u - 1u) / (bclk * 199u));
+    if (div < 8u) div = 8u;
+    if (div > 63u) div = 63u;                           /* the divider register's reach */
+    clk.bclk_div = div;
+    return clk;
+}
+
+static i2s_std_clk_config_t master_clock(uint32_t rate)
+{
+    i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(rate);
+    /* APLL, not the 160 MHz PLL: 44.1 kHz lands far closer, and the clock servo
+     * absorbs the phone's drift by tuning it (DEVICE_SPEC, "Вихід I2S"). */
+    clk.clk_src = I2S_CLK_SRC_APLL;
+    return clk;
+}
+
+/* A slave drives DATA and nothing else. i2s_del_channel only forgets its reservation of
+ * the pads (i2s_output_gpio_revoke): after a master they stay outputs on that master's
+ * clocks, and a slave's init enables their inputs without taking the outputs away. */
+static void release_clock_pads(void)
+{
+    gpio_set_direction(BOARD_I2S_BCLK_GPIO, GPIO_MODE_INPUT);
+    gpio_set_direction(BOARD_I2S_WS_GPIO, GPIO_MODE_INPUT);
+}
+
+/* Pad drive, measured on 30.09.2026 with the host clocking this link and this device's
+ * pulse counter on WS: this cable is loaded hard enough that drive 0-1 moves no line at
+ * all, and at the default 2 the bit clock couples into its neighbour for ~10 false edges
+ * a frame; at 3 the neighbour arrives clean. So every line that runs beside the bit clock
+ * and is ours to drive goes out at 3: DATA always, WS too when we are the master. The bit
+ * clock itself stays at 2, the least that arrives, so it couples least into the others. */
+static void set_pad_drive(bool slave)
+{
+    gpio_set_drive_capability(BOARD_I2S_DOUT_GPIO, GPIO_DRIVE_CAP_3);
+    if (!slave) {
+        gpio_set_drive_capability(BOARD_I2S_WS_GPIO, GPIO_DRIVE_CAP_3);
+        gpio_set_drive_capability(BOARD_I2S_BCLK_GPIO, GPIO_DRIVE_CAP_2);
+    }
+}
+
+/* With both locks held, or before the writer exists. On failure s_tx is NULL. */
+static esp_err_t i2s_open(bool slave)
+{
+    if (slave) release_clock_pads();
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0,
+                                                            slave ? I2S_ROLE_SLAVE : I2S_ROLE_MASTER);
+    /* Send zeros rather than the last buffer again when the producer falls behind:
+     * a repeated buffer is an audible buzz, silence is not. */
+    chan_cfg.auto_clear = true;
+    esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx, NULL);
+    if (err != ESP_OK) { s_tx = NULL; return err; }
+
+    if (slave) s_slot_bits = 32;
+    /* A variable, not an expression: the IDF macro pastes its argument unparenthesised. */
+    const i2s_data_bit_width_t width = s_slot_bits == 32 ? I2S_DATA_BIT_WIDTH_32BIT
+                                                         : I2S_DATA_BIT_WIDTH_16BIT;
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_RATE_DEFAULT),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(width, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,        /* the host does not get an MCLK and does not need one */
+            .bclk = BOARD_I2S_BCLK_GPIO,
+            .ws   = BOARD_I2S_WS_GPIO,
+            .dout = BOARD_I2S_DOUT_GPIO,
+            .din  = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv   = false,
+            },
+        },
+    };
+    std_cfg.clk_cfg = slave ? slave_clock(s_rate_hz) : master_clock(s_rate_hz);
+
+    err = i2s_channel_init_std_mode(s_tx, &std_cfg);
+    if (err == ESP_OK) set_pad_drive(slave);
+    /* Before enable: the driver refuses callbacks on a running channel. They live
+     * in the handle and survive the disable/reconfig/enable that a format change
+     * does, so one registration per channel is enough. */
+    const i2s_event_callbacks_t cbs = { .on_send_q_ovf = audio_dma_starved, .on_sent = audio_dma_sent };
+    if (err == ESP_OK) err = i2s_channel_register_event_callback(s_tx, &cbs, NULL);
+    if (err == ESP_OK) err = clear_dma();
+    if (err == ESP_OK) err = i2s_channel_enable(s_tx);
+    if (err != ESP_OK) {
+        i2s_del_channel(s_tx);
+        s_tx = NULL;
+        s_running = false;
+        return err;
+    }
+    s_slave = slave;
+    s_running = true;
+    return ESP_OK;
 }
 
 esp_err_t audio_out_init(void)
@@ -981,40 +1223,9 @@ esp_err_t audio_out_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    /* Send zeros rather than the last buffer again when the producer falls behind:
-     * a repeated buffer is an audible buzz, silence is not. */
-    chan_cfg.auto_clear = true;
-    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_tx, NULL), TAG, "i2s_new_channel");
-
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_RATE_DEFAULT),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,        /* the host does not get an MCLK and does not need one */
-            .bclk = BOARD_I2S_BCLK_GPIO,
-            .ws   = BOARD_I2S_WS_GPIO,
-            .dout = BOARD_I2S_DOUT_GPIO,
-            .din  = I2S_GPIO_UNUSED,
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv   = false,
-            },
-        },
-    };
-    /* APLL, not the 160 MHz PLL: 44.1 kHz lands far closer, and the clock servo
-     * above absorbs the phone's drift by tuning it (DEVICE_SPEC, "Вихід I2S"). */
-    std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_APLL;
-
-    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_tx, &std_cfg), TAG, "init_std_mode");
-    /* Before enable: the driver refuses callbacks on a running channel. They live
-     * in the handle and survive the disable/reconfig/enable that a format change
-     * does, so this registration is the only one. */
-    const i2s_event_callbacks_t cbs = { .on_send_q_ovf = audio_dma_starved, .on_sent = audio_dma_sent };
-    ESP_RETURN_ON_ERROR(i2s_channel_register_event_callback(s_tx, &cbs, NULL), TAG, "register_cb");
-    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_tx), TAG, "channel_enable");
-    s_running = true;
+    /* A slave until a host says otherwise: a slave drives only DATA, so whatever the
+     * host turns out to be, nothing on the wire has two drivers (protocol 1.9). */
+    ESP_RETURN_ON_ERROR(i2s_open(true), TAG, "i2s_open");
 
 #if AUDIO_TEST_TONE_HZ
     audio_tone_init();
@@ -1028,7 +1239,8 @@ esp_err_t audio_out_init(void)
     if (xTaskCreate(audio_report_task, "audio_stats", 3072, NULL, 2, NULL) != pdPASS)
         return ESP_ERR_NO_MEM;
 
-    ESP_LOGI(TAG, "master out: BCLK %d, WS %d, DOUT %d, %" PRIu32 " Hz, %d-bit stereo",
+    ESP_LOGI(TAG, "%s out: BCLK %d, WS %d, DOUT %d, %" PRIu32 " Hz, %d-bit stereo",
+             s_slave ? "slave (the host clocks)" : "master",
              BOARD_I2S_BCLK_GPIO, BOARD_I2S_WS_GPIO, BOARD_I2S_DOUT_GPIO,
              s_rate_hz, (int)s_slot_bits);
 #if AUDIO_TEST_TONE_HZ
@@ -1163,6 +1375,7 @@ void audio_out_write(const uint8_t *pcm, size_t len)
     /* Only the decoder worker may backpressure. Stack/control callbacks never
      * wait here. Packet hooks are in patch 0008, not an application callback. */
     if (!s_producer_lock || xTaskGetCurrentTaskHandle() != s_decoder_task) return;
+    if (s_packet_src_frame) s_packet_frames += len / s_packet_src_frame;
     transfer_context_t ctx = { s_packet_gate, s_packet_epoch, false };
     if (!transfer_current(&ctx) || xSemaphoreTake(s_producer_lock, 0) != pdTRUE) {
         atomic_fetch_add(&s_pcm_cancelled_frames, len / s_packet_src_frame);
@@ -1213,6 +1426,7 @@ esp_err_t audio_out_configure(uint32_t rate, uint8_t bits, uint8_t source_bits)
 {
     if (!rate || (bits != 16 && bits != 32) || (source_bits != 16 && source_bits != 32))
         return ESP_ERR_INVALID_ARG;
+    if (s_slave) bits = 32;     /* a 1.9 host clocks the link in 32-bit slots only */
     xSemaphoreTake(s_producer_lock, portMAX_DELAY);
     xSemaphoreTake(s_lock, portMAX_DELAY);
     esp_err_t err = (atomic_load(&s_gate) & 1u) ? ESP_OK : ESP_ERR_INVALID_STATE;
@@ -1227,8 +1441,7 @@ esp_err_t audio_out_configure(uint32_t rate, uint8_t bits, uint8_t source_bits)
         if (err == ESP_OK) s_slot_bits = bits;
     }
     if (err == ESP_OK && rate != s_rate_hz) {
-        i2s_std_clk_config_t clock = I2S_STD_CLK_DEFAULT_CONFIG(rate);
-        clock.clk_src = I2S_CLK_SRC_APLL;
+        i2s_std_clk_config_t clock = s_slave ? slave_clock(rate) : master_clock(rate);
         err = i2s_channel_reconfig_std_clock(s_tx, &clock);
         if (err == ESP_OK) s_rate_hz = rate;
     }
@@ -1250,6 +1463,40 @@ bool audio_out_resume(uint32_t token)
 {
     unsigned expected = token;
     return s_running && atomic_compare_exchange_strong(&s_gate, &expected, token & ~1u);
+}
+
+esp_err_t audio_out_set_role(bool slave)
+{
+    if (s_lock == NULL || s_producer_lock == NULL) return ESP_ERR_INVALID_STATE;
+    if (s_tx != NULL && slave == s_slave) return ESP_OK;
+    xSemaphoreTake(s_producer_lock, portMAX_DELAY); // finish any decoder packet
+    xSemaphoreTake(s_lock, portMAX_DELAY);          // and any writer pass
+    flush_ring();
+    if (s_tx != NULL) {
+        if (s_running) i2s_channel_disable(s_tx);
+        s_running = false;
+        i2s_del_channel(s_tx);
+        s_tx = NULL;
+    }
+    esp_err_t err = i2s_open(slave);
+    if (err != ESP_OK) {
+        /* Neither role came up: stay silent and driving nothing rather than half open. */
+        s_fault = true;
+        ESP_LOGE(TAG, "I2S %s would not open: %s", slave ? "slave" : "master", esp_err_to_name(err));
+    } else {
+        audio_servo_reset();    /* the old channel's correction is not this one's */
+        ESP_LOGW(TAG, "I2S is now the %s: %" PRIu32 " Hz, %d-bit slots",
+                 slave ? "SLAVE (the host clocks the link)" : "MASTER (legacy host)",
+                 s_rate_hz, (int)s_slot_bits);
+    }
+    xSemaphoreGive(s_lock);
+    xSemaphoreGive(s_producer_lock);
+    return err;
+}
+
+bool audio_out_is_slave(void)
+{
+    return s_tx != NULL && s_slave;
 }
 
 uint8_t audio_out_slot_bits(void)
@@ -1278,8 +1525,10 @@ static void flush_ring(void)
         atomic_fetch_add(&s_pcm_cancelled_frames, len / ((s_slot_bits / 8u) * 2u));
         vRingbufferReturnItem(s_ring, item);
     }
-    /* And the half frame held back from the old format, which belongs to it. */
+    /* And the half frame held back from the old format, which belongs to it, and what the
+     * converter still holds. */
     s_carry_len = 0;
+    audio_asrc_reset(&s_asrc);
 }
 
 void audio_out_set_codec_name(const char *name)

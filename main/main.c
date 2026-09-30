@@ -88,6 +88,22 @@ static void on_radio(bool on, bool discoverable, bool disconnect)
 }
 #endif
 
+static uint32_t own_caps(void);
+
+/* Protocol 1.9, before our answering HELLO goes out: a host that clocks the link gets a
+ * slave, any other host gets the master it has always had. Then the answer says which. */
+static uint32_t on_host_caps(uint32_t host_caps)
+{
+#if !CONFIG_SAT_LINK_ONLY
+    const bool slave = (host_caps & SATLINK_HOST_CAP_I2S_MASTER) != 0;
+    if (audio_out_set_role(slave) != ESP_OK)
+        ESP_LOGE(TAG, "I2S could not become the %s", slave ? "slave" : "master");
+#else
+    (void)host_caps;
+#endif
+    return own_caps();
+}
+
 static void on_gpio_cfg(const satlink_gpio_cfg_t *cfg) { expander_apply_cfg(cfg); }
 static void on_gpio_out(uint32_t values, uint32_t mask) { expander_set_outputs(values, mask); }
 static void on_adc_read(uint8_t index)     { expander_read_adc(index); }
@@ -97,6 +113,10 @@ static void on_adc_read(uint8_t index)     { expander_read_adc(index); }
 static uint32_t own_caps(void)
 {
     uint32_t caps = expander_caps();
+#if !CONFIG_SAT_LINK_ONLY
+    /* 1.9: claimed only while true, because the host drives BCLK and WS on it. */
+    if (audio_out_is_slave()) caps |= SATLINK_CAP_I2S_SLAVE;
+#endif
 #if !CONFIG_SAT_LINK_ONLY
     caps |= SATLINK_CAP_A2DP_SINK | SATLINK_CAP_AVRCP_META |
             SATLINK_CAP_ABS_VOLUME | SATLINK_CAP_COVER_ART |
@@ -140,6 +160,7 @@ void app_main(void)
         .on_gpio_cfg  = on_gpio_cfg,
         .on_gpio_out  = on_gpio_out,
         .on_adc_read  = on_adc_read,
+        .on_host_caps = on_host_caps,
     };
     ESP_ERROR_CHECK(link_start(&handlers, own_caps()));
     ESP_ERROR_CHECK(expander_start());

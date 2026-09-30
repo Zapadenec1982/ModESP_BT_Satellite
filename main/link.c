@@ -449,7 +449,7 @@ static size_t encode_own_hello(uint8_t *payload, size_t cap)
     satlink_hello_t m = {
         .major = SATLINK_PROTO_MAJOR,
         .minor = SATLINK_PROTO_MINOR,
-        .caps  = s_own_caps,
+        .caps  = __atomic_load_n(&s_own_caps, __ATOMIC_SEQ_CST),
         .build = satlink_str_clip(build, LINK_BUILD_MAX),
     };
     return satlink_enc_hello(payload, cap, &m);
@@ -467,20 +467,22 @@ static void send_hello(void)
     }
     s_stats.hello_sent++;
     ESP_LOGI(TAG, "HELLO out: %u.%u, caps 0x%08" PRIx32 ", %u bytes",
-             SATLINK_PROTO_MAJOR, SATLINK_PROTO_MINOR, s_own_caps, (unsigned)len);
+             SATLINK_PROTO_MAJOR, SATLINK_PROTO_MINOR, __atomic_load_n(&s_own_caps, __ATOMIC_SEQ_CST), (unsigned)len);
     tx_push(SATLINK_MSG_HELLO, payload, len);
 }
 
 /* The reply half of the greeting. Without it a peer that started first never
  * learns our version or our capabilities, and is right to refuse to bring the
  * link up: it would be guessing at what we can do. */
-static void answer_hello(void)
+static void answer_hello(bool force)
 {
     int64_t now = esp_timer_get_time();
     // RX, startup and retry timer share one reservation; do not hold the lock
     // while encoding, logging or queueing the message.
     portENTER_CRITICAL(&s_hello_mux);
-    if (s_last_hello_us != 0 && now - s_last_hello_us < LINK_HELLO_MIN_GAP_US) {
+    // `force`: our capabilities changed, and a host that keeps the old ones would be
+    // driving a line we now drive too, or not driving one we now need.
+    if (!force && s_last_hello_us != 0 && now - s_last_hello_us < LINK_HELLO_MIN_GAP_US) {
         portEXIT_CRITICAL(&s_hello_mux);
         return;
     }
@@ -527,7 +529,7 @@ static void handle_hello(const uint8_t *payload, size_t len)
                  h.major, h.minor, SATLINK_PROTO_MAJOR, SATLINK_PROTO_MINOR);
         /* Still answer. Two sides that both fall silent on a version mismatch
          * leave nobody able to say what the mismatch was. */
-        answer_hello();
+        answer_hello(false);
         return;
     }
 
@@ -539,6 +541,9 @@ static void handle_hello(const uint8_t *payload, size_t len)
     if (h.minor < 5) caps &= ~SATLINK_HOST_CAP_COVER;
     if (h.minor < 6 || !(caps & SATLINK_HOST_CAP_COVER)) caps &= ~COVER_STREAM_CAP;
     if (h.minor < 8) caps &= ~SATLINK_HOST_CAP_PAIR_CONFIRM;
+    /* 1.9: the host clocks the link only in 32-bit slots and only if it can relock. */
+    if (h.minor < 9 || !(caps & SATLINK_HOST_CAP_RELOCK) || !(caps & SATLINK_HOST_CAP_WIDE))
+        caps &= ~SATLINK_HOST_CAP_I2S_MASTER;
     /* Minor first: a sender that sees the new caps must not see the old minor. */
     __atomic_store_n(&s_host_minor, h.minor, __ATOMIC_SEQ_CST);
     __atomic_store_n(&s_host_caps, caps, __ATOMIC_SEQ_CST);
@@ -549,9 +554,18 @@ static void handle_hello(const uint8_t *payload, size_t len)
         ESP_LOGI(TAG, "host cannot relock: announcing 44.1 kHz only");
     }
 
+    /* 1.9: whatever the host's caps change about us (the I2S role) is made true
+     * before we answer, and a change goes out now rather than after the rate limit. */
+    bool changed = false;
+    if (s_handlers.on_host_caps != NULL) {
+        const uint32_t own = s_handlers.on_host_caps(caps);
+        changed = own != __atomic_load_n(&s_own_caps, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&s_own_caps, own, __ATOMIC_SEQ_CST);
+    }
+
     /* The spec asks for a HELLO after start and in answer to one. Only the first
      * half was here, so a host that came up second waited for ever. */
-    answer_hello();
+    answer_hello(changed);
 
     if (s_handlers.on_hello != NULL) {
         s_handlers.on_hello(&h);
@@ -811,7 +825,7 @@ static void ping_tick(void *arg)
 
     // PONG proves liveness, not capability negotiation. A lost startup HELLO
     // or reply must not leave a restarted satellite permanently in legacy mode.
-    if (!s_host_present && !s_peer_incompatible) answer_hello();
+    if (!s_host_present && !s_peer_incompatible) answer_hello(false);
 
     if (s_ping_outstanding > 0) {
         s_stats.pings_unanswered++;
@@ -957,7 +971,7 @@ esp_err_t link_start(const link_handlers_t *handlers, uint32_t caps)
     /* HELLO first, then GPIO_MAP, always and in that order — the host reads the
      * map as the answer to "what lines does this thing have", and an empty one is
      * a legitimate answer. */
-    answer_hello();
+    answer_hello(false);
 
     ESP_LOGI(TAG, "UART%d at %d baud, TX %d, RX %d",
              BOARD_LINK_UART_NUM, BOARD_LINK_BAUD, BOARD_LINK_TX_GPIO, BOARD_LINK_RX_GPIO);

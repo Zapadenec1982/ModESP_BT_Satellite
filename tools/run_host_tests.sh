@@ -77,4 +77,5 @@ fi
 "$python" "$repo/tools/run_cover_tests.py" --cc "$cc"
 "$python" "$repo/tools/run_audio_tests.py" --cc "$cc"
 "$python" "$repo/tools/run_audio_refill_tests.py" --cc "$cc"
+"$python" "$repo/tools/run_audio_asrc_tests.py" --cc "$cc"
 "$python" "$repo/tools/run_lhdc_tests.py" --cc "$cc"

@@ -37,6 +37,10 @@ typedef struct {
     void (*on_bt_config_set)(const satlink_bt_config_set_t *set);
     void (*on_bond_remove)(const uint8_t addr[6]);
     void (*on_bt_refresh)(void);
+    /* Protocol 1.9. Called with the host's normalised caps BEFORE the answering
+     * HELLO goes out, so whatever it changes (the I2S role) is already true when
+     * the host reads our reply. Returns the caps that reply must carry. */
+    uint32_t (*on_host_caps)(uint32_t host_caps);
 } link_handlers_t;
 
 /* `caps` is what this build can actually do, not what the protocol defines. The

@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "bt_av.c"
         "audio_out.c"
+        "audio_asrc.c"
         "link.c"
         "expander.c"
         "clock_probe.c"

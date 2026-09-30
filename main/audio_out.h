@@ -1,5 +1,6 @@
 /*
- * I2S output to the host. This device is the I2S master.
+ * I2S output to the host. Master for hosts before protocol 1.9, slave for 1.9 hosts
+ * that clock the link themselves (audio_out_set_role).
  */
 
 #pragma once
@@ -27,6 +28,14 @@ esp_err_t audio_out_configure(uint32_t rate_hz, uint8_t bits, uint8_t source_bit
 bool audio_out_resume(uint32_t token);
 uint8_t audio_out_slot_bits(void);
 uint32_t audio_out_rate_hz(void);
+
+/* Protocol 1.9. The I2S role: master (this device clocks the link, every host before 1.9)
+ * or slave (the host clocks it and this device drives DATA only, always in 32-bit slots).
+ * Boots as a slave, which drives nothing a host might also drive; the first host HELLO
+ * decides. Control task only: it closes and reopens the channel under both locks. */
+esp_err_t audio_out_set_role(bool slave);
+/* True while the channel exists and is a slave: what DEV_CAP_I2S_SLAVE says. */
+bool audio_out_is_slave(void);
 
 /* Samples dropped since boot because the ring was full. Zero is the only good value;
  * anything else means the host is not taking the data fast enough. */

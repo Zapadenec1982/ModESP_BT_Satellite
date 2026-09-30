@@ -49,8 +49,9 @@ typedef struct {
 static probe_t s_probes[] = {
     { "BCLK    ", BOARD_I2S_BCLK_GPIO, NULL },
     { "WS      ", BOARD_I2S_WS_GPIO,   NULL },
-    { "UART TX ", BOARD_LINK_TX_GPIO,  NULL },
-    { "UART RX ", BOARD_LINK_RX_GPIO,  NULL },
+    /* Not the UART pins. On this ESP32 the link's TX sits on its IO_MUX pin, and
+     * the pulse counter's channel setup switches the pad to the GPIO function:
+     * the TX line went silent and the link came down (30.09.2026). */
 };
 
 #define PROBE_COUNT (sizeof(s_probes) / sizeof(s_probes[0]))
