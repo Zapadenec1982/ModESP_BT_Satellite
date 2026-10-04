@@ -287,6 +287,17 @@ static struct {
 static esp_timer_handle_t s_meta_timer;
 static esp_timer_handle_t s_pos_timer;
 
+/* How long a phone gets to act on the host's PAUSE before the stream itself is suspended.
+ *
+ * The host pauses the phone whenever it listens to another source. Some phones show the
+ * pause and keep streaming anyway: on 05.10.2026 a Pixel 6 Pro streamed LHDC on for
+ * minutes while the host re-sent PAUSE every 3 s, and that live stream next to the panel's
+ * Wi-Fi cost AirPlay 24 gaps of up to 280 ms in 90 s, none once the phone was gone. A
+ * stream still running this long after a PAUSE is suspended at AVDTP level (customer's
+ * decision, 05.10.2026): the radio goes quiet and the phone stays connected. */
+#define PAUSE_GRACE_US  (1500 * 1000)
+static esp_timer_handle_t s_pause_timer;
+
 static const char *conn_state_name(esp_a2d_connection_state_t state)
 {
     switch (state) {
@@ -1908,6 +1919,20 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 
 /* ------------------------------------------------------------ host commands */
 
+/* Runs PAUSE_GRACE_US after a PAUSE or STOP from the host, unless another transport
+ * command came first. s_now.state is written on the BT task; a stale read costs at most
+ * one suspend of a stream that had just stopped, which the stack answers as a no-op. */
+static void pause_check(void *arg)
+{
+    (void)arg;
+    if (s_now.state != SATLINK_BT_STREAMING) {
+        return;
+    }
+    esp_err_t err = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
+    ESP_LOGI(TAG, "phone still streaming %u ms after PAUSE: suspending the stream (%s)",
+             (unsigned)(PAUSE_GRACE_US / 1000), esp_err_to_name(err));
+}
+
 void bt_av_transport(uint8_t cmd)
 {
     static const uint8_t key[] = {
@@ -1925,6 +1950,13 @@ void bt_av_transport(uint8_t cmd)
     if (cmd > SATLINK_XPORT_REW_STOP) {
         ESP_LOGW(TAG, "host sent transport command %u, which does not exist", cmd);
         return;
+    }
+    /* Armed before the AVRCP check on purpose: a stream with no AVRCP to pause it is the
+     * plainest case of a pause the phone will not act on. Any other command supersedes
+     * a pause still waiting to be checked. */
+    esp_timer_stop(s_pause_timer);
+    if (cmd == SATLINK_XPORT_PAUSE || cmd == SATLINK_XPORT_STOP) {
+        esp_timer_start_once(s_pause_timer, PAUSE_GRACE_US);
     }
     if (!s_now.avrcp_up) {
         ESP_LOGW(TAG, "transport command %u with no phone connected", cmd);
@@ -2004,6 +2036,11 @@ esp_err_t bt_av_start(const char *device_name)
     };
     ESP_RETURN_ON_ERROR(esp_timer_create(&pos_args, &s_pos_timer), TAG, "pos timer");
     ESP_RETURN_ON_ERROR(esp_timer_start_periodic(s_pos_timer, POS_PERIOD_US), TAG, "pos start");
+
+    const esp_timer_create_args_t pause_args = {
+        .callback = pause_check, .name = "bt_pause", .dispatch_method = ESP_TIMER_TASK,
+    };
+    ESP_RETURN_ON_ERROR(esp_timer_create(&pause_args, &s_pause_timer), TAG, "pause timer");
 
     /* BLE is not used. Hand its controller memory back before the controller
      * starts, which is the only moment this is allowed. */
