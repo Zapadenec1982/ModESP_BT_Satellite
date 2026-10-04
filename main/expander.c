@@ -39,14 +39,14 @@ typedef struct {
  * one row and no protocol change.
  *
  * What is available on the DevKitC once there is a use for it, from
- * docs/DEVICE_SPEC.md: 13, 14, 18, 19, 21, 22, 23, 32 and 33 either way, and 34,
+ * docs/DEVICE_SPEC.md: 14, 18, 19, 21, 22, 23, 25, 32 and 33 either way, and 34,
  * 35, 36, 39 as inputs only — those four have no internal pulls, which is exactly
  * what the HAS_PULL flag is for.
  *
  * Example of a filled row, for whoever adds the first one:
- *   { GPIO_NUM_13, SATLINK_PIN_CAN_INPUT | SATLINK_PIN_CAN_OUTPUT |
+ *   { GPIO_NUM_14, SATLINK_PIN_CAN_INPUT | SATLINK_PIN_CAN_OUTPUT |
  *                  SATLINK_PIN_CAN_ADC   | SATLINK_PIN_HAS_PULL,
- *     ADC_UNIT_2, ADC_CHANNEL_4 },
+ *     ADC_UNIT_2, ADC_CHANNEL_6 },
  */
 static const exp_pin_t s_pins[] = {
     /* intentionally empty */
