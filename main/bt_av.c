@@ -294,9 +294,22 @@ static esp_timer_handle_t s_pos_timer;
  * minutes while the host re-sent PAUSE every 3 s, and that live stream next to the panel's
  * Wi-Fi cost AirPlay 24 gaps of up to 280 ms in 90 s, none once the phone was gone. A
  * stream still running this long after a PAUSE is suspended at AVDTP level (customer's
- * decision, 05.10.2026): the radio goes quiet and the phone stays connected. */
-#define PAUSE_GRACE_US  (1500 * 1000)
+ * decision, 05.10.2026): the radio goes quiet and the phone stays connected.
+ *
+ * Five seconds, not the 1.5 this started with. A phone that obeys a pause still keeps its
+ * stream open for a few seconds of silence before closing it itself (Android's output goes
+ * to standby after 3 s), and suspending it in that window is not harmless: Android then
+ * holds the stream as suspended by the remote and will not start it again from its own play
+ * button. On 05.10.2026 that was a phone playing, its clock running, and no sound until
+ * Bluetooth was switched off and on. */
+#define PAUSE_GRACE_US  (5000 * 1000)
 static esp_timer_handle_t s_pause_timer;
+
+/* Set when pause_check() suspended the stream, so that this device, which stopped it, is
+ * the one that starts it again (resume_own_suspend()). Cleared when the stream starts and
+ * when the phone connects or goes. */
+static atomic_bool s_own_suspend;
+static void resume_own_suspend(const char *why);
 
 static const char *conn_state_name(esp_a2d_connection_state_t state)
 {
@@ -763,6 +776,7 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
         ESP_LOGI(TAG, "a2dp %s, %02x:%02x:%02x:%02x:%02x:%02x",
                  conn_state_name(p->conn_stat.state),
                  bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+        atomic_store(&s_own_suspend, false);    /* a suspend belongs to the link it was on */
 
         switch (p->conn_stat.state) {
         case ESP_A2D_CONNECTION_STATE_CONNECTED:
@@ -802,6 +816,9 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
                  started ? "started" : "suspended", audio_out_dropped_bytes());
         audio_out_set_streaming(started);
         s_now.state = started ? SATLINK_BT_STREAMING : SATLINK_BT_CONNECTED;
+        if (started) {
+            atomic_store(&s_own_suspend, false);
+        }
         bt_av_report_state();
         break;
     }
@@ -1096,6 +1113,11 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             s_now.play_state = play_state_from_avrc(param->change_ntf.event_parameter.playback);
             s_now.elapsed_at_us = esp_timer_get_time();
             send_track_pos();
+            /* Only a change, never a polled status: a phone that ignored the PAUSE answers
+             * "playing" to every poll, and starting on that would undo the suspend at once. */
+            if (s_now.play_state == SATLINK_PLAY_PLAYING) {
+                resume_own_suspend("the phone plays again");
+            }
             esp_avrc_ct_send_register_notification_cmd(TL_PLAY_STATE,
                                                        ESP_AVRC_RN_PLAY_STATUS_CHANGE, 0);
             break;
@@ -1929,8 +1951,27 @@ static void pause_check(void *arg)
         return;
     }
     esp_err_t err = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
+    if (err == ESP_OK) {
+        atomic_store(&s_own_suspend, true);
+    }
     ESP_LOGI(TAG, "phone still streaming %u ms after PAUSE: suspending the stream (%s)",
              (unsigned)(PAUSE_GRACE_US / 1000), esp_err_to_name(err));
+}
+
+/* Start a stream that pause_check() suspended, on the first sign that music is wanted
+ * again: a PLAY from the host, or the phone saying it plays. A phone holds a stream the sink
+ * suspended until the sink starts it, and Android takes a START from the remote in exactly
+ * that state. */
+static void resume_own_suspend(const char *why)
+{
+    if (!atomic_exchange(&s_own_suspend, false)) {
+        return;
+    }
+    esp_err_t err = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+    if (err != ESP_OK) {
+        atomic_store(&s_own_suspend, true);     /* the next sign tries again */
+    }
+    ESP_LOGI(TAG, "%s: starting the stream this device suspended (%s)", why, esp_err_to_name(err));
 }
 
 void bt_av_transport(uint8_t cmd)
@@ -1953,10 +1994,18 @@ void bt_av_transport(uint8_t cmd)
     }
     /* Armed before the AVRCP check on purpose: a stream with no AVRCP to pause it is the
      * plainest case of a pause the phone will not act on. Any other command supersedes
-     * a pause still waiting to be checked. */
-    esp_timer_stop(s_pause_timer);
+     * a pause still waiting to be checked. A repeated PAUSE does not restart the wait: the
+     * host repeats it every 3 s while the phone keeps playing, which is shorter than the
+     * wait, so restarting it would mean it never ran out. */
     if (cmd == SATLINK_XPORT_PAUSE || cmd == SATLINK_XPORT_STOP) {
-        esp_timer_start_once(s_pause_timer, PAUSE_GRACE_US);
+        if (!esp_timer_is_active(s_pause_timer)) {
+            esp_timer_start_once(s_pause_timer, PAUSE_GRACE_US);
+        }
+    } else {
+        esp_timer_stop(s_pause_timer);
+    }
+    if (cmd == SATLINK_XPORT_PLAY) {
+        resume_own_suspend("PLAY from the host");
     }
     if (!s_now.avrcp_up) {
         ESP_LOGW(TAG, "transport command %u with no phone connected", cmd);
