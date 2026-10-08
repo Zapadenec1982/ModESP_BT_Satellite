@@ -7,10 +7,10 @@ choice SAT_LINK_PORT
         UART2 on GPIO17 (TX) and GPIO16 (RX) is the DevKitC configuration. UART0 on
         that board belongs to the USB bridge, which flashes it and shows its console.
 
-        UART0 on GPIO1 (TX) and GPIO3 (RX) is the bare-module configuration of
-        ABT_play. The host reaches the ROM bootloader over the same two wires, so it
-        flashes this device and talks to it on one pair. Nothing else may speak on
-        UART0 then: build with sdkconfig.abt, which turns the console off.
+        UART0 on GPIO1 (TX) and GPIO3 (RX) is the bare-module configuration. The
+        host reaches the ROM bootloader over the same two wires, so it flashes this
+        device and talks to it on one pair. Nothing else may speak on UART0 then:
+        build with sdkconfig.bare, which turns the console off.
 
 config SAT_LINK_UART2
     bool "UART2, GPIO17/16 (DevKitC)"

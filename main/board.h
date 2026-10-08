@@ -1,5 +1,5 @@
 /*
- * Board wiring. ESP32-WROOM-32, on a DevKitC or as a bare module (ABT_play).
+ * Board wiring. ESP32-WROOM-32, on a DevKitC or as a bare module.
  *
  * Confirmed by the customer on 18.09.2026 (docs/DEVICE_SPEC.md, section "Піни").
  * The pins were chosen by where they sit on the header, not by number: I2S is three
@@ -22,7 +22,7 @@
  *
  *  - UART2 on 17/16 for the DevKitC, where UART0 belongs to the USB bridge that flashes
  *    the board and shows its console.
- *  - UART0 on 1/3 for the bare module (sdkconfig.abt): the host reaches the ROM
+ *  - UART0 on 1/3 for the bare module (sdkconfig.bare): the host reaches the ROM
  *    bootloader over the same two wires, so it flashes this device and talks to it on one
  *    pair. The console has to leave UART0 for that.
  *
@@ -31,7 +31,7 @@
  * headroom we want at 460800 baud. */
 #if CONFIG_SAT_LINK_UART0
 #if CONFIG_ESP_CONSOLE_UART && CONFIG_ESP_CONSOLE_UART_NUM == 0
-#error "The link is on UART0 and so is the console. Build with sdkconfig.abt (console NONE)."
+#error "The link is on UART0 and so is the console. Build with sdkconfig.bare (console NONE)."
 #endif
 #define BOARD_LINK_UART_NUM   UART_NUM_0
 #define BOARD_LINK_TX_GPIO    GPIO_NUM_1
