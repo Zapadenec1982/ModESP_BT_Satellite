@@ -88,6 +88,9 @@ static int64_t s_decode_start_us;
 static atomic_uint s_decode_last_us;
 static uint32_t s_packet_wait_us;
 static atomic_uint s_short_writes, s_tx_errors, s_tx_cancelled_bytes;
+/* Slave only: writes that timed out while no DMA descriptor finished, i.e. while the
+ * host was not driving BCLK. A state of the link, not a fault, so not in s_tx_errors. */
+static atomic_uint s_tx_noclock, s_tx_noclock_us;
 static atomic_uint s_pcm_cancelled_frames, s_dropped_frames, s_backpressure;
 static atomic_uint s_tx_events, s_tx_gap_us, s_tx_last_us, s_tx_qovf_us;
 static atomic_uint s_format_qovf, s_rebuffers, s_writer_gap_us;
@@ -628,14 +631,15 @@ static void audio_report(void)
      * Timestamp their acquisition, not the earlier report scheduling check. */
     now = esp_timer_get_time();
     ESP_LOGI(TAG, "uptime_us=%" PRId64 " gate=%u streaming=%u slave=%u fixed_trim=%u "
-             "pcm_drop_frames=%u cancel_frames=%u backpressure=%u short=%u txerr=%u txcancel_bytes=%u "
+             "pcm_drop_frames=%u cancel_frames=%u backpressure=%u short=%u txerr=%u txnoclk=%u txcancel_bytes=%u "
              "txevents=%u txgap_us=%u txlast_us=%u qovf_us=%u fmtqovf=%u writer_gap_us=%u rebuffer=%u "
              "decode_gap_us=%u decode_us=%u active_us=%u encoded=%u/%u drop=%u seqgap=%u "
              "trim_changes=%u trim_us=%u internal_min=%u largest=%u writer_stack=%u decoder_stack=%u "
              "asrc_us=%u asrc_cpf=%u servo_ppm=%d servo_fill=%u packet_frames=%u",
              now, atomic_load(&s_gate), (unsigned)s_streaming, (unsigned)s_slave, AUDIO_DIAGNOSTIC_FIXED_TRIM,
              atomic_load(&s_dropped_frames), atomic_load(&s_pcm_cancelled_frames), atomic_load(&s_backpressure),
-             atomic_load(&s_short_writes), atomic_load(&s_tx_errors), atomic_load(&s_tx_cancelled_bytes),
+             atomic_load(&s_short_writes), atomic_load(&s_tx_errors), atomic_load(&s_tx_noclock),
+             atomic_load(&s_tx_cancelled_bytes),
              atomic_load(&s_tx_events), atomic_load(&s_tx_gap_us), atomic_load(&s_tx_last_us),
              atomic_load(&s_tx_qovf_us), atomic_load(&s_format_qovf), atomic_load(&s_writer_gap_us), atomic_load(&s_rebuffers),
              atomic_load(&s_decode_gap_us), atomic_load(&s_decode_max_us), atomic_load(&s_decode_active_max_us),
@@ -647,9 +651,9 @@ static void audio_report(void)
              atomic_load(&s_decoder_stack), atomic_load(&s_asrc_us),
              atomic_exchange(&s_asrc_best_cpf, UINT32_MAX), s_servo_ppm,
              atomic_load(&s_servo_fill_last), atomic_load(&s_frames_per_packet_q4) / 16u);
-    ESP_LOGI(TAG, "event_us: encoded_drop=%u pcm_drop=%u tx_error=%u decode_last=%u",
+    ESP_LOGI(TAG, "event_us: encoded_drop=%u pcm_drop=%u tx_error=%u tx_noclock=%u decode_last=%u",
              atomic_load(&s_encoded_drop_us), atomic_load(&s_pcm_drop_us),
-             atomic_load(&s_tx_error_us), atomic_load(&s_decode_last_us));
+             atomic_load(&s_tx_error_us), atomic_load(&s_tx_noclock_us), atomic_load(&s_decode_last_us));
     audio_event_state_t events;
     uint32_t rebuffer_overflow, trim_overflow;
     portENTER_CRITICAL(&s_event_lock);
@@ -793,10 +797,11 @@ static bool tx_send(void *ctx, const uint8_t *data, size_t len, size_t *sent)
     if (*sent < len) atomic_fetch_add(&s_short_writes, 1);
     return err == ESP_OK || err == ESP_ERR_TIMEOUT;
 }
-static size_t i2s_write_locked(const void *data, size_t len)
+static size_t i2s_write_locked(const void *data, size_t len, bool silence)
 {
     transfer_context_t ctx = { s_writer_gate, s_writer_epoch, true };
     audio_transfer_ops_t ops = { &ctx, transfer_current, transfer_now, tx_send };
+    const uint32_t dma_events = atomic_load(&s_tx_events);
     size_t accepted;
     audio_transfer_result_t result = audio_transfer(&ops, data, len, transfer_now(NULL),
                                                     AUDIO_TRANSFER_BUDGET_MS, &accepted);
@@ -805,7 +810,21 @@ static size_t i2s_write_locked(const void *data, size_t len)
         /* IDF normally accepts frame-aligned DMA prefixes. If a future driver
          * cancels mid-frame, reset its cursor before submitting new PCM. */
         if (accepted % ((s_slot_bits / 8u) * 2u)) s_tx_recover = true;
-        if (result != AUDIO_TRANSFER_CANCELLED) {
+        if (result == AUDIO_TRANSFER_TIMEOUT && s_slave &&
+            atomic_load(&s_tx_events) == dma_events) {
+            /* Not one descriptor finished in the whole budget: a slave with no BCLK.
+             * The host clocks only at an announced rate (PROTOCOL.md 3.5), so this is
+             * every boot until a phone negotiates a codec. Counted apart from faults,
+             * and silence is not recovered: DMA holds zeros, and resetting it ten
+             * times a second fixed nothing (52 resets in 5 s on 11.10.2026). PCM still
+             * is, so that none of it plays when the clock comes back. */
+            atomic_fetch_add(&s_tx_noclock, 1);
+            atomic_store(&s_tx_noclock_us, (uint32_t)esp_timer_get_time());
+            if (!silence) {
+                atomic_fetch_add(&s_play_epoch, 1u);
+                s_tx_recover = true;
+            }
+        } else if (result != AUDIO_TRANSFER_CANCELLED) {
             atomic_fetch_add(&s_tx_errors, 1);
             atomic_store(&s_tx_error_us, (uint32_t)esp_timer_get_time());
             /* Explicit recovery: invalidate this packet/tail, clear DMA, retry
@@ -823,7 +842,7 @@ static void i2s_write_silence_locked(const void *data, size_t len)
     const bool streaming_open = s_streaming && !(gate & 1u) &&
                                 gate == atomic_load(&s_gate) && epoch == atomic_load(&s_play_epoch);
     const unsigned frame = (s_slot_bits / 8u) * 2u;
-    size_t accepted = i2s_write_locked(data, len);
+    size_t accepted = i2s_write_locked(data, len, true);
     const bool cancelled = gate != atomic_load(&s_gate) || epoch != atomic_load(&s_play_epoch);
     uint32_t now = (uint32_t)esp_timer_get_time();
     portENTER_CRITICAL(&s_event_lock);
@@ -837,7 +856,7 @@ static void i2s_write_silence_locked(const void *data, size_t len)
 static void pcm_write_locked(const uint8_t *wire, size_t len)
 {
     if (!s_slave || s_slot_bits != 32u) {
-        i2s_write_locked(wire, len);
+        i2s_write_locked(wire, len, false);
         return;
     }
     size_t frames = len / 8u;
@@ -855,7 +874,7 @@ static void pcm_write_locked(const uint8_t *wire, size_t len)
             const uint32_t cpf = cycles / (uint32_t)made;
             if (cpf < atomic_load(&s_asrc_best_cpf)) atomic_store(&s_asrc_best_cpf, cpf);
         }
-        if (made != 0u) i2s_write_locked(s_asrc_out, made * 8u);
+        if (made != 0u) i2s_write_locked(s_asrc_out, made * 8u, false);
         wire += used * 8u;
         frames -= used;
         if (used == 0u && made == 0u) break;
@@ -926,7 +945,7 @@ static void audio_out_task(void *arg)
             size_t n = audio_tone_fill(tone_buf, sizeof(tone_buf));
             s_writer_gate = atomic_load(&s_gate);
             s_writer_epoch = atomic_load(&s_play_epoch);
-            i2s_write_locked(tone_buf, n);
+            i2s_write_locked(tone_buf, n, false);
         }
         xSemaphoreGive(s_lock);
         vTaskDelay(1);
