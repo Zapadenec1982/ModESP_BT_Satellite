@@ -173,9 +173,8 @@ void app_main(void)
     ESP_ERROR_CHECK(link_start(&handlers, own_caps()));
     ESP_ERROR_CHECK(expander_start());
 
-    /* After both peripherals have claimed their pins: the probe reads those pins'
-     * own output back in, and configuring it first would only have it overwritten
-     * by uart_set_pin. */
+    /* After both peripherals have claimed their pins. The probe only listens on
+     * the I2S clock pads and never drives them, so it is safe in either role. */
     ESP_ERROR_CHECK(clock_probe_start());
 
 #if CONFIG_SAT_LINK_ONLY

@@ -1,10 +1,11 @@
 /*
- * Counts edges on this board's own output pins, with nothing attached to them.
+ * Counts edges on the I2S clock pads, whoever is driving them.
  *
  * Two questions were asked of this firmware that a datasheet cannot answer. Does
  * BCLK keep running when there is no stream? And is the UART transmitter actually
- * moving the pad, or only the peripheral? The pulse counter can be fed from a
- * pin's own output path, so both cost no wire and no second instrument.
+ * moving the pad, or only the peripheral? The pulse counter reads a pad through
+ * its input buffer, so both cost no wire and no second instrument. As master that
+ * is this device's own clock; as slave it is the host's.
  *
  * Off by default. It is a diagnostic, not a feature.
  */
@@ -72,7 +73,10 @@ static esp_err_t probe_pin(int gpio, pcnt_unit_handle_t *out_unit)
     pcnt_chan_config_t chan_cfg = {
         .edge_gpio_num  = gpio,
         .level_gpio_num = -1,             /* nothing gates the count */
-        .flags.io_loop_back = 1,          /* read the pin's own output back in */
+        /* No io_loop_back. The counter reads the pad through its input buffer: as
+         * master that is our own clock, as slave the host's. io_loop_back would
+         * turn the pad's output driver on and fight a host-driven clock
+         * (PROTOCOL 3.5). */
     };
     pcnt_channel_handle_t chan = NULL;
     ESP_RETURN_ON_ERROR(pcnt_new_channel(*out_unit, &chan_cfg, &chan), TAG, "pcnt_new_channel");
