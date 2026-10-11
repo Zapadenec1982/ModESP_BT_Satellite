@@ -7,6 +7,8 @@
 #include "link.h"
 
 #include "driver/gpio.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -66,6 +68,7 @@ _Static_assert(EXP_PIN_COUNT == sizeof(s_pins) / sizeof(s_pins[0]),
 
 static uint32_t s_input_mask;       /* lines currently configured as inputs */
 static uint32_t s_output_mask;
+static uint32_t s_analog_mask;      /* lines in mode 6 with their channel set up */
 static uint32_t s_reported;         /* last levels the host was told about */
 static uint32_t s_candidate;        /* levels seen but not yet stable */
 static uint8_t  s_stable[SATLINK_GPIO_MAX];
@@ -73,6 +76,7 @@ static uint8_t  s_stable[SATLINK_GPIO_MAX];
 static uint16_t s_adc_period[SATLINK_GPIO_MAX];   /* poll ticks, 0 = on request only */
 static uint16_t s_adc_countdown[SATLINK_GPIO_MAX];
 static adc_oneshot_unit_handle_t s_adc[2];
+static adc_cali_handle_t s_cali[2];             /* NULL: no calibration, linear mv */
 
 /* Everything above is shared between the link's RX task (GPIO_CFG, GPIO_OUT,
  * ADC_READ) and the poller, on either core. A mutex rather than a critical
@@ -140,6 +144,7 @@ void expander_apply_cfg(const satlink_gpio_cfg_t *cfg)
 
         s_input_mask  &= ~(1u << index);
         s_output_mask &= ~(1u << index);
+        s_analog_mask &= ~(1u << index);
         s_adc_period[index] = 0;
 
         if (mode == SATLINK_PIN_ANALOG) {
@@ -149,6 +154,7 @@ void expander_apply_cfg(const satlink_gpio_cfg_t *cfg)
             };
             if (s_adc[pin->adc_unit] != NULL &&
                 adc_oneshot_config_channel(s_adc[pin->adc_unit], pin->adc_channel, &chan) == ESP_OK) {
+                s_analog_mask |= (1u << index);
                 /* Hundreds of milliseconds on the wire, poll ticks here. */
                 s_adc_period[index] = exp_adc_period_ticks(initial);
                 s_adc_countdown[index] = s_adc_period[index];
@@ -217,7 +223,8 @@ void expander_set_outputs(uint32_t values, uint32_t mask)
 static void adc_sample_and_send(uint8_t index)
 {
     const exp_pin_t *pin = &s_pins[index];
-    if (s_adc[pin->adc_unit] == NULL) {
+    if (!exp_adc_readable(pin->flags, (s_analog_mask >> index) & 1u) ||
+        s_adc[pin->adc_unit] == NULL) {
         return;
     }
     int raw = 0;
@@ -226,10 +233,14 @@ static void adc_sample_and_send(uint8_t index)
         ESP_LOGW(TAG, "index %u: ADC read failed (%s)", index, esp_err_to_name(err));
         return;
     }
-    /* Uncalibrated for now: 12 bits over roughly 3.1 V at this attenuation. The
-     * curve-fitting calibration is a later concern; the raw value is the honest
-     * one and it travels alongside. */
-    uint32_t mv = ((uint32_t)raw * 3100u) / 4095u;
+    /* PROTOCOL.md 11 promises millivolts calibrated on the device. Without a
+     * calibration scheme, the nominal 12 bits over roughly 3.1 V at this
+     * attenuation; expander_init has said so in LOG. */
+    int mv = -1;
+    if (s_cali[pin->adc_unit] == NULL ||
+        adc_cali_raw_to_voltage(s_cali[pin->adc_unit], raw, &mv) != ESP_OK || mv < 0) {
+        mv = (int)(((uint32_t)raw * 3100u) / 4095u);
+    }
     link_send_adc_value(index, (uint16_t)raw, (uint16_t)mv);
 }
 
@@ -241,7 +252,14 @@ void expander_read_adc(uint8_t index)
         return;
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    adc_sample_and_send(index);
+    /* Not set up on first use instead: configuring the channel hands the pad to
+     * the ADC and would take a line the host made digital away from it. */
+    if (!exp_adc_readable(s_pins[index].flags, (s_analog_mask >> index) & 1u)) {
+        ESP_LOGW(TAG, "host asked to read index %u (GPIO%d), which is not an analog input; "
+                 "GPIO_CFG mode 6 first", index, s_pins[index].gpio);
+    } else {
+        adc_sample_and_send(index);
+    }
     xSemaphoreGive(s_lock);
 }
 
@@ -335,6 +353,21 @@ esp_err_t expander_init(void)
         if (adc_oneshot_new_unit(&cfg, &s_adc[unit]) != ESP_OK) {
             ESP_LOGE(TAG, "ADC unit %d would not start", unit + 1);
             s_adc[unit] = NULL;
+            continue;
+        }
+
+        /* Line fitting, the scheme IDF has for the ESP32, from the eFuse two-point
+         * or Vref values. default_vref is the 1100 mV the IDF calibration guide
+         * gives as the design reference, used only on a chip with neither. */
+        adc_cali_line_fitting_config_t cali = {
+            .unit_id = (adc_unit_t)unit,
+            .atten = ADC_ATTEN_DB_12,                   /* what mode 6 configures */
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+            .default_vref = 1100,
+        };
+        if (adc_cali_create_scheme_line_fitting(&cali, &s_cali[unit]) != ESP_OK) {
+            ESP_LOGW(TAG, "ADC unit %d: no calibration; mv will be a linear estimate", unit + 1);
+            s_cali[unit] = NULL;
         }
     }
     return ESP_OK;

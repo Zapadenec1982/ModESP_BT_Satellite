@@ -113,6 +113,20 @@ static void test_adc_period(void)
     CHECK_EQ(at[0], 0);
 }
 
+static void test_adc_readable(void)
+{
+    /* ADC_READ samples only a line that has an ADC and is in mode 6 now. It used
+     * to read whatever channel the row held: ADC1 channel 0 (GPIO36) for a row
+     * with no ADC, or an unconfigured channel at 0 dB for a CAN_ADC line in a
+     * digital mode, with the millivolts scaled for 12 dB. */
+    CHECK(exp_adc_readable(CAN_ALL, true));
+    CHECK(exp_adc_readable(SATLINK_PIN_CAN_INPUT | SATLINK_PIN_CAN_ADC, true));
+    CHECK(!exp_adc_readable(CAN_ALL, false));
+    CHECK(!exp_adc_readable(CAN_ALL & ~SATLINK_PIN_CAN_ADC, true));
+    CHECK(!exp_adc_readable(CAN_ALL & ~SATLINK_PIN_CAN_ADC, false));
+    CHECK(!exp_adc_readable(IN_ONLY, true));
+}
+
 /*
  * A line read every EXP_POLL_MS from `start` ms on, its level given by `input` per
  * millisecond, settled at 0 before. Returns how many changes were reported and the
@@ -731,6 +745,7 @@ int main(void)
 {
     test_legal_mode();
     test_adc_period();
+    test_adc_readable();
     test_debounce();
     test_debounce_cfg();
     test_log_level();

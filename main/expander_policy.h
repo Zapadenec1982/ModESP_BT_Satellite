@@ -119,6 +119,17 @@ static inline void exp_debounce_adopt(uint32_t lines, uint32_t levels, uint32_t 
     }
 }
 
+/*
+ * Whether ADC_READ may sample a line: only one that has an ADC and is in mode 6
+ * now. A line without CAN_ADC has no channel of its own, and a CAN_ADC line in a
+ * digital mode has neither the attenuation the millivolts assume nor its pad
+ * handed to the ADC -- taking it would undo what GPIO_CFG set up.
+ */
+static inline bool exp_adc_readable(uint8_t flags, bool analog)
+{
+    return (flags & SATLINK_PIN_CAN_ADC) != 0 && analog;
+}
+
 /* Mode 6: `initial` is the report period in hundreds of milliseconds, 0 = only on
  * ADC_READ. In poll ticks, which is what the expander counts. */
 static inline uint16_t exp_adc_period_ticks(uint8_t initial)
