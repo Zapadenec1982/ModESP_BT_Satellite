@@ -153,15 +153,19 @@ void expander_apply_cfg(const satlink_gpio_cfg_t *cfg)
             .pull_down_en = (mode == SATLINK_PIN_INPUT_PD) ? GPIO_PULLDOWN_ENABLE : GPIO_PULLDOWN_DISABLE,
             .intr_type = GPIO_INTR_DISABLE,
         };
+        if (mode == SATLINK_PIN_OUTPUT || mode == SATLINK_PIN_OUTPUT_OD) {
+            /* Outputs come up in what the host asked for and not a moment before:
+             * until GPIO_CFG arrives every line is an input. The output latch does
+             * not depend on the driver being on, so it is written first and the pad
+             * starts driving the host's level instead of a stale one. */
+            gpio_set_level(pin->gpio, initial ? 1 : 0);
+        }
         if (gpio_config(&io) != ESP_OK) {
             ESP_LOGE(TAG, "index %u (GPIO%d): configuration refused", index, pin->gpio);
             continue;
         }
 
         if (mode == SATLINK_PIN_OUTPUT || mode == SATLINK_PIN_OUTPUT_OD) {
-            /* Outputs come up in what the host asked for and not a moment before:
-             * until GPIO_CFG arrives every line is an input. */
-            gpio_set_level(pin->gpio, initial ? 1 : 0);
             s_output_mask |= (1u << index);
         } else if (exp_mode_is_input(mode)) {
             s_input_mask |= (1u << index);
