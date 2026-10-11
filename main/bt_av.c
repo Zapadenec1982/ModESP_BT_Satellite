@@ -1626,8 +1626,10 @@ static void cfg_phone_connected(const uint8_t addr[6])
             esp_bt_gap_read_remote_name((uint8_t *)addr);
         }
     }
-    if (!s_settings.radio) {
-        /* Radio switched off while this phone was on its way in. */
+    if (!s_live_radio) {
+        /* Radio switched off while this phone was on its way in, by BT_CONFIG_SET
+         * or by CMD_RADIO. The live state, not the saved one: CMD_RADIO may have
+         * switched the radio on without saving it. */
         ESP_LOGI(TAG, "radio is off: letting " BDA_FMT " go", BDA_ARGS(addr));
         esp_a2d_sink_disconnect((uint8_t *)addr);
     }
