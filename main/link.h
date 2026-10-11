@@ -106,8 +106,16 @@ bool link_try_cover_stream(uint32_t nonce, uint32_t generation, uint32_t offset,
 /* Counters, for the report that explains a bad cable or a wedged host. */
 typedef struct {
     uint32_t tx_frames;
-    uint32_t tx_dropped_bulk;      /* TRACK_POS, LOG, COVER: the spec allows this */
-    uint32_t tx_dropped_critical;  /* anything else: the spec does not, so it is a fault */
+    /* TRACK_POS and LOG lost: the oldest evicted from a full queue, or no heap for
+     * the copy. The spec allows this. */
+    uint32_t tx_dropped_bulk;
+    /* Anything else lost: a message with no slot, or longer than its slot. The spec
+     * does not allow it, so it is a fault in this build. */
+    uint32_t tx_dropped_critical;
+    /* Messages that must not be lost replaced, unsent, by a newer one of the same
+     * type (GPIO_IN: merged into it). Not a loss -- the host gets the newer state --
+     * but a count that climbs says the wire is behind. */
+    uint32_t tx_coalesced;
     uint32_t rx_bytes;             /* raw, before framing: tells a dead wire from a noisy one */
     uint32_t rx_frames;
     /* Frames the reassembler threw away: COBS, CRC, runt, too long. The wire's fault. */
@@ -143,10 +151,10 @@ typedef struct {
 void link_get_stats(link_stats_t *out);
 
 /*
- * How many droppable messages are still waiting to go out.
+ * How many cover parts are still waiting to go out.
  *
  * Exists for the cover stream, which is the only producer that can generate
- * more messages in one burst than the queue holds. Everything else emits one
+ * more messages in one burst than its queue holds. Everything else emits one
  * message per event and cannot outrun the wire.
  */
 uint32_t link_bulk_pending(void);
