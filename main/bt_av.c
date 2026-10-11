@@ -30,6 +30,7 @@
 #include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "satlink/proto.h"
 
@@ -287,6 +288,15 @@ static struct {
 } s_now;
 
 static esp_timer_handle_t s_meta_timer;
+
+/* Title, artist and album are written on the BTC task, read by the meta timer on the
+ * esp_timer task and cleared by the bt_av task. s_meta_mux guards the three strings and
+ * s_meta_live (A2DP is up, so TRACK_META may go out): a spinlock, because a Bluetooth
+ * callback must not wait. s_meta_send keeps the timer's send and the empty one on
+ * disconnect in order, so a send already under way cannot land after the empty one. */
+static portMUX_TYPE s_meta_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_meta_live;
+static SemaphoreHandle_t s_meta_send;
 static esp_timer_handle_t s_pos_timer;
 
 /* How long a phone gets to act on the host's PAUSE before the stream itself is suspended.
@@ -608,8 +618,23 @@ void bt_av_report_stream_fmt(void)
 static void send_track_meta(void *arg)
 {
     (void)arg;
-    link_send_track_meta(s_now.title, s_now.artist, s_now.album);
-    ESP_LOGI(TAG, "meta: \"%s\" / \"%s\" / \"%s\"", s_now.title, s_now.artist, s_now.album);
+    /* A snapshot, so an attribute copied in meanwhile cannot tear what is encoded. Static:
+     * only the esp_timer task runs this, and its stack is small. */
+    static char snap[3][sizeof s_now.title];
+    xSemaphoreTake(s_meta_send, portMAX_DELAY);
+    portENTER_CRITICAL(&s_meta_mux);
+    const bool live = s_meta_live;
+    memcpy(snap[0], s_now.title, sizeof snap[0]);
+    memcpy(snap[1], s_now.artist, sizeof snap[1]);
+    memcpy(snap[2], s_now.album, sizeof snap[2]);
+    portEXIT_CRITICAL(&s_meta_mux);
+    if (live) {
+        link_send_track_meta(snap[0], snap[1], snap[2]);
+    }
+    xSemaphoreGive(s_meta_send);
+    if (live) {
+        ESP_LOGI(TAG, "meta: \"%s\" / \"%s\" / \"%s\"", snap[0], snap[1], snap[2]);
+    }
 }
 
 static void meta_settle_restart(void)
@@ -785,11 +810,20 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
         atomic_store(&s_own_suspend, false);    /* a suspend belongs to the link it was on */
 
         switch (p->conn_stat.state) {
-        case ESP_A2D_CONNECTION_STATE_CONNECTED:
+        case ESP_A2D_CONNECTION_STATE_CONNECTED: {
             memcpy(s_now.addr, bda, sizeof(s_now.addr));
             s_now.state = SATLINK_BT_CONNECTED;
             cfg_phone_connected(bda);
+            /* Metadata from a phone whose AVRCP came up first was kept, not sent. */
+            portENTER_CRITICAL(&s_meta_mux);
+            s_meta_live = true;
+            const bool have_meta = s_now.title[0] || s_now.artist[0] || s_now.album[0];
+            portEXIT_CRITICAL(&s_meta_mux);
+            if (have_meta) {
+                meta_settle_restart();
+            }
             break;
+        }
         case ESP_A2D_CONNECTION_STATE_CONNECTING:
             s_now.state = SATLINK_BT_CONNECTING;
             break;
@@ -805,8 +839,16 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
             audio_out_set_streaming(false);
             s_now.state = idle_state();
             s_now.play_state = SATLINK_PLAY_STOPPED;
+            /* Nothing non-empty may follow the empty TRACK_META: not a settle already
+             * pending, nor one armed by an attribute that arrives after this. */
+            esp_timer_stop(s_meta_timer);
+            xSemaphoreTake(s_meta_send, portMAX_DELAY);
+            portENTER_CRITICAL(&s_meta_mux);
+            s_meta_live = false;
             s_now.title[0] = s_now.artist[0] = s_now.album[0] = '\0';
+            portEXIT_CRITICAL(&s_meta_mux);
             link_send_track_meta("", "", "");
+            xSemaphoreGive(s_meta_send);
             break;
         }
         bt_av_report_state();
@@ -974,15 +1016,31 @@ static void a2d_data_cb(const uint8_t *buf, uint32_t len)
 
 /* Cut on a character boundary: the phone's text is UTF-8, and a title cut through
  * its last character went to the host as invalid UTF-8 in TRACK_META. */
-static void copy_attr(char *dst, size_t cap, const uint8_t *text, int len)
+static size_t attr_fit(size_t cap, const uint8_t *text, int len)
 {
     if (len < 0) { len = 0; }
     size_t n = ((size_t)len < cap - 1) ? (size_t)len : cap - 1;
     if (n < (size_t)len) {
         n = satlink_utf8_prefix((const char *)text, n);
     }
+    return n;
+}
+
+static void copy_attr(char *dst, size_t cap, const uint8_t *text, int len)
+{
+    size_t n = attr_fit(cap, text, len);
     memcpy(dst, text, n);
     dst[n] = '\0';
+}
+
+/* Title, artist and album: the meta timer reads them on its own task. */
+static void copy_meta(char *dst, size_t cap, const uint8_t *text, int len)
+{
+    size_t n = attr_fit(cap, text, len);
+    portENTER_CRITICAL(&s_meta_mux);
+    memcpy(dst, text, n);
+    dst[n] = '\0';
+    portEXIT_CRITICAL(&s_meta_mux);
 }
 
 /* AVRCP responses are handled in place. It is all cheap, and it sidesteps the
@@ -1008,6 +1066,11 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             s_now.art_connecting = false;
             s_now.art_supported = false;
             cover_reset();
+            /* So that a late refill cannot carry over into the next connection. */
+            esp_timer_stop(s_meta_timer);
+            portENTER_CRITICAL(&s_meta_mux);
+            s_now.title[0] = s_now.artist[0] = s_now.album[0] = '\0';
+            portEXIT_CRITICAL(&s_meta_mux);
         }
         break;
 
@@ -1051,15 +1114,15 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         }
         switch (param->meta_rsp.attr_id) {
         case ESP_AVRC_MD_ATTR_TITLE:
-            copy_attr(s_now.title, sizeof(s_now.title),
+            copy_meta(s_now.title, sizeof(s_now.title),
                       param->meta_rsp.attr_text, param->meta_rsp.attr_length);
             break;
         case ESP_AVRC_MD_ATTR_ARTIST:
-            copy_attr(s_now.artist, sizeof(s_now.artist),
+            copy_meta(s_now.artist, sizeof(s_now.artist),
                       param->meta_rsp.attr_text, param->meta_rsp.attr_length);
             break;
         case ESP_AVRC_MD_ATTR_ALBUM:
-            copy_attr(s_now.album, sizeof(s_now.album),
+            copy_meta(s_now.album, sizeof(s_now.album),
                       param->meta_rsp.attr_text, param->meta_rsp.attr_length);
             break;
         case ESP_AVRC_MD_ATTR_COVER_ART:
@@ -1105,7 +1168,9 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
              * refilling there would make the bound mean nothing. */
             atomic_store(&s_cover_retries, 0);
             cover_new_track();
+            portENTER_CRITICAL(&s_meta_mux);
             s_now.title[0] = s_now.artist[0] = s_now.album[0] = 0;
+            portEXIT_CRITICAL(&s_meta_mux);
             /* Notifications fire once. Re-arm or this is the last one. */
             esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS);
             esp_avrc_ct_send_get_play_status_cmd(TL_PLAY_STATUS);
@@ -2076,6 +2141,8 @@ esp_err_t bt_av_start(const char *device_name)
     ESP_RETURN_ON_FALSE(s_queue != NULL, ESP_ERR_NO_MEM, TAG, "no memory for the event queue");
     s_cfg_queue = xQueueCreate(BT_CFG_QUEUE_DEPTH, sizeof(cfg_msg_t));
     ESP_RETURN_ON_FALSE(s_cfg_queue != NULL, ESP_ERR_NO_MEM, TAG, "no memory for the settings queue");
+    s_meta_send = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_meta_send != NULL, ESP_ERR_NO_MEM, TAG, "no memory for the meta lock");
     ESP_RETURN_ON_FALSE(
         xTaskCreate(bt_av_task, "bt_av", BT_TASK_STACK, NULL, BT_TASK_PRIO, NULL) == pdPASS,
         ESP_ERR_NO_MEM, TAG, "no memory for the bt task");
