@@ -283,15 +283,24 @@ uint32_t expander_caps(void)
     return caps;
 }
 
-esp_err_t expander_start(void)
+/* Built from the table every time rather than kept: the host can greet before
+ * expander_start has run, and the table is all there is to know. */
+void expander_send_map(void)
 {
     satlink_gpio_map_t map = { .count = (uint8_t)EXP_PIN_COUNT };
-    bool needs_adc[2] = { false, false };
-
     for (uint8_t i = 0; i < EXP_PIN_COUNT; i++) {
         map.pins[i].index = i;
         map.pins[i].gpio  = (uint8_t)s_pins[i].gpio;
         map.pins[i].flags = s_pins[i].flags;
+    }
+    link_send_gpio_map(&map);
+}
+
+esp_err_t expander_start(void)
+{
+    bool needs_adc[2] = { false, false };
+
+    for (uint8_t i = 0; i < EXP_PIN_COUNT; i++) {
         if (s_pins[i].flags & SATLINK_PIN_CAN_ADC) {
             needs_adc[s_pins[i].adc_unit] = true;
         }
@@ -308,9 +317,10 @@ esp_err_t expander_start(void)
         }
     }
 
-    /* Straight after HELLO, always, even when there is nothing in it: an empty
-     * map is the answer to "what have you got", not the absence of one. */
-    link_send_gpio_map(&map);
+    /* Straight after our own HELLO, always, even when there is nothing in it: an
+     * empty map is the answer to "what have you got", not the absence of one.
+     * Every host HELLO gets it again, from main.c. */
+    expander_send_map();
 
     if (EXP_PIN_COUNT == 0) {
         ESP_LOGI(TAG, "no lines offered yet; GPIO_MAP sent empty, poller not started");
