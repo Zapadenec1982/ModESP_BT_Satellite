@@ -286,6 +286,7 @@ static struct {
     uint32_t art_done_generation;
     char     art_request[8];
     bool     art_busy;
+    bool     art_drain_failed;      /* the old track's drain failed: refetch on close */
 } s_now;
 
 static esp_timer_handle_t s_meta_timer;
@@ -746,11 +747,13 @@ static bool cover_emit(void *ctx, uint32_t offset, const uint8_t *data,
 static void cover_on_data(const esp_avrc_ct_cb_param_t *param)
 {
     if (!s_now.art_busy) return;
+    bool stale = s_now.art_generation != atomic_load(&s_cover_epoch);
     if (param->cover_art_data.status != ESP_BT_STATUS_SUCCESS) {
         ESP_LOGW(TAG, "cover art: transfer failed");
+        // The new track's fetch waits for the close: the channel is still up here.
+        s_now.art_drain_failed = stale;
         cover_reset(); esp_avrc_ct_cover_art_disconnect(); return;
     }
-    bool stale = s_now.art_generation != atomic_load(&s_cover_epoch);
     size_t len = param->cover_art_data.data_len;
     if (!stale && !s_now.art_stream.failed &&
         !cover_stream_feed(&s_now.art_stream, param->cover_art_data.p_data, len,
@@ -1076,6 +1079,7 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             s_now.art_connected = false;
             s_now.art_connecting = false;
             s_now.art_supported = false;
+            s_now.art_drain_failed = false;
             cover_reset();
             /* So that a late refill cannot carry over into the next connection. */
             esp_timer_stop(s_meta_timer);
@@ -1238,7 +1242,14 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS);
         } else if (!s_now.art_connected) {
             if (s_now.art_busy) ESP_LOGW(TAG, "cover art: channel closed, reason %d", param->cover_art_state.reason);
+            /* One go per failure, so a connect that fails as well ends it. cover_fetch()
+             * connects again, and OBEX connected re-reads the metadata for the GET. */
+            const bool refetch = cover_refetch_on_close(
+                s_now.art_drain_failed, s_now.art_busy,
+                s_now.art_generation != atomic_load(&s_cover_epoch), s_now.art_handle[0] != 0);
+            s_now.art_drain_failed = false;
             cover_reset();
+            if (refetch) cover_fetch();
         }
         break;
 

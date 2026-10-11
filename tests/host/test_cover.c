@@ -88,8 +88,27 @@ static void pacing_tests(void) {
     r->handle=1; cover_schedule_continue(r);
     cover_continue_cb(&cover_continue_timer[1]); CHECK(sent==2);
 }
+/* What bt_av.c does when the OBEX channel closes, walked through the ways it closes. */
+static void refetch_tests(void) {
+    /* The old track's drain ended in an OBEX error: cover_on_data cleared busy and
+     * asked for the close. The new track's handle came during the drain. */
+    CHECK(cover_refetch_on_close(true,false,false,true));
+    // The channel dropped by itself in the middle of that drain.
+    CHECK(cover_refetch_on_close(false,true,true,true));
+    // No handle for the new track yet: its metadata answer will fetch it.
+    CHECK(!cover_refetch_on_close(true,false,false,false));
+    CHECK(!cover_refetch_on_close(false,true,true,false));
+    // The current track's own transfer died: part of it may be out, so COVER_RETRY.
+    CHECK(!cover_refetch_on_close(false,false,false,true));
+    CHECK(!cover_refetch_on_close(false,true,false,true));
+    // A GET of the current track went out before the drain's close arrived.
+    CHECK(!cover_refetch_on_close(true,true,false,true));
+    /* The flag is spent on the first close, so the reconnect failing as well closes
+     * with nothing pending and no further attempt. */
+    CHECK(!cover_refetch_on_close(false,false,true,true));
+}
 int main(void) {
-    pacing_tests(); stream_tests();
+    pacing_tests(); stream_tests(); refetch_tests();
     printf("Cover streaming/pacing: %d checks, %d failures\n",g_checks,g_failures);
     return g_failures?1:0;
 }

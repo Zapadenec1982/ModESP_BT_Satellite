@@ -33,3 +33,16 @@ fail:
     s->failed=true;
     return false;
 }
+
+/* The OBEX channel closed. The current track's image is fetched again only when the
+ * transfer that died was the old track's, drained after a track change: no byte of
+ * the current generation reached the host then, and its handle is already waiting.
+ * drain_failed: such a drain ended in an OBEX error, which also closes the channel;
+ * busy/stale: the transfer still in flight at the close, if any. A transfer of the
+ * current generation that dies is left to the host's COVER_RETRY, which never
+ * repeats a generation. */
+static inline bool cover_refetch_on_close(bool drain_failed, bool busy, bool stale,
+                                          bool has_handle) {
+    if (busy && !stale) return false;
+    return (drain_failed || busy) && has_handle;
+}
