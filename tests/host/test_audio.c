@@ -29,6 +29,8 @@ static atomic_uint s_tx_cancelled_bytes, s_backpressure, s_pcm_cancelled_frames,
 static atomic_uint s_dropped;
 static atomic_uint s_empty_polls, s_wait_recovered, s_wait_timeout, s_wait_cancel, s_wait_max_us;
 static uint32_t s_packet_gate, s_packet_epoch, s_packet_start_ms, s_packet_wait_us, s_packet_src_frame;
+static uint32_t s_packet_frames;
+static atomic_uint s_frames_per_packet_q4;
 static uint32_t s_writer_gate, s_writer_epoch;
 static int64_t s_decode_start_us;
 static atomic_uint s_decode_last_us, s_pcm_drop_us, s_tx_error_us;
@@ -134,6 +136,7 @@ static void reset(void) {
     drain_per_wait=0;tx_limit=0;tx_fail=0;tx_zero=false;gate_on_send=false;task_id=1;
     refill_change=0;refill_receives=0;refill_returns=0;refill_delay_ms=10;refill_bytes=0;refill_borrowed=false;
     s_empty_polls=0;s_wait_recovered=0;s_wait_timeout=0;s_wait_cancel=0;s_wait_max_us=0;
+    s_frames_per_packet_q4=0;
     sat_audio_decode_begin(0);
 }
 int main(void) {
@@ -179,6 +182,14 @@ int main(void) {
     for(unsigned i=0;i<16;i++) {sat_audio_decode_begin(16-i);audio_out_write(data,sizeof data);}
     assert(sent_len==16*sizeof data && !s_dropped && ring_fill<=ring_capacity);
     for(unsigned i=0;i<16;i++)assert(!memcmp(sent_data+i*sizeof data,data,sizeof data));
+    /* What one queued packet holds: a running mean (x16, weight 1/8) of decoder frames. */
+    reset();sat_audio_decode_begin(1);audio_out_write(data,sizeof data);sat_audio_decode_end();
+    assert(s_frames_per_packet_q4==480*16);
+    sat_audio_decode_begin(1);audio_out_write(data,1920);
+    task_id=2;audio_out_write(data,1920);task_id=1; /* a control write is not the packet's */
+    sat_audio_decode_end();assert(s_frames_per_packet_q4==7680-960+480);
+    sat_audio_decode_begin(1);sat_audio_decode_end();
+    assert(s_frames_per_packet_q4==7200); /* a packet that produced nothing leaves it alone */
     assert(audio_prefill_bytes(96000,8,24576)==9216);
     assert(audio_prefill_bytes(44100,4,24576)==2116);
     assert(audio_prefill_bytes(192000,8,24576)==12288);
@@ -265,6 +276,6 @@ int main(void) {
     assert(refill.status==AUDIO_REFILL_CANCELLED && !refill_receives);
     reset();refill_change=3;refill=audio_wait_refill(2,0);
     assert(refill.status==AUDIO_REFILL_CANCELLED && !refill_returns && !s_wait_timeout);
-    puts("satellite audio: 16 transfer/generation/pacing/worker + 8 telemetry + 13 refill adapter scenarios PASS");
+    puts("satellite audio: 17 transfer/generation/pacing/worker + 8 telemetry + 13 refill adapter scenarios PASS");
     return 0;
 }
