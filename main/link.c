@@ -1,4 +1,5 @@
 #include "link.h"
+#include "link_policy.h"
 #include "log_line.h"
 #include "satlink/cover_wire.h"
 
@@ -155,9 +156,7 @@ static void tx_push_tagged(uint8_t type, const uint8_t *payload, size_t payload_
     }
     /* An incompatible peer gets liveness and log lines and nothing else: it would
      * not understand the rest, and guessing is worse than silence. */
-    if (s_peer_incompatible &&
-        type != SATLINK_MSG_HELLO && type != SATLINK_MSG_PING &&
-        type != SATLINK_MSG_PONG && type != SATLINK_MSG_LOG) {
+    if (s_peer_incompatible && !link_incompatible_allows(type)) {
         return;
     }
 
@@ -372,7 +371,9 @@ void link_send_cover_reset(uint32_t nonce, uint32_t generation)
 bool link_try_cover_stream(uint32_t nonce, uint32_t generation, uint32_t offset,
                            const uint8_t *data, size_t len, uint32_t crc)
 {
-    if (!(link_host_caps() & COVER_STREAM_CAP) || !s_q_bulk ||
+    /* The incompatible check too: this skips tx_push and its filter, and the caps
+     * are still those of the last compatible host. */
+    if (s_peer_incompatible || !(link_host_caps() & COVER_STREAM_CAP) || !s_q_bulk ||
         len>COVER_PART_MAX || (!data && len) ||
         link_bulk_pending()>LINK_BULK_COVER_HEADROOM) return false;
     size_t bytes=16+len;
@@ -580,6 +581,14 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
     (void)seq;
     s_stats.rx_frames++;
 
+    /* One gate for every command, present and future. It used to be one check per
+     * handler, and transport, volume, radio and the expander had none, so a host
+     * the link refused to come up for could still drive them. */
+    if (s_peer_incompatible && !link_incompatible_allows(type)) {
+        s_stats.rx_refused++;
+        return;
+    }
+
     switch (type) {
     case SATLINK_MSG_HELLO:
         handle_hello(payload, len);
@@ -610,7 +619,7 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
     case FMT_READY: {
         fmt_ready_t ready;
         if (!fmt_decode_ready(payload, len, &ready)) { s_stats.rx_bad++; break; }
-        if (!s_peer_incompatible && (link_host_caps() & FMT_HOST_CAP) && s_handlers.on_format_ready)
+        if ((link_host_caps() & FMT_HOST_CAP) && s_handlers.on_format_ready)
             s_handlers.on_format_ready(&ready);
         break;
     }
@@ -658,8 +667,7 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
          * is sent no covers at all has nothing that could have failed, so a retry
          * from it names a transfer that never happened -- and serving it would
          * cost the phone an OBEX round trip for an image nobody will receive. */
-        if (!s_peer_incompatible && (link_host_caps() & COVER_STREAM_CAP) &&
-            s_handlers.on_cover_retry)
+        if ((link_host_caps() & COVER_STREAM_CAP) && s_handlers.on_cover_retry)
             s_handlers.on_cover_retry(m.boot_nonce, m.track_generation);
         break;
     }
@@ -676,7 +684,7 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
     case SATLINK_MSG_PAIR_REPLY: {
         satlink_pair_reply_t m = {0};
         if (!satlink_dec_pair_reply(payload, len, &m)) { s_stats.rx_bad++; break; }
-        if (!s_peer_incompatible && s_handlers.on_pair_reply != NULL)
+        if (s_handlers.on_pair_reply != NULL)
             s_handlers.on_pair_reply(m.addr, m.accept != 0);
         break;
     }
@@ -684,7 +692,7 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
     case SATLINK_MSG_BT_CONFIG_SET: {
         satlink_bt_config_set_t m = {0};
         if (!satlink_dec_bt_config_set(payload, len, &m)) { s_stats.rx_bad++; break; }
-        if (!s_peer_incompatible && s_handlers.on_bt_config_set != NULL)
+        if (s_handlers.on_bt_config_set != NULL)
             s_handlers.on_bt_config_set(&m);
         break;
     }
@@ -692,14 +700,14 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
     case SATLINK_MSG_BOND_REMOVE: {
         satlink_bond_remove_t m = {0};
         if (!satlink_dec_bond_remove(payload, len, &m)) { s_stats.rx_bad++; break; }
-        if (!s_peer_incompatible && s_handlers.on_bond_remove != NULL)
+        if (s_handlers.on_bond_remove != NULL)
             s_handlers.on_bond_remove(m.addr);
         break;
     }
 
     case SATLINK_MSG_BT_REFRESH:
         if (!satlink_dec_bt_refresh(payload, len)) { s_stats.rx_bad++; break; }
-        if (!s_peer_incompatible && s_handlers.on_bt_refresh != NULL)
+        if (s_handlers.on_bt_refresh != NULL)
             s_handlers.on_bt_refresh();
         break;
 
@@ -812,13 +820,13 @@ static void report_stats(void)
     ESP_LOGI(TAG, "tx %" PRIu32 " (dropped %" PRIu32 "/%" PRIu32 ", hello %" PRIu32 "), "
                   "rx %" PRIu32 " bytes %" PRIu32 " frames "
                   "(bad frames %" PRIu32 ", bad payloads %" PRIu32 ", gaps %" PRIu32
-                  ", unknown %" PRIu32 ", overrun %" PRIu32
+                  ", unknown %" PRIu32 ", refused %" PRIu32 ", overrun %" PRIu32
                   ", own hello %" PRIu32 "), pings unanswered %" PRIu32,
              s_stats.tx_frames, s_stats.tx_dropped_bulk, s_stats.tx_dropped_critical,
              s_stats.hello_sent,
              s_stats.rx_bytes, s_stats.rx_frames, s_stats.rx_bad_frames, s_stats.rx_bad,
              s_stats.rx_seq_gaps,
-             s_stats.rx_unknown, s_stats.rx_overruns, s_stats.rx_echoes, s_stats.pings_unanswered);
+             s_stats.rx_unknown, s_stats.rx_refused, s_stats.rx_overruns, s_stats.rx_echoes, s_stats.pings_unanswered);
     if (s_host_present) {
         ESP_LOGI(TAG, "round trip %" PRIu32 " ms", s_stats.rtt_ms);
     }

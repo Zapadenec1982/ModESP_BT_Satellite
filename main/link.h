@@ -121,6 +121,9 @@ typedef struct {
      * nothing else arrives means the two sides disagree about what they speak,
      * and that used to be indistinguishable from silence. */
     uint32_t rx_unknown;
+    /* Frames from a host with another proto_major that the link does not act on:
+     * anything but HELLO, PING and PONG. */
+    uint32_t rx_refused;
     /* Times the receiver was not run often enough and the UART driver threw bytes
      * away. Distinct from rx_bad_frames, which counts frames that arrived and did
      * not decode: an overrun is our fault, a bad frame is the wire's. Keeping them

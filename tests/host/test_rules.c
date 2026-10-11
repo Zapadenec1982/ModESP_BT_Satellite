@@ -1,6 +1,7 @@
 /*
  * Device-side rules of PROTOCOL.md that live in main/ as pure C, walked without a
- * board: the port expander's GPIO_CFG handling, and LOG lines from the ESP log.
+ * board: the port expander's GPIO_CFG handling, LOG lines from the ESP log, and
+ * what the link lets through for a host with another proto_major.
  */
 
 #include <stdio.h>
@@ -8,6 +9,7 @@
 
 #include "harness.h"
 #include "expander_policy.h"
+#include "link_policy.h"
 #include "log_line.h"
 
 int g_checks, g_failures;
@@ -164,11 +166,41 @@ static void test_log_level(void)
     CHECK(strcmp(text, "") == 0);
 }
 
+/* ---------------------------------------------------------------------- link */
+
+static void test_incompatible_host(void)
+{
+    /* PROTOCOL.md 3 and 13: HELLO, PING, PONG and LOG, and nothing else. */
+    unsigned allowed = 0;
+    for (unsigned type = 0; type <= 0xFF; type++) {
+        if (link_incompatible_allows((uint8_t)type)) {
+            allowed++;
+        }
+    }
+    CHECK_EQ(allowed, 4);
+    CHECK(link_incompatible_allows(SATLINK_MSG_HELLO));
+    CHECK(link_incompatible_allows(SATLINK_MSG_PING));
+    CHECK(link_incompatible_allows(SATLINK_MSG_PONG));
+    CHECK(link_incompatible_allows(SATLINK_MSG_LOG));
+
+    /* The commands that used to get through. */
+    CHECK(!link_incompatible_allows(SATLINK_MSG_CMD_TRANSPORT));
+    CHECK(!link_incompatible_allows(SATLINK_MSG_CMD_VOLUME));
+    CHECK(!link_incompatible_allows(SATLINK_MSG_CMD_RADIO));
+    CHECK(!link_incompatible_allows(SATLINK_MSG_GPIO_OUT));
+    CHECK(!link_incompatible_allows(SATLINK_MSG_GPIO_CFG));
+    CHECK(!link_incompatible_allows(SATLINK_MSG_ADC_READ));
+    /* And what the cover stream sends. */
+    CHECK(!link_incompatible_allows(0x18));      /* COVER_DATA */
+    CHECK(!link_incompatible_allows(0x19));      /* COVER_END */
+}
+
 int main(void)
 {
     test_legal_mode();
     test_adc_period();
     test_log_level();
+    test_incompatible_host();
     printf("Device rules: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }
