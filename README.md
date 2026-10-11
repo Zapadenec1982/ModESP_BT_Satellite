@@ -58,6 +58,12 @@ WS and DOUT sit next to each other in the left header row, BCLK on 13 beside a G
 next to WS, it put false edges on it (moved 04.10.2026). The UART pair sits together in the
 right row; 17 and 16 are also UART2's IOMUX pins, which keeps 460800 baud off the GPIO matrix.
 
+The same firmware has a second configuration for the **bare module**: the link moves to UART0,
+TX 1 and RX 3, the pair the ROM bootloader listens on, so the host both flashes the device and
+talks to it over the same two wires (and drives EN and IO0). The console is off there. It is a
+Kconfig choice (`SAT_LINK_PORT`) made by building with `sdkconfig.bare`; see
+[`docs/DEVICE_SPEC.md`](docs/DEVICE_SPEC.md), "Голий модуль".
+
 The CPU runs at 240 MHz: at 160 the aptX decoder could not keep up.
 
 ## Building
@@ -91,16 +97,17 @@ idf.py build
 builds it again from scratch. Flashing and logs on this bench are on **COM13**. COM12 is the
 host, not this board.
 
-Three overlay builds are there for bring-up, each a `sdkconfig.*` file named on the command line:
+Other builds are overlays, each a `sdkconfig.*` file named on the command line:
 
 | Overlay | What it builds |
 |---|---|
+| `sdkconfig.bare` | the bare module: the link on UART0 (GPIO1/3), console off |
 | `sdkconfig.linkonly` | the link and nothing else: HELLO, an empty GPIO_MAP, PING/PONG, LOG |
 | `sdkconfig.loopback` | the full firmware with the UART looped back inside the chip |
 | `sdkconfig.clockprobe` | measures the I2S bit clock on the board itself and logs it |
 
 ```bash
-idf.py -B build_loopback -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.loopback" build
+idf.py -B build_bare -D SDKCONFIG=build_bare/sdkconfig -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.bare" build
 ```
 
 ## Testing
