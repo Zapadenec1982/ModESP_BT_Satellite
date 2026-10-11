@@ -1,4 +1,5 @@
 #include "expander.h"
+#include "expander_policy.h"
 
 #include <inttypes.h>
 #include <string.h>
@@ -13,13 +14,6 @@
 #include "freertos/task.h"
 
 static const char *TAG = "sat.gpio";
-
-/* Poll fast, accept slowly. The spec allows 20 ms of debounce and asks for the
- * frame to be on the wire within 30 ms of the edge: 5 ms of granularity plus 20
- * ms of settling leaves room for the frame itself. */
-#define EXP_POLL_MS        5
-#define EXP_DEBOUNCE_MS    20
-#define EXP_STABLE_SAMPLES (EXP_DEBOUNCE_MS / EXP_POLL_MS)
 
 #define EXP_TASK_STACK     2560
 #define EXP_TASK_PRIO      (configMAX_PRIORITIES - 8)
@@ -74,7 +68,7 @@ static uint32_t s_reported;         /* last levels the host was told about */
 static uint32_t s_candidate;        /* levels seen but not yet stable */
 static uint8_t  s_stable[SATLINK_GPIO_MAX];
 
-static uint16_t s_adc_period[SATLINK_GPIO_MAX];   /* hundreds of ms, 0 = on request only */
+static uint16_t s_adc_period[SATLINK_GPIO_MAX];   /* poll ticks, 0 = on request only */
 static uint16_t s_adc_countdown[SATLINK_GPIO_MAX];
 static adc_oneshot_unit_handle_t s_adc[2];
 
@@ -109,21 +103,27 @@ void expander_apply_cfg(const satlink_gpio_cfg_t *cfg)
         /* Asking for something the silicon cannot do is answered with the nearest
          * legal thing plus a complaint, because the protocol has no request and
          * response pairs to say no with. */
-        if ((mode == SATLINK_PIN_INPUT_PU || mode == SATLINK_PIN_INPUT_PD) &&
-            (pin->flags & SATLINK_PIN_HAS_PULL) == 0) {
+        exp_mode_fix_t fix;
+        const uint8_t asked = mode;
+        mode = exp_legal_mode(asked, pin->flags, &fix);
+        switch (fix) {
+        case EXP_MODE_NO_PULL:
             ESP_LOGW(TAG, "index %u (GPIO%d) has no internal pull; using a plain input",
                      index, pin->gpio);
-            mode = SATLINK_PIN_INPUT;
-        }
-        if ((mode == SATLINK_PIN_OUTPUT || mode == SATLINK_PIN_OUTPUT_OD) &&
-            (pin->flags & SATLINK_PIN_CAN_OUTPUT) == 0) {
+            break;
+        case EXP_MODE_INPUT_ONLY:
             ESP_LOGW(TAG, "index %u (GPIO%d) is input only; using a plain input",
                      index, pin->gpio);
-            mode = SATLINK_PIN_INPUT;
-        }
-        if (mode == SATLINK_PIN_ANALOG && (pin->flags & SATLINK_PIN_CAN_ADC) == 0) {
+            break;
+        case EXP_MODE_NO_ADC:
             ESP_LOGW(TAG, "index %u (GPIO%d) has no ADC; using a plain input", index, pin->gpio);
-            mode = SATLINK_PIN_INPUT;
+            break;
+        case EXP_MODE_UNKNOWN:
+            ESP_LOGW(TAG, "index %u (GPIO%d): mode %u is not defined; line disabled",
+                     index, pin->gpio, asked);
+            break;
+        case EXP_MODE_AS_ASKED:
+            break;
         }
 
         s_input_mask  &= ~(1u << index);
@@ -137,8 +137,9 @@ void expander_apply_cfg(const satlink_gpio_cfg_t *cfg)
             };
             if (s_adc[pin->adc_unit] != NULL &&
                 adc_oneshot_config_channel(s_adc[pin->adc_unit], pin->adc_channel, &chan) == ESP_OK) {
-                s_adc_period[index] = initial;
-                s_adc_countdown[index] = initial;
+                /* Hundreds of milliseconds on the wire, poll ticks here. */
+                s_adc_period[index] = exp_adc_period_ticks(initial);
+                s_adc_countdown[index] = s_adc_period[index];
             } else {
                 ESP_LOGE(TAG, "index %u: ADC setup failed", index);
             }
@@ -162,7 +163,7 @@ void expander_apply_cfg(const satlink_gpio_cfg_t *cfg)
              * until GPIO_CFG arrives every line is an input. */
             gpio_set_level(pin->gpio, initial ? 1 : 0);
             s_output_mask |= (1u << index);
-        } else if (mode != SATLINK_PIN_DISABLED) {
+        } else if (exp_mode_is_input(mode)) {
             s_input_mask |= (1u << index);
             newly_input |= (1u << index);
             s_stable[index] = EXP_STABLE_SAMPLES;    /* take the first read as settled */
@@ -258,15 +259,9 @@ static void expander_task(void *arg)
         }
 
         for (uint8_t i = 0; i < EXP_PIN_COUNT; i++) {
-            if (s_adc_period[i] == 0) {
-                continue;
+            if (exp_adc_tick(&s_adc_countdown[i], s_adc_period[i])) {
+                adc_sample_and_send(i);
             }
-            if (s_adc_countdown[i] > 0) {
-                s_adc_countdown[i]--;
-                continue;
-            }
-            s_adc_countdown[i] = s_adc_period[i];
-            adc_sample_and_send(i);
         }
     }
 }
@@ -283,15 +278,24 @@ uint32_t expander_caps(void)
     return caps;
 }
 
-esp_err_t expander_start(void)
+/* Built from the table every time rather than kept: the host can greet before
+ * expander_start has run, and the table is all there is to know. */
+void expander_send_map(void)
 {
     satlink_gpio_map_t map = { .count = (uint8_t)EXP_PIN_COUNT };
-    bool needs_adc[2] = { false, false };
-
     for (uint8_t i = 0; i < EXP_PIN_COUNT; i++) {
         map.pins[i].index = i;
         map.pins[i].gpio  = (uint8_t)s_pins[i].gpio;
         map.pins[i].flags = s_pins[i].flags;
+    }
+    link_send_gpio_map(&map);
+}
+
+esp_err_t expander_start(void)
+{
+    bool needs_adc[2] = { false, false };
+
+    for (uint8_t i = 0; i < EXP_PIN_COUNT; i++) {
         if (s_pins[i].flags & SATLINK_PIN_CAN_ADC) {
             needs_adc[s_pins[i].adc_unit] = true;
         }
@@ -308,9 +312,10 @@ esp_err_t expander_start(void)
         }
     }
 
-    /* Straight after HELLO, always, even when there is nothing in it: an empty
-     * map is the answer to "what have you got", not the absence of one. */
-    link_send_gpio_map(&map);
+    /* Straight after our own HELLO, always, even when there is nothing in it: an
+     * empty map is the answer to "what have you got", not the absence of one.
+     * Every host HELLO gets it again, from main.c. */
+    expander_send_map();
 
     if (EXP_PIN_COUNT == 0) {
         ESP_LOGI(TAG, "no lines offered yet; GPIO_MAP sent empty, poller not started");

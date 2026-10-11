@@ -408,8 +408,11 @@ static void begin_format(uint32_t rate, uint8_t bits, uint8_t channels, uint8_t 
         do { s_nonce = esp_random(); } while (!s_nonce);
         s_generation = 1;
     }
-    if (rate == 96000 && !(link_host_caps() & SATLINK_HOST_CAP_96KHZ)) {
-        ESP_LOGE(TAG, "host cannot accept 96 kHz; PCM stays gated");
+    if (!ep_host_can_follow(rate, link_host_caps())) {
+        /* 48 kHz used to play on to a host without RELOCK, announced or not; only
+         * 96 kHz was held. Silence until a host that can follow greets, or the
+         * phone reconnects to endpoints that offer only what this host takes. */
+        ESP_LOGE(TAG, "host cannot follow %" PRIu32 " Hz; PCM stays gated", rate);
         rate = 0;
     }
     fmt_request_t r = {s_nonce, s_generation, rate, bits, channels};
@@ -562,7 +565,7 @@ static void poll_format(void)
         uint8_t bits = audio_out_is_slave() ? 32
                      : fmt_slot_bits(s_decoder_bits, (caps & SATLINK_HOST_CAP_WIDE) != 0, ack);
         if (!fmt_valid(&s_format.request) || bits != s_now.bits || ack != s_format.require_ack ||
-            (s_now.rate_hz == 96000 && !(caps & SATLINK_HOST_CAP_96KHZ)))
+            !ep_host_can_follow(s_now.rate_hz, caps))
             begin_format(s_now.rate_hz, bits, s_now.channels, s_decoder_bits);
         else announce_format(); // a restarted host must relearn the current transaction
     }
@@ -900,17 +903,9 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
         }
 
         if (rate != 0) {
-            /* A tripwire, not a policy. The stream endpoints advertise 44.1 kHz
-             * and nothing else precisely so this cannot happen; if it ever fires,
-             * some endpoint's advertised capability and this promise have drifted
-             * apart, and the host is about to be handed a rate it cannot follow.
-             * That is inaudible in every counter this firmware keeps, so it has
-             * to be said out loud. */
-            if (rate != 44100 && (link_host_caps() & SATLINK_HOST_CAP_RELOCK) == 0) {
-                ESP_LOGE(TAG, "negotiated %" PRIu32 " Hz, but the host was promised 44.1 kHz "
-                              "and cannot relock: an endpoint is advertising a rate this "
-                              "device must not offer", rate);
-            }
+            /* A rate the host cannot follow -- endpoints decided for an earlier
+             * host, or an endpoint advertising what it must not -- is held gated
+             * by begin_format, which says so. */
             uint32_t caps = link_host_caps();
             bool acknowledged = (caps & FMT_HOST_CAP) != 0;
             uint8_t bits = audio_out_is_slave() ? 32
@@ -974,10 +969,15 @@ static void a2d_data_cb(const uint8_t *buf, uint32_t len)
     audio_out_write(buf, len);
 }
 
+/* Cut on a character boundary: the phone's text is UTF-8, and a title cut through
+ * its last character went to the host as invalid UTF-8 in TRACK_META. */
 static void copy_attr(char *dst, size_t cap, const uint8_t *text, int len)
 {
     if (len < 0) { len = 0; }
     size_t n = ((size_t)len < cap - 1) ? (size_t)len : cap - 1;
+    if (n < (size_t)len) {
+        n = satlink_utf8_prefix((const char *)text, n);
+    }
     memcpy(dst, text, n);
     dst[n] = '\0';
 }

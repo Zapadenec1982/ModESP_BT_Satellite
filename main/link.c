@@ -1,4 +1,7 @@
 #include "link.h"
+#include "link_policy.h"
+#include "log_line.h"
+#include "tx_slots.h"
 #include "satlink/cover_wire.h"
 
 #include <inttypes.h>
@@ -37,11 +40,16 @@ static const char *TAG = "sat.link";
  * edge to reach the wire, and long enough not to split a frame in two. */
 #define LINK_RX_TIMEOUT_SYM  10
 
-/* Two queues, because the spec divides messages into those that may be thrown
- * away when the host stops reading and those that may not. Draining critical
- * first is what keeps BT_STATE ahead of a backlog of TRACK_POS. */
-#define LINK_Q_CRITICAL      10
-#define LINK_Q_BULK          14
+/* PROTOCOL.md 13 divides the device's messages into those that may be thrown away
+ * when the host stops reading and those that may not. What may not waits in slots
+ * (main/tx_slots.h, below); what may, in two queues. The slots drain first, which
+ * is what keeps BT_STATE ahead of a backlog of TRACK_POS. */
+#define LINK_Q_TELEMETRY     10      /* TRACK_POS and LOG: when full, the oldest goes */
+#define LINK_Q_COVER          6      /* cover parts: when full, the new one is refused */
+#define LINK_ADC_SLOTS        8      /* expander lines with an ADC_VALUE in flight at once */
+/* With nothing to send the sender sleeps until a producer wakes it; this only
+ * bounds the sleep, in case a wake-up is ever missed. */
+#define LINK_TX_IDLE_MS     100
 
 #define LINK_TASK_STACK      3584
 /*
@@ -89,10 +97,18 @@ static const char *TAG = "sat.link";
 #define LINK_BUF_META      (3 * (2 + LINK_META_MAX))
 #define LINK_BUF_LOG       (1 + 2 + LINK_LOG_MAX)
 #define LINK_BUF_HELLO     (1 + 1 + 4 + 2 + LINK_BUILD_MAX)
+#define LINK_BUF_PAIR_REQ  (6 + 1 + 4 + 2 + SATLINK_BT_NAME_MAX)
+#define LINK_BUF_BT_CONFIG (5 + 2 + SATLINK_BT_NAME_MAX)
+#define LINK_BUF_GPIO_MAP  (1 + SATLINK_GPIO_MAX * 3)
+/* PING, PONG, STREAM_FMT, STREAM_PREPARE, VOLUME_STATE, COVER_RESET, PAIR_RESULT,
+ * GPIO_IN and ADC_VALUE: 14 bytes at most, STREAM_PREPARE. */
+#define LINK_BUF_SMALL     16
+/* The largest slot, which is what the sender copies a slot out into. */
+#define LINK_SLOT_MAX      SATLINK_BOND_LIST_BYTES_MAX
 
-/* The payload, not the frame. Sequence numbers are stamped at the moment of
- * transmission rather than of queueing, because there are two queues and the
- * sender drains one before the other: numbering at queue time puts frames on the
+/* A queued payload, not a frame. Sequence numbers are stamped at the moment of
+ * transmission rather than of queueing, because there are several queues and the
+ * sender drains one before another: numbering at queue time puts frames on the
  * wire out of order, and the receiver's gap counter then reports losses that
  * never happened. Found exactly that way, in loopback, counting 256 phantom gaps
  * every ten seconds. */
@@ -100,12 +116,63 @@ typedef struct {
     uint8_t *payload;
     uint16_t len;
     uint8_t  type;
-    uint32_t fmt_nonce, fmt_generation;
 } tx_item_t;
 
+/*
+ * The slots: one per message type that must not be lost, and a few for ADC_VALUE,
+ * which is per line. Static, so no state of the heap can lose a BT_STATE: under
+ * three kilobytes with the sender's copy buffer, the price of PROTOCOL.md 13's
+ * "the rest is not dropped".
+ */
+static uint8_t s_buf_hello[LINK_BUF_HELLO];
+static uint8_t s_buf_bt_state[LINK_BUF_BT_STATE];
+static uint8_t s_buf_meta[LINK_BUF_META];
+static uint8_t s_buf_pair_req[LINK_BUF_PAIR_REQ];
+static uint8_t s_buf_bt_config[LINK_BUF_BT_CONFIG];
+static uint8_t s_buf_bond_list[SATLINK_BOND_LIST_BYTES_MAX];
+static uint8_t s_buf_gpio_map[LINK_BUF_GPIO_MAP];
+static uint8_t s_buf_small[8 + LINK_ADC_SLOTS][LINK_BUF_SMALL];
+
+#define SLOT(t, b)  { .type = (t), .cap = (uint16_t)sizeof(b), .buf = (b) }
+static tx_slot_t s_slots[] = {
+    SLOT(SATLINK_MSG_HELLO,        s_buf_hello),
+    SLOT(SATLINK_MSG_BT_STATE,     s_buf_bt_state),
+    SLOT(SATLINK_MSG_TRACK_META,   s_buf_meta),
+    SLOT(SATLINK_MSG_PAIR_REQUEST, s_buf_pair_req),
+    SLOT(SATLINK_MSG_BT_CONFIG,    s_buf_bt_config),
+    SLOT(SATLINK_MSG_BOND_LIST,    s_buf_bond_list),
+    SLOT(SATLINK_MSG_GPIO_MAP,     s_buf_gpio_map),
+    SLOT(SATLINK_MSG_PING,         s_buf_small[0]),
+    SLOT(SATLINK_MSG_PONG,         s_buf_small[1]),
+    SLOT(SATLINK_MSG_STREAM_FMT,   s_buf_small[2]),
+    SLOT(FMT_PREPARE,              s_buf_small[3]),
+    SLOT(SATLINK_MSG_VOLUME_STATE, s_buf_small[4]),
+    SLOT(COVER_RESET,              s_buf_small[5]),
+    SLOT(SATLINK_MSG_PAIR_RESULT,  s_buf_small[6]),
+    SLOT(SATLINK_MSG_GPIO_IN,      s_buf_small[7]),
+    SLOT(SATLINK_MSG_ADC_VALUE,    s_buf_small[8]),
+    SLOT(SATLINK_MSG_ADC_VALUE,    s_buf_small[9]),
+    SLOT(SATLINK_MSG_ADC_VALUE,    s_buf_small[10]),
+    SLOT(SATLINK_MSG_ADC_VALUE,    s_buf_small[11]),
+    SLOT(SATLINK_MSG_ADC_VALUE,    s_buf_small[12]),
+    SLOT(SATLINK_MSG_ADC_VALUE,    s_buf_small[13]),
+    SLOT(SATLINK_MSG_ADC_VALUE,    s_buf_small[14]),
+    SLOT(SATLINK_MSG_ADC_VALUE,    s_buf_small[15]),
+};
+#undef SLOT
+#define LINK_SLOTS (sizeof(s_slots) / sizeof(s_slots[0]))
+_Static_assert(LINK_ADC_SLOTS == 8 && LINK_SLOTS == 7 + 8 + LINK_ADC_SLOTS,
+               "the slot table and its storage disagree");
+_Static_assert(LINK_SLOT_MAX >= LINK_BUF_META && LINK_SLOT_MAX >= LINK_BUF_GPIO_MAP &&
+               LINK_SLOT_MAX >= LINK_BUF_HELLO, "LINK_SLOT_MAX is not the largest slot");
+
+static portMUX_TYPE      s_slot_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t          s_slot_stamp;
+static TaskHandle_t      s_tx_task;
+
 static QueueHandle_t     s_uart_events;
-static QueueHandle_t     s_q_critical;
-static QueueHandle_t     s_q_bulk;
+static QueueHandle_t     s_q_telemetry;
+static QueueHandle_t     s_q_cover;
 static link_handlers_t   s_handlers;
 static satlink_rx_t      s_rx;
 static link_stats_t      s_stats;
@@ -130,8 +197,7 @@ static vprintf_like_t    s_prev_vprintf;
 /* ------------------------------------------------------------------ outbound */
 
 /* TRACK_POS, LOG and COVER are the three the spec names as droppable. The 1.6
- * cover parts and their END are COVER by another name: END shares the bulk
- * queue with DATA precisely so that it cannot overtake it. */
+ * cover parts and their END are COVER by another name. */
 static bool type_is_droppable(uint8_t type)
 {
     return type == SATLINK_MSG_TRACK_POS ||
@@ -146,69 +212,100 @@ static void tx_item_free(tx_item_t *item)
     item->payload = NULL;
 }
 
-static void tx_push_tagged(uint8_t type, const uint8_t *payload, size_t payload_len,
-                           uint32_t nonce, uint32_t generation)
+static void tx_wake(void)
 {
-    if (s_q_critical == NULL) {
+    if (s_tx_task != NULL) {
+        xTaskNotifyGive(s_tx_task);
+    }
+}
+
+static void tx_slot_count(tx_slot_result_t r)
+{
+    switch (r) {
+    case TX_SLOT_REPLACED:
+    case TX_SLOT_MERGED:
+        s_stats.tx_coalesced++;
+        break;
+    case TX_SLOT_NO_SLOT:
+    case TX_SLOT_TOO_LONG:
+        s_stats.tx_dropped_critical++;
+        break;
+    case TX_SLOT_QUEUED:
+        break;
+    }
+}
+
+/*
+ * A droppable message. When the queue is full the OLDEST goes, DEVICE_SPEC rule 1:
+ * a TRACK_POS is superseded within the second and a log line the console already
+ * printed. Cover parts have their own queue and are never evicted for these --
+ * that used to hole images for the sake of a log line, and was why this queue
+ * dropped the newest instead.
+ */
+static void tx_queue_telemetry(uint8_t type, const uint8_t *payload, size_t len)
+{
+    uint8_t *buf = malloc(len != 0 ? len : 1);
+    if (buf == NULL) {
+        s_stats.tx_dropped_bulk++;      /* counted, which it used not to be */
+        return;
+    }
+    if (len != 0) {
+        memcpy(buf, payload, len);
+    }
+    tx_item_t item = { .payload = buf, .len = (uint16_t)len, .type = type };
+    /* Bounded: another producer can refill the place this one freed. */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (xQueueSend(s_q_telemetry, &item, 0) == pdTRUE) {
+            tx_wake();
+            return;
+        }
+        tx_item_t oldest;
+        if (xQueueReceive(s_q_telemetry, &oldest, 0) == pdTRUE) {
+            tx_item_free(&oldest);
+            s_stats.tx_dropped_bulk++;
+        }
+    }
+    tx_item_free(&item);
+    s_stats.tx_dropped_bulk++;
+}
+
+/* `key` matters only for ADC_VALUE: the line. */
+static void tx_send(uint8_t type, uint8_t key, const uint8_t *payload, size_t payload_len,
+                    uint32_t nonce, uint32_t generation)
+{
+    if (s_q_telemetry == NULL) {
         return;
     }
     /* An incompatible peer gets liveness and log lines and nothing else: it would
      * not understand the rest, and guessing is worse than silence. */
-    if (s_peer_incompatible &&
-        type != SATLINK_MSG_HELLO && type != SATLINK_MSG_PING &&
-        type != SATLINK_MSG_PONG && type != SATLINK_MSG_LOG) {
+    if (s_peer_incompatible && !link_incompatible_allows(type)) {
         return;
     }
-
     if (payload_len > SATLINK_PAYLOAD_MAX) {
         return;     /* the encoders already refuse oversize; nothing to say here */
     }
 
-    /* A copy of the payload and nothing more. Framing happens in the sender, so
-     * nothing frame-sized ever lands on the caller's stack — and the caller can
-     * be any task at all, since the log bridge runs in whoever happened to log. */
-    uint8_t *buf = malloc(payload_len != 0 ? payload_len : 1);
-    if (buf == NULL) {
-        return;
-    }
-    if (payload_len != 0) {
-        memcpy(buf, payload, payload_len);
-    }
-
-    tx_item_t item = { .payload = buf, .len = (uint16_t)payload_len, .type = type,
-                       .fmt_nonce = nonce, .fmt_generation = generation };
-
-    bool bulk = type_is_droppable(type);
-    QueueHandle_t q = bulk ? s_q_bulk : s_q_critical;
-
-    if (xQueueSend(q, &item, 0) == pdTRUE) {
+    if (type_is_droppable(type)) {
+        tx_queue_telemetry(type, payload, payload_len);
         return;
     }
 
-    if (bulk) {
-        /* Full, and the queue may be carrying a cover image mid-flight. Every
-         * ESP_LOG line is bridged into this same queue, so a burst of logging
-         * used to evict the oldest bulk item -- a cover part, as likely as
-         * not -- and hole the image for the sake of a line the console
-         * already printed. The newest droppable item is the cheapest to lose:
-         * a log line is gone from nowhere but the host, and a TRACK_POS is
-         * superseded within the second. */
-        tx_item_free(&item);
-        s_stats.tx_dropped_bulk++;
-        return;
-    }
+    /* A copy into the type's slot and nothing more. Framing happens in the sender,
+     * so nothing frame-sized ever lands on the caller's stack -- and the caller can
+     * be any task at all. A spinlock rather than a mutex: the copy is a few hundred
+     * bytes at worst, and Bluetooth callbacks must not wait. */
+    portENTER_CRITICAL(&s_slot_mux);
+    tx_slot_result_t r = tx_slot_put(s_slots, LINK_SLOTS, type, key, payload, payload_len,
+                                     nonce, generation, &s_slot_stamp);
+    portEXIT_CRITICAL(&s_slot_mux);
+    tx_slot_count(r);
+    tx_wake();
+}
 
-    /* Critical and full. Make room by losing the oldest, which for a state
-     * message is also the least interesting one. */
-    tx_item_t victim;
-    if (xQueueReceive(q, &victim, 0) == pdTRUE) {
-        tx_item_free(&victim);
-        s_stats.tx_dropped_critical++;
-    }
-    if (xQueueSend(q, &item, 0) != pdTRUE) {
-        tx_item_free(&item);
-        s_stats.tx_dropped_critical++;
-    }
+static void tx_push_tagged(uint8_t type, const uint8_t *payload, size_t payload_len,
+                           uint32_t nonce, uint32_t generation)
+{
+    tx_send(type, 0, payload, payload_len, nonce, generation);
 }
 
 static void tx_push(uint8_t type, const uint8_t *payload, size_t len)
@@ -219,39 +316,50 @@ static void tx_push(uint8_t type, const uint8_t *payload, size_t len)
 static void link_tx_task(void *arg)
 {
     (void)arg;
+    /* Framed here, in transmission order, and into buffers only this task touches. */
+    static uint8_t slot_out[LINK_SLOT_MAX];
+    static uint8_t wire[SATLINK_WIRE_MAX];
+
     for (;;) {
-        tx_item_t item;
-        bool got = (xQueueReceive(s_q_critical, &item, 0) == pdTRUE);
-        if (!got) {
-            got = (xQueueReceive(s_q_bulk, &item, 0) == pdTRUE);
-        }
-        if (!got) {
-            /* Nothing waiting. Block on the critical queue so a new message wakes
-             * us at once rather than after a poll interval. */
-            if (xQueueReceive(s_q_critical, &item, pdMS_TO_TICKS(20)) != pdTRUE) {
-                continue;
-            }
+        uint8_t type = 0;
+        uint16_t len = 0;
+        uint32_t nonce = 0, generation = 0;
+        const uint8_t *payload = NULL;
+        tx_item_t item = { 0 };
+
+        portENTER_CRITICAL(&s_slot_mux);
+        bool got = tx_slot_take(s_slots, LINK_SLOTS, slot_out, sizeof(slot_out),
+                                &type, &len, &nonce, &generation);
+        portEXIT_CRITICAL(&s_slot_mux);
+        if (got) {
+            payload = slot_out;
+        } else if (xQueueReceive(s_q_telemetry, &item, 0) == pdTRUE ||
+                   xQueueReceive(s_q_cover, &item, 0) == pdTRUE) {
+            type = item.type;
+            len = item.len;
+            payload = item.payload;
+        } else {
+            /* Nothing waiting. Every producer gives a notification, so a new message
+             * wakes us at once rather than after a poll interval. */
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(LINK_TX_IDLE_MS));
+            continue;
         }
 
-        /* Framed here, in transmission order, and into a buffer only this task
-         * touches. */
-        static uint8_t wire[SATLINK_WIRE_MAX];
         size_t wire_len = 0;
-        if (satlink_frame_encode(item.type, s_tx_seq, item.payload, item.len,
-                                 wire, sizeof(wire), &wire_len)) {
+        if (satlink_frame_encode(type, s_tx_seq, payload, len, wire, sizeof(wire), &wire_len)) {
             s_tx_seq++;
             /* There is no flow control on this link, so the transmitter always
-             * drains and this wait is bounded by the baud rate. The queues in
-             * front are what keep callers from ever waiting at all. */
+             * drains and this wait is bounded by the baud rate. The slots and
+             * queues in front are what keep callers from ever waiting at all. */
             int sent = uart_write_bytes(BOARD_LINK_UART_NUM, wire, wire_len);
             if (sent == (int)wire_len) {
                 s_stats.tx_frames++;
-                if (item.fmt_generation &&
+                if (generation &&
                     uart_wait_tx_done(BOARD_LINK_UART_NUM, pdMS_TO_TICKS(100)) == ESP_OK) {
                     portENTER_CRITICAL(&s_fmt_mux);
-                    if (s_fmt_nonce != item.fmt_nonce || s_fmt_generation != item.fmt_generation) {
-                        s_fmt_nonce = item.fmt_nonce;
-                        s_fmt_generation = item.fmt_generation;
+                    if (s_fmt_nonce != nonce || s_fmt_generation != generation) {
+                        s_fmt_nonce = nonce;
+                        s_fmt_generation = generation;
                         s_fmt_sent_ms = (uint32_t)(esp_timer_get_time() / 1000);
                     }
                     portEXIT_CRITICAL(&s_fmt_mux);
@@ -354,7 +462,8 @@ void link_send_adc_value(uint8_t index, uint16_t raw, uint16_t mv)
     satlink_adc_value_t m = { .index = index, .raw = raw, .mv = mv };
     uint8_t payload[8];
     size_t len = satlink_enc_adc_value(payload, sizeof(payload), &m);
-    if (len != 0) { tx_push(SATLINK_MSG_ADC_VALUE, payload, len); }
+    /* One slot per line, so one line's value never replaces another's. */
+    if (len != 0) { tx_send(SATLINK_MSG_ADC_VALUE, index, payload, len, 0, 0); }
 }
 
 void link_send_cover_reset(uint32_t nonce, uint32_t generation)
@@ -371,7 +480,9 @@ void link_send_cover_reset(uint32_t nonce, uint32_t generation)
 bool link_try_cover_stream(uint32_t nonce, uint32_t generation, uint32_t offset,
                            const uint8_t *data, size_t len, uint32_t crc)
 {
-    if (!(link_host_caps() & COVER_STREAM_CAP) || !s_q_bulk ||
+    /* The incompatible check too: this skips tx_push and its filter, and the caps
+     * are still those of the last compatible host. */
+    if (s_peer_incompatible || !(link_host_caps() & COVER_STREAM_CAP) || !s_q_cover ||
         len>COVER_PART_MAX || (!data && len) ||
         link_bulk_pending()>LINK_BULK_COVER_HEADROOM) return false;
     size_t bytes=16+len;
@@ -382,7 +493,7 @@ bool link_try_cover_stream(uint32_t nonce, uint32_t generation, uint32_t offset,
     cover_put32(p+8,len?0:offset); cover_put32(p+12,len?offset:crc);
     if (len) memcpy(p+16,data,len);
     tx_item_t item={.payload=p,.len=(uint16_t)bytes,.type=len?COVER_DATA:COVER_END};
-    if (xQueueSend(s_q_bulk,&item,0)==pdTRUE) return true;
+    if (xQueueSend(s_q_cover,&item,0)==pdTRUE) { tx_wake(); return true; }
     free(p); return false;
 }
 
@@ -424,15 +535,23 @@ void link_send_bt_config(const satlink_bt_config_t *m)
     if (len != 0) { tx_push(SATLINK_MSG_BT_CONFIG, payload, len); }
 }
 
-/* 658 bytes at worst, so not on the caller's stack. */
+static size_t encode_bond_list(uint8_t *buf, size_t cap, const void *m)
+{
+    return satlink_enc_bond_list(buf, cap, (const satlink_bond_list_t *)m);
+}
+
+/* 658 bytes at worst, so not on the caller's stack -- and not on the heap either,
+ * where a failed allocation used to lose it without a word. It is encoded
+ * straight into its slot. */
 void link_send_bond_list(const satlink_bond_list_t *m)
 {
-    if (!host_speaks_1_8()) return;
-    uint8_t *payload = malloc(SATLINK_BOND_LIST_BYTES_MAX);
-    if (payload == NULL) return;
-    size_t len = satlink_enc_bond_list(payload, SATLINK_BOND_LIST_BYTES_MAX, m);
-    if (len != 0) { tx_push(SATLINK_MSG_BOND_LIST, payload, len); }
-    free(payload);
+    if (!host_speaks_1_8() || s_q_telemetry == NULL || s_peer_incompatible) return;
+    portENTER_CRITICAL(&s_slot_mux);
+    tx_slot_result_t r = tx_slot_encode(s_slots, LINK_SLOTS, SATLINK_MSG_BOND_LIST,
+                                        encode_bond_list, m, &s_slot_stamp);
+    portEXIT_CRITICAL(&s_slot_mux);
+    tx_slot_count(r);
+    tx_wake();
 }
 
 /* Our greeting, byte for byte as it goes on the wire. 0 if it will not fit. */
@@ -579,6 +698,14 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
     (void)seq;
     s_stats.rx_frames++;
 
+    /* One gate for every command, present and future. It used to be one check per
+     * handler, and transport, volume, radio and the expander had none, so a host
+     * the link refused to come up for could still drive them. */
+    if (s_peer_incompatible && !link_incompatible_allows(type)) {
+        s_stats.rx_refused++;
+        return;
+    }
+
     switch (type) {
     case SATLINK_MSG_HELLO:
         handle_hello(payload, len);
@@ -609,7 +736,7 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
     case FMT_READY: {
         fmt_ready_t ready;
         if (!fmt_decode_ready(payload, len, &ready)) { s_stats.rx_bad++; break; }
-        if (!s_peer_incompatible && (link_host_caps() & FMT_HOST_CAP) && s_handlers.on_format_ready)
+        if ((link_host_caps() & FMT_HOST_CAP) && s_handlers.on_format_ready)
             s_handlers.on_format_ready(&ready);
         break;
     }
@@ -657,8 +784,7 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
          * is sent no covers at all has nothing that could have failed, so a retry
          * from it names a transfer that never happened -- and serving it would
          * cost the phone an OBEX round trip for an image nobody will receive. */
-        if (!s_peer_incompatible && (link_host_caps() & COVER_STREAM_CAP) &&
-            s_handlers.on_cover_retry)
+        if ((link_host_caps() & COVER_STREAM_CAP) && s_handlers.on_cover_retry)
             s_handlers.on_cover_retry(m.boot_nonce, m.track_generation);
         break;
     }
@@ -675,7 +801,7 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
     case SATLINK_MSG_PAIR_REPLY: {
         satlink_pair_reply_t m = {0};
         if (!satlink_dec_pair_reply(payload, len, &m)) { s_stats.rx_bad++; break; }
-        if (!s_peer_incompatible && s_handlers.on_pair_reply != NULL)
+        if (s_handlers.on_pair_reply != NULL)
             s_handlers.on_pair_reply(m.addr, m.accept != 0);
         break;
     }
@@ -683,7 +809,7 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
     case SATLINK_MSG_BT_CONFIG_SET: {
         satlink_bt_config_set_t m = {0};
         if (!satlink_dec_bt_config_set(payload, len, &m)) { s_stats.rx_bad++; break; }
-        if (!s_peer_incompatible && s_handlers.on_bt_config_set != NULL)
+        if (s_handlers.on_bt_config_set != NULL)
             s_handlers.on_bt_config_set(&m);
         break;
     }
@@ -691,14 +817,14 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
     case SATLINK_MSG_BOND_REMOVE: {
         satlink_bond_remove_t m = {0};
         if (!satlink_dec_bond_remove(payload, len, &m)) { s_stats.rx_bad++; break; }
-        if (!s_peer_incompatible && s_handlers.on_bond_remove != NULL)
+        if (s_handlers.on_bond_remove != NULL)
             s_handlers.on_bond_remove(m.addr);
         break;
     }
 
     case SATLINK_MSG_BT_REFRESH:
         if (!satlink_dec_bt_refresh(payload, len)) { s_stats.rx_bad++; break; }
-        if (!s_peer_incompatible && s_handlers.on_bt_refresh != NULL)
+        if (s_handlers.on_bt_refresh != NULL)
             s_handlers.on_bt_refresh();
         break;
 
@@ -758,7 +884,9 @@ static void link_rx_task(void *arg)
 
                 satlink_rx_feed(&s_rx, chunk, (size_t)n, on_frame, NULL);
                 s_stats.rx_seq_gaps = s_rx.seq_gaps;
-                s_stats.rx_bad = s_rx.err_cobs + s_rx.err_crc + s_rx.err_runt + s_rx.err_too_long;
+                /* Its own field. This one used to be rx_bad, and assigning it here
+                 * erased every payload that on_frame had just counted as bad. */
+                s_stats.rx_bad_frames = s_rx.err_cobs + s_rx.err_crc + s_rx.err_runt + s_rx.err_too_long;
             }
             break;
         }
@@ -773,7 +901,7 @@ static void link_rx_task(void *arg)
                      event.type == UART_FIFO_OVF ? "hardware fifo" : "ring buffer");
             uart_flush_input(BOARD_LINK_UART_NUM);
             xQueueReset(s_uart_events);
-            satlink_rx_init(&s_rx);
+            satlink_rx_discard(&s_rx);
             /* Its own counter. This used to increment rx_bad, which the next data
              * event overwrote from the reassembler's totals -- so the one number
              * that said "we were too slow" was reliably erased by the one that
@@ -806,14 +934,18 @@ static void report_stats(void)
         return;
     }
 
-    ESP_LOGI(TAG, "tx %" PRIu32 " (dropped %" PRIu32 "/%" PRIu32 ", hello %" PRIu32 "), "
-                  "rx %" PRIu32 " bytes %" PRIu32 " frames "
-                  "(bad %" PRIu32 ", gaps %" PRIu32 ", unknown %" PRIu32 ", overrun %" PRIu32
-                  ", own hello %" PRIu32 "), pings unanswered %" PRIu32,
+    /* Two lines, so that each fits one LOG to the host. */
+    ESP_LOGI(TAG, "tx %" PRIu32 " (dropped %" PRIu32 "/%" PRIu32 ", coalesced %" PRIu32
+                  ", hello %" PRIu32 "), pings unanswered %" PRIu32,
              s_stats.tx_frames, s_stats.tx_dropped_bulk, s_stats.tx_dropped_critical,
-             s_stats.hello_sent,
-             s_stats.rx_bytes, s_stats.rx_frames, s_stats.rx_bad, s_stats.rx_seq_gaps,
-             s_stats.rx_unknown, s_stats.rx_overruns, s_stats.rx_echoes, s_stats.pings_unanswered);
+             s_stats.tx_coalesced, s_stats.hello_sent, s_stats.pings_unanswered);
+    ESP_LOGI(TAG, "rx %" PRIu32 " bytes %" PRIu32 " frames "
+                  "(bad frames %" PRIu32 ", bad payloads %" PRIu32 ", gaps %" PRIu32
+                  ", unknown %" PRIu32 ", refused %" PRIu32 ", overrun %" PRIu32
+                  ", own hello %" PRIu32 ")",
+             s_stats.rx_bytes, s_stats.rx_frames, s_stats.rx_bad_frames, s_stats.rx_bad,
+             s_stats.rx_seq_gaps, s_stats.rx_unknown, s_stats.rx_refused, s_stats.rx_overruns,
+             s_stats.rx_echoes);
     if (s_host_present) {
         ESP_LOGI(TAG, "round trip %" PRIu32 " ms", s_stats.rtt_ms);
     }
@@ -864,19 +996,21 @@ static int log_bridge(const char *fmt, va_list args)
     }
     s_in_log_bridge = true;
 
-    char line[200];
+    /* Exactly what LOG carries, so nothing is cut twice. */
+    char line[LINK_LOG_MAX + 1];
     int n = vsnprintf(line, sizeof(line), fmt, args);
     if (n > 0) {
-        /* Strip the trailing newline and the colour escape the console adds: the
-         * host wants text, not terminal control. */
-        size_t len = strnlen(line, sizeof(line));
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' ||
-                           line[len - 1] == 'm'  || line[len - 1] == '\033')) {
-            if (line[len - 1] == 'm' && (len < 2 || line[len - 2] != '[')) { break; }
-            line[--len] = '\0';
+        if ((size_t)n >= sizeof(line)) {
+            /* vsnprintf cuts by bytes. A character that lost its tail would reach
+             * the host as invalid UTF-8 in a field the protocol says is UTF-8. */
+            line[satlink_utf8_prefix(line, sizeof(line) - 1)] = '\0';
         }
-        if (len > 0) {
-            link_send_log(SATLINK_LOG_INFO, line);
+        /* The level was always 2, whatever the line said. The letter IDF puts in
+         * front of it is the only place the level survives to this hook. */
+        const uint8_t level = log_line_level(line);
+        const char *text = log_line_tidy(line);
+        if (text[0] != '\0') {
+            link_send_log(level, text);
         }
     }
 
@@ -907,7 +1041,7 @@ uint8_t link_host_minor(void) { return __atomic_load_n(&s_host_minor, __ATOMIC_S
 
 uint32_t link_bulk_pending(void)
 {
-    return (s_q_bulk != NULL) ? (uint32_t)uxQueueMessagesWaiting(s_q_bulk) : 0;
+    return (s_q_cover != NULL) ? (uint32_t)uxQueueMessagesWaiting(s_q_cover) : 0;
 }
 
 void link_get_stats(link_stats_t *out)
@@ -923,9 +1057,9 @@ esp_err_t link_start(const link_handlers_t *handlers, uint32_t caps)
     }
     satlink_rx_init(&s_rx);
 
-    s_q_critical = xQueueCreate(LINK_Q_CRITICAL, sizeof(tx_item_t));
-    s_q_bulk     = xQueueCreate(LINK_Q_BULK, sizeof(tx_item_t));
-    ESP_RETURN_ON_FALSE(s_q_critical != NULL && s_q_bulk != NULL,
+    s_q_telemetry = xQueueCreate(LINK_Q_TELEMETRY, sizeof(tx_item_t));
+    s_q_cover     = xQueueCreate(LINK_Q_COVER, sizeof(tx_item_t));
+    ESP_RETURN_ON_FALSE(s_q_telemetry != NULL && s_q_cover != NULL,
                         ESP_ERR_NO_MEM, TAG, "no memory for the tx queues");
 
     const uart_config_t cfg = {
@@ -956,7 +1090,7 @@ esp_err_t link_start(const link_handlers_t *handlers, uint32_t caps)
         xTaskCreate(link_rx_task, "link_rx", LINK_TASK_STACK, NULL, LINK_RX_PRIO, NULL) == pdPASS,
         ESP_ERR_NO_MEM, TAG, "no memory for the rx task");
     ESP_RETURN_ON_FALSE(
-        xTaskCreate(link_tx_task, "link_tx", LINK_TASK_STACK, NULL, LINK_TX_PRIO, NULL) == pdPASS,
+        xTaskCreate(link_tx_task, "link_tx", LINK_TASK_STACK, NULL, LINK_TX_PRIO, &s_tx_task) == pdPASS,
         ESP_ERR_NO_MEM, TAG, "no memory for the tx task");
 
     const esp_timer_create_args_t timer_args = {

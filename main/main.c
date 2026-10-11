@@ -58,7 +58,15 @@ static void on_hello(const satlink_hello_t *hello)
     /* Protocol 1.8 asks for BT_CONFIG and BOND_LIST after every greeting, and the
      * pairing mode follows the host that greeted last: not rate limited. */
     bt_av_host_hello();
+#endif
 
+    /* PROTOCOL.md 3.4: GPIO_MAP after every host HELLO, always, in a link-only
+     * build too. It went out once at boot, which a host that greeted later never
+     * saw. Not rate limited: it is 1 + 3n bytes and the host reads it as the
+     * answer to "what lines does this thing have". */
+    expander_send_map();
+
+#if !CONFIG_SAT_LINK_ONLY
     static int64_t next_announce_us;
     int64_t now = esp_timer_get_time();
     if (now < next_announce_us) {

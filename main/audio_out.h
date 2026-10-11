@@ -63,8 +63,9 @@ typedef struct {
     uint8_t  wire_head[8];
 } audio_out_stats_t;
 
-/* Nonblocking snapshot; success resets the window counters and peak/water marks.
- * False leaves both the caller's output and counters unchanged. */
+/* Nonblocking snapshot under two short spinlocks, never the writer's mutex; it
+ * resets the window counters and peak/water marks. False only before the output
+ * has started, and then leaves the caller's output and the counters unchanged. */
 bool audio_out_get_stats(audio_out_stats_t *out);
 
 /*
