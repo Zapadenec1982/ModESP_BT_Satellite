@@ -113,6 +113,70 @@ static void test_adc_period(void)
     CHECK_EQ(at[0], 0);
 }
 
+/*
+ * A line read every EXP_POLL_MS from `start` ms on, its level given by `input` per
+ * millisecond, settled at 0 before. Returns how many changes were reported and the
+ * time of the first one.
+ */
+typedef unsigned (*level_fn)(unsigned ms);
+
+static unsigned debounce_walk(level_fn input, unsigned start, unsigned end, unsigned *first_ms)
+{
+    const uint32_t bit = 1u << 3;
+    uint32_t candidate = 0, reported = 0;
+    uint8_t stable = EXP_STABLE_SAMPLES;
+    unsigned changes = 0;
+    *first_ms = 0;
+    for (unsigned ms = start; ms <= end; ms += EXP_POLL_MS) {
+        uint32_t level = input(ms) ? bit : 0;
+        if (exp_debounce_step(level, bit, &candidate, &stable, &reported)) {
+            if (changes++ == 0) {
+                *first_ms = ms;
+            }
+        }
+    }
+    return changes;
+}
+
+#define EDGE_MS 100u
+
+static unsigned clean_press(unsigned ms) { return ms >= EDGE_MS; }
+
+/* Contact bounce: flipping every 3 ms for 12 ms after the edge, then held. */
+static unsigned bouncy_press(unsigned ms)
+{
+    if (ms < EDGE_MS) {
+        return 0;
+    }
+    if (ms < EDGE_MS + 12) {
+        return ((ms - EDGE_MS) / 3) % 2 == 0;
+    }
+    return 1;
+}
+
+/* A 7 ms spike that is not a press at all. */
+static unsigned glitch(unsigned ms) { return ms >= EDGE_MS && ms < EDGE_MS + 7; }
+
+static void test_debounce(void)
+{
+    /* The edge-to-wire bound of PROTOCOL.md 11 is under 30 ms with 20 ms of
+     * debounce, so the poll must really be 5 ms: one change per press, no sooner
+     * than the debounce and in time, whatever the phase of the poll against the
+     * edge. */
+    for (unsigned phase = 0; phase < EXP_POLL_MS; phase++) {
+        unsigned at;
+        CHECK_EQ(debounce_walk(clean_press, phase, 400, &at), 1);
+        CHECK(at >= EDGE_MS + EXP_DEBOUNCE_MS);
+        CHECK(at - EDGE_MS < 30);
+
+        CHECK_EQ(debounce_walk(bouncy_press, phase, 400, &at), 1);
+        CHECK(at >= EDGE_MS + EXP_DEBOUNCE_MS);
+        CHECK(at - EDGE_MS < 12 + 30);
+
+        CHECK_EQ(debounce_walk(glitch, phase, 400, &at), 0);
+    }
+}
+
 /* ----------------------------------------------------------------------- LOG */
 
 /* The bridge's two steps on a copy of `in`: level first, then the tidy text. */
@@ -596,6 +660,7 @@ int main(void)
 {
     test_legal_mode();
     test_adc_period();
+    test_debounce();
     test_log_level();
     test_incompatible_host();
     test_abs_volume();

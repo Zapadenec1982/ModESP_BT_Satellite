@@ -10,6 +10,7 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -227,11 +228,19 @@ void expander_read_adc(uint8_t index)
     adc_sample_and_send(index);
 }
 
+/* The poll period. Not vTaskDelay: below one FreeRTOS tick (10 ms at the 100 Hz
+ * this build runs) it rounds to 0, which only yields, and the debounce and the
+ * ADC period would count loop passes instead of 5 ms. */
+static void poll_tick(void *arg)
+{
+    xTaskNotifyGive((TaskHandle_t)arg);
+}
+
 static void expander_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(EXP_POLL_MS));
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         uint32_t changed = 0;
         for (uint8_t i = 0; i < EXP_PIN_COUNT; i++) {
@@ -240,18 +249,7 @@ static void expander_task(void *arg)
                 continue;
             }
             uint32_t level = gpio_get_level(s_pins[i].gpio) ? bit : 0;
-
-            if (level == (s_candidate & bit)) {
-                if (s_stable[i] < EXP_STABLE_SAMPLES) {
-                    s_stable[i]++;
-                }
-            } else {
-                s_candidate = (s_candidate & ~bit) | level;
-                s_stable[i] = 0;
-            }
-
-            if (s_stable[i] >= EXP_STABLE_SAMPLES && (s_reported & bit) != level) {
-                s_reported = (s_reported & ~bit) | level;
+            if (exp_debounce_step(level, bit, &s_candidate, &s_stable[i], &s_reported)) {
                 changed |= bit;
             }
         }
@@ -326,9 +324,21 @@ esp_err_t expander_start(void)
         return ESP_OK;
     }
 
+    TaskHandle_t task = NULL;
     ESP_RETURN_ON_FALSE(
-        xTaskCreate(expander_task, "expander", EXP_TASK_STACK, NULL, EXP_TASK_PRIO, NULL) == pdPASS,
+        xTaskCreate(expander_task, "expander", EXP_TASK_STACK, NULL, EXP_TASK_PRIO, &task) == pdPASS,
         ESP_ERR_NO_MEM, TAG, "no memory for the expander task");
+
+    const esp_timer_create_args_t poll_args = {
+        .callback = poll_tick,
+        .arg = task,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "exp_poll",
+    };
+    esp_timer_handle_t poll_timer = NULL;
+    ESP_RETURN_ON_ERROR(esp_timer_create(&poll_args, &poll_timer), TAG, "poll timer");
+    ESP_RETURN_ON_ERROR(esp_timer_start_periodic(poll_timer, EXP_POLL_MS * 1000), TAG,
+                        "poll timer start");
 
     ESP_LOGI(TAG, "%u lines, %d ms debounce", (unsigned)EXP_PIN_COUNT, EXP_DEBOUNCE_MS);
     return ESP_OK;

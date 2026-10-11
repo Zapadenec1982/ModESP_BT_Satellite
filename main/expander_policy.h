@@ -16,10 +16,17 @@
 
 /* Poll fast, accept slowly. The spec allows 20 ms of debounce and asks for the
  * frame to be on the wire within 30 ms of the edge: 5 ms of granularity plus 20
- * ms of settling leaves room for the frame itself. */
+ * ms of settling leaves room for the frame itself.
+ *
+ * The period comes from an esp_timer, not from the FreeRTOS tick: at the default
+ * 100 Hz, pdMS_TO_TICKS(5) is 0 and the poller would spin instead of waiting. */
 #define EXP_POLL_MS        5
 #define EXP_DEBOUNCE_MS    20
 #define EXP_STABLE_SAMPLES (EXP_DEBOUNCE_MS / EXP_POLL_MS)
+
+_Static_assert(EXP_DEBOUNCE_MS % EXP_POLL_MS == 0, "debounce must be whole poll periods");
+_Static_assert(100 % EXP_POLL_MS == 0, "exp_adc_period_ticks needs 100 ms in whole polls");
+_Static_assert(EXP_POLL_MS + EXP_DEBOUNCE_MS < 30, "edge-to-wire bound of PROTOCOL.md 11");
 
 /* Why a requested mode was replaced, for the warning in LOG. */
 typedef enum {
@@ -65,6 +72,31 @@ static inline bool exp_mode_is_input(uint8_t mode)
 {
     return mode == SATLINK_PIN_INPUT || mode == SATLINK_PIN_INPUT_PU ||
            mode == SATLINK_PIN_INPUT_PD;
+}
+
+/*
+ * One poll of an input line, `bit` its place in the masks and `level` either `bit`
+ * or 0. A level must be read EXP_STABLE_SAMPLES polls in a row after it first
+ * differs before it replaces the reported one. True when the reported level of
+ * this line changed, which is when the host is told.
+ */
+static inline bool exp_debounce_step(uint32_t level, uint32_t bit, uint32_t *candidate,
+                                     uint8_t *stable, uint32_t *reported)
+{
+    if (level == (*candidate & bit)) {
+        if (*stable < EXP_STABLE_SAMPLES) {
+            (*stable)++;
+        }
+    } else {
+        *candidate = (*candidate & ~bit) | level;
+        *stable = 0;
+    }
+
+    if (*stable >= EXP_STABLE_SAMPLES && (*reported & bit) != level) {
+        *reported = (*reported & ~bit) | level;
+        return true;
+    }
+    return false;
 }
 
 /* Mode 6: `initial` is the report period in hundreds of milliseconds, 0 = only on
