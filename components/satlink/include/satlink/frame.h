@@ -71,5 +71,10 @@ typedef struct {
 
 void satlink_rx_init(satlink_rx_t *rx);
 
+/* Forgets a partly received frame and the last sequence number, after bytes were
+ * lost on the way in. The counters stay: they are totals since start, and a reset
+ * would run them back. */
+void satlink_rx_discard(satlink_rx_t *rx);
+
 void satlink_rx_feed(satlink_rx_t *rx, const uint8_t *data, size_t len,
                      satlink_rx_frame_cb cb, void *ctx);

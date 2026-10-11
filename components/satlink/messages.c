@@ -31,6 +31,28 @@ satlink_str_t satlink_str_clip(const char *s, uint16_t max_bytes)
     return out;
 }
 
+size_t satlink_utf8_prefix(const char *s, size_t len)
+{
+    if (s == NULL) {
+        return 0;
+    }
+    /* Back over at most three continuation bytes (10xxxxxx) to the byte that
+     * starts the last character, then ask it how long that character is. */
+    size_t start = len;
+    while (start > 0 && len - start < 3 && ((uint8_t)s[start - 1] & 0xC0u) == 0x80u) {
+        start--;
+    }
+    if (start == 0) {
+        return len;
+    }
+    uint8_t lead = (uint8_t)s[start - 1];
+    size_t need = ((lead & 0xE0u) == 0xC0u) ? 2
+                : ((lead & 0xF0u) == 0xE0u) ? 3
+                : ((lead & 0xF8u) == 0xF0u) ? 4
+                : 1;
+    return (len - (start - 1) >= need) ? len : start - 1;
+}
+
 /* Every encoder ends the same way: the sticky flag decides, and a failed write
  * yields 0 rather than a half-built payload. */
 static size_t wr_finish(const satlink_wr_t *w)

@@ -755,6 +755,40 @@ static void test_utf8_clip(void)
     CHECK_EQ(satlink_str_clip(cyr, 5).len, 5);
 }
 
+static void test_utf8_prefix(void)
+{
+    /* Text cut by somebody else: the log bridge's vsnprintf, a 128-byte metadata
+     * buffer. Only the bytes before the cut exist. */
+    const char *s = "Salom\xC3\xA9 Das";
+    CHECK_EQ(satlink_utf8_prefix(s, 11), 11);
+    CHECK_EQ(satlink_utf8_prefix(s, 7), 7);     /* right after the é */
+    CHECK_EQ(satlink_utf8_prefix(s, 6), 5);     /* the é's lead byte alone: dropped */
+    CHECK_EQ(satlink_utf8_prefix(s, 5), 5);
+    CHECK_EQ(satlink_utf8_prefix(s, 0), 0);
+    CHECK_EQ(satlink_utf8_prefix(NULL, 4), 0);
+
+    const char *euro = "\xE2\x82\xAC";      /* three bytes */
+    CHECK_EQ(satlink_utf8_prefix(euro, 1), 0);
+    CHECK_EQ(satlink_utf8_prefix(euro, 2), 0);
+    CHECK_EQ(satlink_utf8_prefix(euro, 3), 3);
+
+    const char *smile = "a\xF0\x9F\x98\x80";  /* one plus four bytes */
+    CHECK_EQ(satlink_utf8_prefix(smile, 2), 1);
+    CHECK_EQ(satlink_utf8_prefix(smile, 3), 1);
+    CHECK_EQ(satlink_utf8_prefix(smile, 4), 1);
+    CHECK_EQ(satlink_utf8_prefix(smile, 5), 5);
+
+    /* Not UTF-8 to begin with: not ours to repair. */
+    CHECK_EQ(satlink_utf8_prefix("\x80\x80", 2), 2);
+    CHECK_EQ(satlink_utf8_prefix("a\x80\x80\x80\x80", 5), 5);
+
+    /* Where the next byte does exist, it agrees with satlink_str_clip. */
+    const char *mixed = "a\xD0\xB1\xE2\x82\xAC\xF0\x9F\x98\x80z";
+    for (uint16_t max = 0; max < 11; max++) {
+        CHECK_EQ(satlink_utf8_prefix(mixed, max), satlink_str_clip(mixed, max).len);
+    }
+}
+
 static void test_every_message_through_a_frame(void)
 {
     /* The largest payload any message can produce still has to fit a frame, and
@@ -802,6 +836,7 @@ const test_case_t message_tests[] = {
     { "encoders refuse small", test_encoders_refuse_small_buffers },
     { "worst case in a frame", test_every_message_through_a_frame },
     { "utf-8 clipping",        test_utf8_clip },
+    { "utf-8 prefix",          test_utf8_prefix },
 };
 
 const size_t message_test_count = sizeof(message_tests) / sizeof(message_tests[0]);
