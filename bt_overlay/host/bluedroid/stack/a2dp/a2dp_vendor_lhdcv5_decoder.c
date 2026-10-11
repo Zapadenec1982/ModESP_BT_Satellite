@@ -98,7 +98,11 @@ void a2dp_lhdcv5_decoder_configure(const uint8_t *codec_info) {
 }
 
 ssize_t a2dp_lhdcv5_decoder_decode_packet_header(BT_HDR *packet) {
-    if (!state || !packet || a2dp_rtp_strip_header(packet) < 0 || packet->len < 1) {
+    /* The sink reads a positive return as "layer_specific holds the RTP
+     * sequence number" and only then counts sequence gaps, so return every
+     * byte taken off (RTP header plus the LHDC payload byte), never 0. */
+    const ssize_t rtp_len = state && packet ? a2dp_rtp_strip_header(packet) : -1;
+    if (rtp_len < 0 || packet->len < 1) {
         clear_fragments();
         return -EINVAL;
     }
@@ -123,7 +127,7 @@ ssize_t a2dp_lhdcv5_decoder_decode_packet_header(BT_HDR *packet) {
     }
     ++packet->offset;
     --packet->len;
-    return 0;
+    return rtp_len + 1;
 invalid:
     clear_fragments();
     return -EINVAL;
