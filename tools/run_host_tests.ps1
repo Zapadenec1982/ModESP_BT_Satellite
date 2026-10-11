@@ -131,7 +131,4 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 & $Python (Join-Path $repoRoot 'tools\run_lhdc_tests.py') --cc $Cc
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-& $Python (Join-Path $repoRoot 'tools\run_aptx_ll_tests.py') --cc $Cc
 exit $LASTEXITCODE

@@ -20,7 +20,6 @@ int g_checks, g_failures;
 #define APTX  SATLINK_CODEC_BIT_APTX
 #define APTXH SATLINK_CODEC_BIT_APTX_HD
 #define LHDC  SATLINK_CODEC_BIT_LHDC_V5
-#define APTXL SATLINK_CODEC_BIT_APTX_LL
 #define ALL   (SBC | AAC | APTX | APTXH | LHDC)
 
 static const uint8_t A[6] = { 0xDC, 0xE5, 0x5B, 0xEA, 0xC9, 0x3B };
@@ -155,62 +154,6 @@ static void test_settings_blob(void)
     static const uint8_t no_name[] = { 1, 1, 1, 0, 0, 0 };
     CHECK(!bt_settings_unpack(&back, no_name, sizeof(no_name)));
     CHECK(strcmp(back.name, "Kitchen") == 0);               /* a refusal leaves it alone */
-}
-
-/*
- * Protocol 1.10: aptX Low Latency exists for a host at minor 10 and for no other.
- * The numbers are the panel's as much as ours.
- */
-static void test_aptx_ll_for_host(void)
-{
-    CHECK_EQ(SATLINK_PROTO_MINOR, 10);
-    CHECK_EQ(SATLINK_CODEC_APTX_LL, 6);
-    CHECK_EQ(SATLINK_CODEC_BIT_APTX_LL, 1u << 5);
-
-    const uint8_t build = ALL | APTXL;
-    CHECK_EQ(bt_codecs_for_host(build, 0), ALL);        /* nobody has spoken yet */
-    CHECK_EQ(bt_codecs_for_host(build, 9), ALL);
-    CHECK_EQ(bt_codecs_for_host(build, 10), build);
-    CHECK_EQ(bt_codecs_for_host(build, 11), build);
-    CHECK_EQ(bt_codecs_for_host(SBC | AAC, 10), SBC | AAC);  /* a build without it */
-
-    /* BT_STATE: a host below 1.10 hears aptX, every other codec is left alone. */
-    CHECK_EQ(bt_codec_for_host(SATLINK_CODEC_APTX_LL, 9), SATLINK_CODEC_APTX);
-    CHECK_EQ(bt_codec_for_host(SATLINK_CODEC_APTX_LL, 0), SATLINK_CODEC_APTX);
-    CHECK_EQ(bt_codec_for_host(SATLINK_CODEC_APTX_LL, 10), SATLINK_CODEC_APTX_LL);
-    for (uint8_t c = SATLINK_CODEC_NONE; c <= SATLINK_CODEC_LHDC_V5; c++) {
-        CHECK_EQ(bt_codec_for_host(c, 9), c);
-        CHECK_EQ(bt_codec_for_host(c, 10), c);
-    }
-
-    /* A 1.10 host switches it off; a 1.9 host that takes over, and sends back the
-     * five bits it knows, cannot switch it on again -- or off, had it been on. */
-    bt_settings_t s;
-    bt_settings_defaults(&s, "modesp satellite");
-    CHECK_EQ(bt_codecs_enabled(&s, bt_codecs_for_host(build, 10)), build);
-    CHECK_EQ(bt_settings_apply(&s, bt_codecs_for_host(build, 10), 1, 1, 0, ALL, NULL, 0),
-             BT_CHANGED_CODECS);
-    CHECK_EQ(s.codecs_off, APTXL);
-    CHECK_EQ(bt_settings_apply(&s, bt_codecs_for_host(build, 9), 1, 1, 0, ALL, NULL, 0), 0);
-    CHECK_EQ(bt_settings_apply(&s, bt_codecs_for_host(build, 9), 1, 1, 0, 0xFF, NULL, 0), 0);
-    CHECK_EQ(s.codecs_off, APTXL);
-    CHECK_EQ(bt_codecs_enabled(&s, bt_codecs_for_host(build, 10)), ALL);
-
-    bt_settings_defaults(&s, "modesp satellite");
-    CHECK_EQ(bt_settings_apply(&s, bt_codecs_for_host(build, 9), 1, 1, 0, SBC, NULL, 0),
-             BT_CHANGED_CODECS);
-    CHECK_EQ(s.codecs_off, AAC | APTX | APTXH | LHDC);
-    CHECK_EQ(bt_codecs_enabled(&s, bt_codecs_for_host(build, 10)), SBC | APTXL);
-
-    /* Off survives the NVS record like any other codec. */
-    bt_settings_t back;
-    bt_settings_defaults(&s, "modesp satellite");
-    bt_settings_apply(&s, build, 1, 1, 0, ALL, NULL, 0);
-    uint8_t blob[BT_SETTINGS_BLOB_MAX];
-    size_t len = bt_settings_pack(&s, blob, sizeof(blob));
-    bt_settings_defaults(&back, "other");
-    CHECK(bt_settings_unpack(&back, blob, len));
-    CHECK_EQ(back.codecs_off, APTXL);
 }
 
 /* ---------------------------------------------------------------------- bonds */
@@ -463,7 +406,6 @@ int main(void)
     test_utf8();
     test_apply_set();
     test_settings_blob();
-    test_aptx_ll_for_host();
     test_bonds_follow_the_stack();
     test_bonds_full_and_saved();
     test_pair_without_host();

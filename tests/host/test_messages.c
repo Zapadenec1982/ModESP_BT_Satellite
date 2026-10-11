@@ -332,7 +332,7 @@ static void test_proto_1_7_constants(void)
  * numbering is the panel's as much as ours. */
 static void test_proto_1_8_constants(void)
 {
-    CHECK(SATLINK_PROTO_MINOR >= 8);
+    CHECK_EQ(SATLINK_PROTO_MINOR, 8);
     CHECK_EQ(SATLINK_CAP_BT_SETTINGS, 1u << 7);
     CHECK_EQ(SATLINK_HOST_CAP_PAIR_CONFIRM, 1u << 7);
     CHECK_EQ(SATLINK_MSG_PAIR_REQUEST, 0x1A);

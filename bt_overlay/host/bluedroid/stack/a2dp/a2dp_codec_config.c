@@ -11,7 +11,6 @@
 #include "stack/a2dp_aac.h"
 #include "stack/a2dp_vendor.h"
 #include "stack/a2dp_vendor_aptx_hd.h"
-#include "stack/a2dp_vendor_aptx_ll.h"
 #include "stack/a2dp_vendor_lhdcv5.h"
 #include "bta/bta_av_api.h"
 #include "bta/bta_av_ci.h"
@@ -63,15 +62,6 @@ void A2DP_SinkOfferAptx(bool offer) {
 #endif
 }
 
-/* Off until asked for, unlike the others: see A2DP_AptxLlSinkOffer. */
-void A2DP_SinkOfferAptxLl(bool offer) {
-#if (defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE)
-  A2DP_AptxLlSinkOffer(offer);
-#else
-  (void)offer;
-#endif
-}
-
 void A2DP_SinkOfferAac(bool offer) {
 #if (defined(AAC_DEC_INCLUDED) && AAC_DEC_INCLUDED == TRUE)
   A2DP_AacSinkOffer(offer);
@@ -107,7 +97,6 @@ void A2DP_SinkAllow48kHz(bool allow) {
 #if (defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE)
   A2DP_AptxSinkAllow48kHz(allow);
   A2DP_AptxHdSinkAllow48kHz(allow);
-  A2DP_AptxLlSinkAllow48kHz(allow);
 #endif
 }
 
@@ -290,8 +279,8 @@ bool A2DP_InitCodecConfig(btav_a2dp_codec_index_t codec_index, UINT8 *p_result) 
   }
 
   /* The endpoint loop walks every index in the range and registers what it
-   * finds, so an index with no codec compiled in, or one withheld by its
-   * A2DP_SinkOffer* switch, is the expected way for this to end, not a fault. */
+   * finds, so an index with no codec compiled in is the expected way for
+   * this to end, not a fault. aptX Low Latency is one such index here. */
   LOG_DEBUG("%s: no codec at index %u, skipping", __func__, codec_index);
   return false;
 }

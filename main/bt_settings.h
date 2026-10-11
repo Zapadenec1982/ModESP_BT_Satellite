@@ -40,36 +40,6 @@ static inline uint8_t bt_codecs_enabled(const bt_settings_t *s, uint8_t supporte
 }
 
 /*
- * Protocol 1.10: aptX Low Latency is a codec only a host at minor 10 can name.
- *
- * Below it the codec is not there at all: not in BT_CONFIG, not offered to a
- * phone, and out of reach of that host's BT_CONFIG_SET, so a choice a 1.10 host
- * made about it survives an older one. An endpoint a phone may take while the host
- * is never told about it is worse than none (docs/BASE.md). Zero, a host that has
- * not spoken yet, is below 10.
- */
-#define BT_CODEC_MINOR_APTX_LL  10
-
-static inline uint8_t bt_codecs_for_host(uint8_t build, uint8_t host_minor)
-{
-    if (host_minor < BT_CODEC_MINOR_APTX_LL) {
-        build &= (uint8_t)~SATLINK_CODEC_BIT_APTX_LL;
-    }
-    return build;
-}
-
-/* What BT_STATE calls the codec. A connection can outlive the host that let it be
- * made, and a host below 1.10 that takes over is told aptX: what reaches it on I2S
- * is exactly that, and a number it does not know never crosses the wire. */
-static inline uint8_t bt_codec_for_host(uint8_t codec, uint8_t host_minor)
-{
-    if (codec == SATLINK_CODEC_APTX_LL && host_minor < BT_CODEC_MINOR_APTX_LL) {
-        return SATLINK_CODEC_APTX;
-    }
-    return codec;
-}
-
-/*
  * Well-formed UTF-8: no NUL, no stray continuation bytes, no overlong forms, no
  * surrogates, nothing past U+10FFFF. A name is shown by the panel and handed to
  * every phone nearby, and both read it as text.

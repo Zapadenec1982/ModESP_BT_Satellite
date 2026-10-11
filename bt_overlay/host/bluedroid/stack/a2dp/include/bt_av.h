@@ -25,6 +25,9 @@ typedef enum {
 #if (defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE)
   BTAV_A2DP_CODEC_INDEX_SOURCE_APTX,
   BTAV_A2DP_CODEC_INDEX_SOURCE_APTX_HD,
+  /* Kept so that every codec index table lines up with upstream, even
+   * though no aptX Low Latency endpoint is registered and no decoder is
+   * built: A2DP_InitCodecConfig declines it. */
   BTAV_A2DP_CODEC_INDEX_SOURCE_APTX_LL,
 #endif /* APTX_DEC_INCLUDED */
 #if (defined(LDAC_DEC_INCLUDED) && LDAC_DEC_INCLUDED == TRUE)
@@ -53,6 +56,9 @@ typedef enum {
 #if (defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE)
   BTAV_A2DP_CODEC_INDEX_SINK_APTX,
   BTAV_A2DP_CODEC_INDEX_SINK_APTX_HD,
+  /* Kept so that every codec index table lines up with upstream, even
+   * though no aptX Low Latency endpoint is registered and no decoder is
+   * built: A2DP_InitCodecConfig declines it. */
   BTAV_A2DP_CODEC_INDEX_SINK_APTX_LL,
 #endif /* APTX_DEC_INCLUDED */
 #if (defined(LDAC_DEC_INCLUDED) && LDAC_DEC_INCLUDED == TRUE)

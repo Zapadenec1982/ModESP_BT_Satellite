@@ -24,11 +24,6 @@ then copy `bt_overlay/`. `tools/setup.ps1 -Clean` reproduces the local ignored
   flagged `just_works`, and the confirmation and the passkey notification both
   carry the peer name BTA has already read. The application must answer every
   confirmation, Just Works included.
-- `0009-register-aptx-ll-endpoint.patch`: builds the aptX Low Latency codec
-  (`bt_overlay/.../a2dp_vendor_aptx_ll.c`) with aptX and aptX HD and makes room for
-  its stream endpoint (`AVDT_APTX_SEPS` 2 -> 3). 0001 already carried the codec
-  indices; nothing was registered at them. The endpoint stays withheld until the
-  application calls `A2DP_SinkOfferAptxLl(true)`.
 
 Patch paths are relative to `components/bt`; setup uses
 `git apply --directory=components/bt` and stops on a rejected hunk.
