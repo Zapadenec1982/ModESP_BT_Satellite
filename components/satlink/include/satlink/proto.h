@@ -16,8 +16,9 @@
  * Legacy STREAM_FMT layouts remain unchanged.
  * 1.7: COVER_RETRY, device capability bit 6.
  * 1.8: Bluetooth settings and host-confirmed pairing, device and host bit 7.
- * 1.9: the host may clock the I2S link; device bit 8 and host bit 8. */
-#define SATLINK_PROTO_MINOR   9
+ * 1.9: the host may clock the I2S link; device bit 8 and host bit 8.
+ * 1.10: aptX Low Latency, BT_STATE codec 6 and BT_CONFIG codec bit 5. */
+#define SATLINK_PROTO_MINOR   10
 
 /* The largest decoded frame: type | seq | payload | crc16. */
 #define SATLINK_FRAME_MAX     1040
@@ -114,6 +115,7 @@ typedef enum {
     SATLINK_CODEC_APTX    = 3,
     SATLINK_CODEC_APTX_HD = 4,
     SATLINK_CODEC_LHDC_V5 = 5,
+    SATLINK_CODEC_APTX_LL = 6,  /* 1.10; a host below it is told 3, aptX */
 } satlink_codec_t;
 
 /* TRACK_POS.state */
@@ -161,6 +163,7 @@ typedef enum {
 #define SATLINK_CODEC_BIT_APTX      (1u << 2)
 #define SATLINK_CODEC_BIT_APTX_HD   (1u << 3)
 #define SATLINK_CODEC_BIT_LHDC_V5   (1u << 4)
+#define SATLINK_CODEC_BIT_APTX_LL   (1u << 5)   /* 1.10; never shown to a host below it */
 
 /* BOND_LIST, 1.8 */
 #define SATLINK_BOND_CONNECTED      (1u << 0)

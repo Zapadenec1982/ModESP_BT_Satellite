@@ -36,9 +36,9 @@
  * says what is true of this build rather than what was true of the first one. The
  * two Kconfig options come from patches/0001; see docs/BASE.md. */
 #if defined(CONFIG_BT_A2DP_APTX_DECODER) && defined(CONFIG_BT_A2DP_AAC_DECODER)
-#define BT_AV_BASE_CODEC_LIST    ", SBC, AAC, aptX, aptX HD"
+#define BT_AV_BASE_CODEC_LIST    ", SBC, AAC, aptX, aptX HD, aptX LL"
 #elif defined(CONFIG_BT_A2DP_APTX_DECODER)
-#define BT_AV_BASE_CODEC_LIST    ", SBC, aptX, aptX HD"
+#define BT_AV_BASE_CODEC_LIST    ", SBC, aptX, aptX HD, aptX LL"
 #elif defined(CONFIG_BT_A2DP_AAC_DECODER)
 #define BT_AV_BASE_CODEC_LIST    ", SBC, AAC"
 #else
@@ -65,6 +65,7 @@ extern void A2DP_SinkAllow48kHz(bool allow);
 extern void A2DP_SinkAllow96kHz(bool allow);
 extern void A2DP_SinkOfferAptxHd(bool offer);
 extern void A2DP_SinkOfferAptx(bool offer);
+extern void A2DP_SinkOfferAptxLl(bool offer);
 extern void A2DP_SinkOfferAac(bool offer);
 extern void A2DP_SinkOfferLhdcV5(bool offer);
 
@@ -101,6 +102,10 @@ extern void BTM_SetPairableMode(bool allow_pairing, bool connect_only_paired);
 #define BT_AV_OFFER_APTX_HD     true
 #define BT_AV_OFFER_APTX        true
 #define BT_AV_OFFER_AAC         true
+/* aptX Low Latency (protocol 1.10) is offered only to a 1.10 host, on top of this
+ * switch: see bt_codecs_for_host(). Where a source ranks it among the others is
+ * the source's business. */
+#define BT_AV_OFFER_APTX_LL     true
 
 /*
  * The codecs this build can offer, as BT_CONFIG counts them (protocol 1.8): a
@@ -114,7 +119,8 @@ extern void BTM_SetPairableMode(bool allow_pairing, bool connect_only_paired);
 #endif
 #if defined(CONFIG_BT_A2DP_APTX_DECODER)
 #define BT_AV_BUILD_APTX    ((BT_AV_OFFER_APTX ? SATLINK_CODEC_BIT_APTX : 0u) | \
-                             (BT_AV_OFFER_APTX_HD ? SATLINK_CODEC_BIT_APTX_HD : 0u))
+                             (BT_AV_OFFER_APTX_HD ? SATLINK_CODEC_BIT_APTX_HD : 0u) | \
+                             (BT_AV_OFFER_APTX_LL ? SATLINK_CODEC_BIT_APTX_LL : 0u))
 #else
 #define BT_AV_BUILD_APTX    0u
 #endif
@@ -362,9 +368,10 @@ static uint8_t aac_channels(const uint8_t *cie)
     return (cie[2] & 0x0C) == 0x08 ? 1 : 2;     /* 0x08 mono, 0x04 stereo */
 }
 
-/* aptX and aptX HD: [0..3] vendor id and [4..5] codec id, both little endian,
- * then [6] with the frequency in the high nibble and the channel mode in the
- * low one. aptX HD adds four reserved bytes that carry nothing we need. */
+/* aptX, aptX HD and aptX Low Latency: [0..3] vendor id and [4..5] codec id, both
+ * little endian, then [6] with the frequency in the high nibble and the channel
+ * mode in the low one. aptX HD adds four reserved bytes and aptX Low Latency one
+ * octet of flags, neither carrying anything we need. */
 #define APTX_CIE_FREQ_CHAN      6
 
 static uint32_t aptx_vendor_id(const uint8_t *cie)
@@ -468,22 +475,30 @@ static void decide_endpoints(uint32_t host_caps, uint8_t codecs)
     A2DP_SinkAllow96kHz((host_caps & SATLINK_HOST_CAP_96KHZ) != 0);
     A2DP_SinkOfferAptxHd((codecs & SATLINK_CODEC_BIT_APTX_HD) != 0);
     A2DP_SinkOfferAptx((codecs & SATLINK_CODEC_BIT_APTX) != 0);
+    A2DP_SinkOfferAptxLl((codecs & SATLINK_CODEC_BIT_APTX_LL) != 0);
     A2DP_SinkOfferAac((codecs & SATLINK_CODEC_BIT_AAC) != 0);
     A2DP_SinkOfferLhdcV5((codecs & SATLINK_CODEC_BIT_LHDC_V5) != 0);
-    ESP_LOGI(TAG, "endpoints: SBC%s%s%s%s, %s, %u-bit slots",
+    ESP_LOGI(TAG, "endpoints: SBC%s%s%s%s%s, %s, %u-bit slots",
              (codecs & SATLINK_CODEC_BIT_AAC) ? " AAC" : "",
              (codecs & SATLINK_CODEC_BIT_APTX) ? " aptX" : "",
              (codecs & SATLINK_CODEC_BIT_APTX_HD) ? " aptX-HD" : "",
+             (codecs & SATLINK_CODEC_BIT_APTX_LL) ? " aptX-LL" : "",
              (codecs & SATLINK_CODEC_BIT_LHDC_V5) ? " LHDC-V5" : "",
              (host_caps & SATLINK_HOST_CAP_96KHZ) ? "44.1/48 kHz + LHDC 96 kHz" :
              (host_caps & SATLINK_HOST_CAP_RELOCK) ? "44.1 and 48 kHz" : "44.1 kHz only",
              audio_out_slot_bits());
 }
 
-/* The codecs to offer a phone: the build's, less what the host switched off. */
+/* The codecs of the build this host can be shown: all of them from 1.10 up. */
+static uint8_t build_codecs(void)
+{
+    return bt_codecs_for_host(BT_AV_BUILD_CODECS, link_host_minor());
+}
+
+/* The codecs to offer a phone: those, less what the host switched off. */
 static uint8_t offered_codecs(void)
 {
-    return bt_codecs_enabled(&s_settings, BT_AV_BUILD_CODECS);
+    return bt_codecs_enabled(&s_settings, build_codecs());
 }
 
 /* No phone in any stage of attachment. Re-registering under one would drop it. */
@@ -590,7 +605,8 @@ static void poll_format(void)
 
 void bt_av_report_state(void)
 {
-    link_send_bt_state(s_now.state, s_now.codec, s_now.addr, s_now.name);
+    link_send_bt_state(s_now.state, bt_codec_for_host(s_now.codec, link_host_minor()),
+                       s_now.addr, s_now.name);
 }
 
 void bt_av_report_stream_fmt(void)
@@ -855,8 +871,8 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
             uint16_t codec  = aptx_codec_id(cie);
             rate     = aptx_rate_hz(cie);
             channels = aptx_channels(cie);
-            /* Both aptX variants come out of libfreeaptx at 24 bits, widened to
-             * int32 by the decoder. Narrowing, if the wire needs it, happens in
+            /* All three aptX variants come out of libfreeaptx at 24 bits, widened
+             * to int32 by the decoder. Narrowing, if the wire needs it, happens in
              * audio_out with dither rather than here by truncation. */
             src_bits = 32;
 
@@ -874,6 +890,12 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
                 s_now.codec = SATLINK_CODEC_APTX;
                 audio_out_set_codec_name("aptX");
                 ESP_LOGI(TAG, "codec aptX, %" PRIu32 " Hz, %u channel(s)", rate, channels);
+            } else if (vendor == 0x0000000A && codec == 0x0002) {
+                /* aptX Low Latency, protocol 1.10. Plain aptX on the air; the
+                 * endpoint exists only while a 1.10 host is there to name it. */
+                s_now.codec = SATLINK_CODEC_APTX_LL;
+                audio_out_set_codec_name("aptX LL");
+                ESP_LOGI(TAG, "codec aptX LL, %" PRIu32 " Hz, %u channel(s)", rate, channels);
             } else if (vendor == 0x000000D7 && codec == 0x0024) {
                 s_now.codec = SATLINK_CODEC_APTX_HD;
                 audio_out_set_codec_name("aptX HD");
@@ -1393,7 +1415,7 @@ static void load_settings(const char *factory_name)
     ESP_LOGI(TAG, "bt settings: radio %u, discoverable %u, reconnect %u, codecs 0x%02x of 0x%02x, "
                   "name \"%s\", %u bond name(s)",
              s_settings.radio, s_settings.discoverable, s_settings.auto_reconnect,
-             offered_codecs(), BT_AV_BUILD_CODECS, s_settings.name, s_bonds.count);
+             offered_codecs(), build_codecs(), s_settings.name, s_bonds.count);
 }
 
 /* ---- The stack's side: its bonds, scan mode, pairing mode. */
@@ -1462,7 +1484,7 @@ static void send_bt_config(void)
         .radio = s_settings.radio,
         .discoverable = s_settings.discoverable,
         .auto_reconnect = s_settings.auto_reconnect,
-        .codecs_supported = BT_AV_BUILD_CODECS,
+        .codecs_supported = build_codecs(),
         .codecs_enabled = offered_codecs(),
         .name = satlink_str(s_settings.name),
     };
@@ -1575,7 +1597,7 @@ static void cfg_phone_gone(void)
 static void cfg_on_set(const cfg_msg_t *m, uint32_t now)
 {
     const bool was_on = s_live_radio;
-    unsigned changed = bt_settings_apply(&s_settings, BT_AV_BUILD_CODECS, m->set[0], m->set[1],
+    unsigned changed = bt_settings_apply(&s_settings, build_codecs(), m->set[0], m->set[1],
                                          m->set[2], m->set[3], m->name, m->name_len);
     if (m->name_refused || (m->name_len != 0 && !bt_name_ok(m->name, m->name_len))) {
         ESP_LOGW(TAG, "bt settings: name refused, keeping \"%s\"", s_settings.name);
