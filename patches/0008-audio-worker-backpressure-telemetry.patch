@@ -1,0 +1,120 @@
+--- a/host/bluedroid/btc/profile/std/a2dp/btc_a2dp_sink.c
++++ b/host/bluedroid/btc/profile/std/a2dp/btc_a2dp_sink.c
+@@ -32,31 +32,11 @@
+ #include "freertos/FreeRTOS.h"
+ #include "freertos/task.h"
+ 
+-/*
+- * Throttle for the warnings on the media path.
+- *
+- * Both of the sites below report a per-packet event, and at 48 kHz aptX HD that
+- * is around 120 packets a second. Printing one line each is not a diagnostic, it
+- * is the fault: measured on this board, 114 lines a second at 115200 baud came to
+- * roughly 0.8 seconds of blocking console writes per second, on the same task
+- * that decodes the audio and drains this queue. The queue then overflows, which
+- * drops packets, which breaks the codec frame sync, which logs more -- and the
+- * storm sustains itself long after whatever started it has gone.
+- *
+- * So: count everything, print at most one line every couple of seconds, and put
+- * the count in the line so that nothing is actually lost.
+- */
+-#define BTC_A2DP_SINK_WARN_PERIOD_MS   2000
+-
+-static BOOLEAN btc_a2dp_sink_warn_due(UINT32 *p_next_tick)
+-{
+-    UINT32 now = (UINT32)xTaskGetTickCount();
+-    if (*p_next_tick != 0 && (INT32)(now - *p_next_tick) < 0) {
+-        return FALSE;
+-    }
+-    *p_next_tick = now + pdMS_TO_TICKS(BTC_A2DP_SINK_WARN_PERIOD_MS);
+-    return TRUE;
+-}
++/* Optional application hooks; all PCM backpressure stays on this worker. */
++extern void sat_audio_decode_begin(unsigned depth) __attribute__((weak));
++extern void sat_audio_decode_end(void) __attribute__((weak));
++extern void sat_audio_encoded_event(unsigned depth, unsigned dropped, unsigned gaps) __attribute__((weak));
++
+ #include "esp_a2dp_api.h"
+ #include "oi_status.h"
+ #include "osi/future.h"
+@@ -611,10 +591,16 @@
+             return;
+         }
+ 
++        if (sat_audio_decode_begin)
++            sat_audio_decode_begin(fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ));
+         btc_a2dp_sink_handle_inc_media(p_msg);
++        if (sat_audio_decode_end) sat_audio_decode_end();
++        /* Yield to already queued control work after one packet. PCM may have
++         * waited for DMA consumption; do not multiply that bound by queue size. */
+         /* p_msg is the original BT packet (zero-copy enqueue) */
+         osi_free(p_msg);
+         nb_of_msgs_to_process--;
++        break;
+     }
+     APPL_TRACE_DEBUG(" Process Frames - ");
+ 
+@@ -751,18 +737,9 @@
+             /* Because the sequence number of some devices is not recounted */
+             if (!a2dp_sink_local_param.media_pkt_seq_num.seq_num_recount ||
+                     a2dp_sink_local_param.media_pkt_seq_num.expected_seq_num != 0x1) {
+-                static UINT32 gap_next_tick;
+-                static UINT32 gap_count;
+-                static UINT32 gap_packets;
+-                gap_count++;
+-                gap_packets += (UINT16)(p_msg->layer_specific -
+-                                        a2dp_sink_local_param.media_pkt_seq_num.expected_seq_num);
+-                if (btc_a2dp_sink_warn_due(&gap_next_tick)) {
+-                    APPL_TRACE_WARNING("sequence gaps: %u so far, %u packets missing, last recv 0x%x expect 0x%x",
+-                                       (unsigned)gap_count, (unsigned)gap_packets,
+-                                       p_msg->layer_specific,
+-                                       a2dp_sink_local_param.media_pkt_seq_num.expected_seq_num);
+-                }
++                if (sat_audio_encoded_event)
++                    sat_audio_encoded_event(fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ), 0,
++                        (UINT16)(p_msg->layer_specific - a2dp_sink_local_param.media_pkt_seq_num.expected_seq_num));
+             }
+         }
+         a2dp_sink_local_param.media_pkt_seq_num.expected_seq_num = p_msg->layer_specific + 1;
+@@ -852,13 +829,7 @@
+ 
+     UINT8 queue_limit = btc_a2dp_sink_queue_limit();
+     if (fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ) >= queue_limit) {
+-        static UINT32 full_next_tick;
+-        static UINT32 full_count;
+-        full_count++;
+-        if (btc_a2dp_sink_warn_due(&full_next_tick)) {
+-            APPL_TRACE_WARNING("codec queue full (%u), %u packets dropped so far",
+-                               (unsigned)queue_limit, (unsigned)full_count);
+-        }
++        if (sat_audio_encoded_event) sat_audio_encoded_event(queue_limit, 1, 0);
+         osi_free(p_pkt);  /* Free original - caller expects us to take ownership */
+         return fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
+     }
+@@ -877,11 +848,11 @@
+                 int queue_floor = btc_a2dp_sink_queue_floor();
+                 if (queue_len > queue_floor) {
+                     int to_drop = queue_len - queue_floor;
+-                    APPL_TRACE_WARNING("Low memory (%u bytes free, target %u), dropping %d oldest packets",
+-                                     (unsigned)free_internal, (unsigned)pressure_target, to_drop);
++
+                     for (int i = 0; i < to_drop; i++) {
+                         void *buf = fixed_queue_dequeue(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ, 0);
+                         if (buf) {
++                            if (sat_audio_encoded_event) sat_audio_encoded_event(queue_len, 1, 0);
+                             osi_free(buf);
+                         }
+                     }
+@@ -898,9 +869,12 @@
+      * This eliminates one malloc+free per packet and avoids transient
+      * double-allocation spikes that cause OOM during LDAC streaming. */
+     if (!fixed_queue_enqueue(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ, p_pkt, 0)) {
++        if (sat_audio_encoded_event) sat_audio_encoded_event(queue_limit, 1, 0);
+         osi_free(p_pkt);
+         return fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
+     }
++    if (sat_audio_encoded_event)
++        sat_audio_encoded_event(fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ), 0, 0);
+     osi_thread_post_event(a2dp_sink_local_param.btc_aa_snk_cb.data_ready_event, 0);
+     return fixed_queue_length(a2dp_sink_local_param.btc_aa_snk_cb.RxSbcQ);
+ }

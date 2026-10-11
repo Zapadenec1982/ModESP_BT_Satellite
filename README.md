@@ -28,11 +28,13 @@ on a network.
 
 | Signal | GPIO |
 |---|---|
-| I2S BCLK, WS, DOUT | 25, 26, 27 |
+| I2S BCLK | 13 |
+| I2S WS, DOUT | 26, 27 |
 | UART to the host | TX 17, RX 16 |
 
-The I2S three sit next to each other in the left header row and the UART two in the right, so
-each comes off on one ribbon. 17 and 16 are also the IOMUX pins of UART2, which keeps 460800
+WS and DOUT sit next to each other in the left header row and BCLK apart, on 13 next to a GND
+pin: on 25, beside WS, it put false edges on it (moved 04.10.2026). The UART two sit together in
+the right row. 17 and 16 are also the IOMUX pins of UART2, which keeps 460800
 baud off the GPIO matrix.
 
 Flashing and logs are on **COM13**.

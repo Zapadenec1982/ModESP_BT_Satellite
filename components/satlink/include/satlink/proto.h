@@ -15,8 +15,9 @@
 /* 1.3: optional correlated STREAM_PREPARE / STREAM_READY transitions.
  * Legacy STREAM_FMT layouts remain unchanged.
  * 1.7: COVER_RETRY, device capability bit 6.
- * 1.8: Bluetooth settings and host-confirmed pairing, device and host bit 7. */
-#define SATLINK_PROTO_MINOR   8
+ * 1.8: Bluetooth settings and host-confirmed pairing, device and host bit 7.
+ * 1.9: the host may clock the I2S link; device bit 8 and host bit 8. */
+#define SATLINK_PROTO_MINOR   9
 
 /* The largest decoded frame: type | seq | payload | crc16. */
 #define SATLINK_FRAME_MAX     1040
@@ -76,6 +77,10 @@ typedef enum {
 /* 1.8. Sends PAIR_REQUEST, PAIR_RESULT, BT_CONFIG and BOND_LIST, and understands
  * PAIR_REPLY, BT_CONFIG_SET, BOND_REMOVE and BT_REFRESH. */
 #define SATLINK_CAP_BT_SETTINGS   (1u << 7)
+/* 1.9. Set only while it is true: this device's I2S output is a SLAVE, drives DATA
+ * alone and takes BCLK and WS from the host. The host drives those two lines only
+ * while the device's latest HELLO carries this bit. */
+#define SATLINK_CAP_I2S_SLAVE     (1u << 8)
 
 /* HELLO capability bits, host side. */
 #define SATLINK_HOST_CAP_RELOCK   (1u << 0)  /* can follow STREAM_FMT mid-flight */
@@ -86,6 +91,10 @@ typedef enum {
 /* 1.8. The host shows pairing requests and answers PAIR_REPLY. Without it the
  * device pairs the way 1.7 did: NoInputNoOutput, and nobody is asked. */
 #define SATLINK_HOST_CAP_PAIR_CONFIRM (1u << 7)
+/* 1.9. The host clocks the link: it drives BCLK and WS at the announced rate in
+ * 32-bit slots, from the clock that also drives its DAC. Requires RELOCK and WIDE.
+ * A device that sees it stays a slave; one that does not reverts to master. */
+#define SATLINK_HOST_CAP_I2S_MASTER   (1u << 8)
 
 /* BT_STATE.state */
 typedef enum {
