@@ -1,146 +1,140 @@
 # modesp-bt-satellite
 
-A Bluetooth A2DP receiver on an original ESP32. It takes audio from a phone and hands it to a
-host over I2S, tells the host what is playing over a UART, and lends the host a few of its own
-GPIO on the side.
+**English** · [Українська](README.uk.md)
 
-The host is somebody else's microcontroller. What it is does not change a single requirement
-here, so this project does not know and does not care.
+Firmware for an original ESP32 that receives Bluetooth audio from a phone and hands it to a
+**host** microcontroller: the audio over I2S, everything else over a UART. On the side it lends
+the host a few of its own GPIO.
+
+What the host is changes no requirement here, so this project neither knows nor cares. Its
+other end is a second, independent implementation of the same protocol.
+
+## What it does
+
+- **A2DP sink** with SBC, AAC, aptX, aptX HD and LHDC V5. 44.1 and 48 kHz, and 96 kHz for LHDC V5
+  when the host says it can take it. LDAC is deliberately absent: the only decoder in
+  circulation has no licence.
+- **AVRCP controller**: title, artist, album, position, play state, absolute volume, transport
+  commands, and the album cover as a JPEG thumbnail.
+- **I2S out**, 16- or 32-bit slots, Philips format, no MCLK. The device is the clock master, or,
+  from protocol 1.9, the host clocks the link and the device drives data only.
+- **Control link**: UART 460800 8N1 with COBS framing and CRC-16. The host learns the stream
+  format before the first sample, and Bluetooth settings, pairing confirmation and the list of
+  paired phones are the host's to show and change.
+- **Port expander**: the host addresses this board's spare GPIO by index. The table is empty
+  today, which is a valid configuration.
+
+No Wi-Fi, no network, no screen, no files, no OTA.
 
 ## Documents
 
-Two, and they are self-contained.
-
 | | |
 |---|---|
-| [`docs/DEVICE_SPEC.md`](docs/DEVICE_SPEC.md) | the device: hardware, pins, codecs, I2S, behaviour |
-| [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | the link, byte by byte, version 1.7 |
-| [`docs/BASE.md`](docs/BASE.md) | why the Bluetooth stack is patched and how those patches are carried |
+| [`docs/DEVICE_SPEC.md`](docs/DEVICE_SPEC.md) | the device: hardware, pins, codecs, I2S, behaviour, customer decisions |
+| [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | the link to the host, byte by byte, version 1.9 |
+| [`docs/BASE.md`](docs/BASE.md) | why the Bluetooth stack is patched and how the patches are carried |
+| [`patches/README.md`](patches/README.md) | what each stack patch does |
+| [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | third-party code in the image and its terms, as found |
+
+The specification and the protocol are written in Ukrainian. `PROTOCOL.md` is a shared contract:
+a word-for-word copy lives in the host's repository, and the two change together.
 
 A gap in the specification is a question for the customer, not an invitation to go looking in
 the folder next door.
 
 ## Hardware
 
-ESP32-WROOM-32 on a DevKitC. Not an S3, C3 or C6: only the original ESP32 has Bluetooth
-Classic, and without it there is no A2DP. Wi-Fi is never brought up; this device does not go
-on a network.
+ESP32-WROOM-32 on a DevKitC. Not an S3, C3 or C6: only the original ESP32 has Bluetooth Classic,
+and without it there is no A2DP. WROOM rather than WROVER, because WROVER spends GPIO16 and 17 on
+PSRAM.
 
 | Signal | GPIO |
 |---|---|
 | I2S BCLK | 13 |
 | I2S WS, DOUT | 26, 27 |
-| UART to the host | TX 17, RX 16 |
+| UART TX to the host, RX from it | 17, 16 |
 
-WS and DOUT sit next to each other in the left header row and BCLK apart, on 13 next to a GND
-pin: on 25, beside WS, it put false edges on it (moved 04.10.2026). The UART two sit together in
-the right row. 17 and 16 are also the IOMUX pins of UART2, which keeps 460800
-baud off the GPIO matrix.
+WS and DOUT sit next to each other in the left header row, BCLK on 13 beside a GND pin; on 25,
+next to WS, it put false edges on it (moved 04.10.2026). The UART pair sits together in the
+right row; 17 and 16 are also UART2's IOMUX pins, which keeps 460800 baud off the GPIO matrix.
 
-Flashing and logs are on **COM13**.
+The CPU runs at 240 MHz: at 160 the aptX decoder could not keep up.
 
 ## Building
+
+The ESP-IDF is pinned in [`idf.pin`](idf.pin) (v5.5.5). Stock Bluedroid does A2DP sink in SBC
+only, so the stack is patched: `tools/setup.*` copies `components/bt` out of the pinned IDF,
+applies `patches/` and copies `bt_overlay/` on top. The shared IDF on disk is read and never
+written. Details in [`docs/BASE.md`](docs/BASE.md).
+
+Windows, PowerShell:
 
 ```powershell
 . C:\Espressif\tools\Microsoft.v5.5.5.PowerShell_profile.ps1
 $env:IDF_COMPONENT_CACHE_PATH = "D:\P4_DSP\.idf_cache"
+.\tools\setup.ps1
 idf.py set-target esp32
 idf.py build
 idf.py -p COM13 flash monitor
 ```
 
-Stock Bluedroid does A2DP sink in SBC and refuses to register an endpoint for anything else,
-so AAC and aptX need changes inside the stack. Rather than vendoring a whole IDF tree, this
-repository pins one in `idf.pin` and keeps the delta in `patches/`. `tools/setup.ps1` builds a
-local `components/bt` from the two. The shared IDF on disk is read and never written — it
-belongs to more than this project.
+Linux:
+
+```bash
+. ~/.espressif/tools/activate_idf_v5.5.5.sh   # or $IDF_PATH/export.sh
+tools/setup.sh
+idf.py set-target esp32
+idf.py build
+```
+
+`components/bt` is generated and ignored by git; `tools/setup.sh --clean` (`-Clean` on Windows)
+builds it again from scratch. Flashing and logs on this bench are on **COM13**. COM12 is the
+host, not this board.
+
+Three overlay builds are there for bring-up, each a `sdkconfig.*` file named on the command line:
+
+| Overlay | What it builds |
+|---|---|
+| `sdkconfig.linkonly` | the link and nothing else: HELLO, an empty GPIO_MAP, PING/PONG, LOG |
+| `sdkconfig.loopback` | the full firmware with the UART looped back inside the chip |
+| `sdkconfig.clockprobe` | measures the I2S bit clock on the board itself and logs it |
+
+```bash
+idf.py -B build_loopback -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.loopback" build
+```
 
 ## Testing
 
-```powershell
-.\tools\run_host_tests.ps1
+```bash
+CC=gcc PYTHON=python3 tools/run_host_tests.sh      # Windows: .\tools\run_host_tests.ps1
 ```
 
-On Linux, and in CI: `tools/setup.sh` then `CC=gcc PYTHON=python3 tools/run_host_tests.sh`
--- the same steps as the PowerShell scripts. `.github/workflows/build.yml` runs both in
-the official `espressif/idf:v5.5.5` container on every push.
+The suites build with a host compiler and need no board: framing, CRC and every message layout
+with golden vectors from the host side, the endpoint re-registration and Bluetooth settings
+rules, and replays of real stack, link, cover, audio and LHDC code against stubs. Some of them
+need `components/bt`, so run `tools/setup.*` first. A passing replay is not a phone or bench
+result.
 
-`components/satlink` has no ESP-IDF dependencies on purpose, so the framing, the CRC, the
-reassembler and all nineteen message layouts build and run with a host compiler. A framing bug
-is far cheaper to find in a terminal than over a UART.
-
-The link can also be exercised on the board with no host attached, by looping the UART back on
-itself inside the chip:
-
-```powershell
-idf.py -B build_loopback -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.loopback" build
-idf.py -B build_loopback -p COM13 flash monitor
-```
+`.github/workflows/build.yml` runs setup, the build and the host tests in the official
+`espressif/idf:v5.5.5` container on every push.
 
 ## Layout
 
 ```
-components/satlink/   the protocol: COBS, CRC-16, framing, every message. No IDF, host-testable
-main/link.c           the UART transport, the two send queues and the drop policy
-main/bt_av.c          A2DP sink and AVRCP controller, and what the host is told about them
-main/audio_out.c      I2S master out, ring buffer, clock that follows the stream
-main/expander.c       the GPIO this board lends out. The table is empty and that is a valid state
-main/board.h          every pin number in the project, and nowhere else
-patches/              the Bluetooth stack delta, one diff per logical change
-tests/host/           the link layer, tested without a board
+components/satlink/        the protocol: COBS, CRC-16, framing, every message. No IDF, host-testable
+components/lhdcv5_decoder/ the pinned LHDC V5 decoder
+main/link.c                the UART transport, the send queues and the drop policy
+main/bt_av.c               A2DP sink, AVRCP controller, pairing and settings, and what the host is told
+main/audio_out.c           I2S out, the PCM ring, the clock servo
+main/expander.c            the GPIO this board lends out
+main/board.h               every pin number in the project, and nowhere else
+bt_overlay/                stack files that are entirely ours: codec framework, decoders
+patches/                   the Bluetooth stack delta, one diff per logical change
+tests/host/, tools/        host tests and the scripts that run them; setup scripts
 ```
 
-## The bit clock, measured
+## Licence
 
-Asked by the host, whose receiver is a slave and has to tell a stopped clock from
-silence. Measured on the board itself: the pulse counter is fed from the BCLK pin's
-own output, so no wire and no oscilloscope are involved (`CONFIG_SAT_CLOCK_PROBE`).
-
-**It never stops.** With no phone and no stream, BCLK ran continuously at 1 411 256 Hz
-for twenty-five seconds, and the data line carries zeros rather than a repeated buffer.
-
-Nominal is 1 411 200 Hz, so the clock is **+40 ppm fast** — about 143 ms of drift an
-hour. Both clocks in that measurement come from the same crystal, so the figure is the
-APLL's own fractional error; the crystal's error adds to it in absolute terms. It is
-the drift the host's rate servo has to absorb, and its sign.
-
-One exception worth knowing: changing the sample rate disables and re-enables the
-channel, so the clock genuinely stops for that moment rather than going quiet. Today
-that path never runs — the rate is 44.1 kHz at boot and stock Bluedroid negotiates
-nothing else — but it would if 48 kHz were ever announced.
-
-### And steered
-
-Since hardening stage 10.1 (2026-09-21) the clock no longer runs free. Once a second
-`audio_out.c` compares the ring's mean fill over that second with the middle of the
-ring and nudges MCLK through `i2s_channel_tune_rate()`: a PI loop with its error in
-milliseconds of audio (so 44.1/16 and 96/32 behave alike), 10 ppm per millisecond, an
-integrator with a 400 s time constant, ±200 ppm of authority and 2 ppm steps. It runs
-only while a stream plays with the gate open, freezes between tracks, and starts from
-zero after every format change. The 10-second report line carries the applied ppm.
-
-Two loops in series, and they do not fight: this one tracks the phone's crystal from
-the ring, the P4's ±500 ppm ASRC tracks this device's BCLK from its own ring, and this
-one is the slower of the two by design. Keep it that way if the P4's loop is ever
-retuned.
-
-The driver re-derives the APLL live for every step — sdm coefficients rewritten, a
-calibration cycle run — while `audio_out.c` holds one extra APLL reference of its own,
-without which IDF 5.5.5 powers the PLL down mid-stream and trips an assert
-(`i2s_common.c:1487`, `clk_ctrl_os.c:111`). Whether BCLK is truly continuous through a
-step is a scope measurement, not a code reading, and is the first thing to check on
-the bench.
-
-## Status
-
-The receiver works: a phone pairs, SBC plays at 44.1 kHz, and the samples leave on the I2S
-pins. Track title, artist, album and length arrive over AVRCP and refresh on every skip.
-
-The link is implemented in full against `docs/PROTOCOL.md` 1.0 — all nineteen messages, both
-directions — and verified on the board with the UART looped back on itself: 95 frames out, 95
-in, no CRC errors, no sequence gaps, every PING answered. It has not yet spoken to a real
-host, because there is no second board on the bench.
-
-Still open: AAC and aptX, which wait on the stack patches; the expander's pin table, which
-waits on something to connect to it; and cover art, which is written but has never met a real
-phone.
+This repository has no licence file of its own. The third-party code linked into the image and
+the terms found in it are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md); libfreeaptx
+is LGPL-2.1, and `tools/relink_kit.ps1` produces the relink kit for a release.
