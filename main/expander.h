@@ -22,6 +22,11 @@
  * sends GPIO_MAP. Call after link_start(). */
 esp_err_t expander_start(void);
 
+/* GPIO_MAP again. PROTOCOL.md 3.4 sends it after every host HELLO, because a host
+ * that greets later than boot, or restarts, has missed the first one. Safe before
+ * expander_start(). */
+void expander_send_map(void);
+
 /* The capability bits this module can honestly claim. EXPANDER always, because it
  * means "understands these messages" rather than "has pins"; ADC only when some
  * line really can read one, which with an empty table is never. */

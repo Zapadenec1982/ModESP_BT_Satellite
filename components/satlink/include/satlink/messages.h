@@ -34,6 +34,13 @@ satlink_str_t satlink_str(const char *s);
  * stray byte. */
 satlink_str_t satlink_str_clip(const char *s, uint16_t max_bytes);
 
+/* How much of s[0..len) to keep so that it does not end inside a UTF-8 sequence:
+ * len, or less by the bytes of a last character that lost its tail. For text cut
+ * by somebody else -- vsnprintf, a fixed buffer -- where the byte after the cut is
+ * gone and satlink_str_clip cannot look at it. Bytes that are not valid UTF-8 to
+ * begin with are left as they are. */
+size_t satlink_utf8_prefix(const char *s, size_t len);
+
 /* ------------------------------------------------------------------ 0x01 HELLO */
 
 typedef struct {

@@ -109,6 +109,20 @@ if ($LASTEXITCODE -ne 0) {
 & $settingsExe
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+# The device's other rules of PROTOCOL.md, pure C out of main/.
+$rulesExe = Join-Path $outDir 'test_rules.exe'
+& $Cc '-std=c17' '-Wall' '-Wextra' '-Werror' '-g' '-O1' `
+    "-I$(Join-Path $repoRoot 'main')" `
+    "-I$(Join-Path $repoRoot 'components\satlink\include')" `
+    "-I$(Join-Path $repoRoot 'tests\host')" `
+    (Join-Path $repoRoot 'tests\host\test_rules.c') -o $rulesExe
+if ($LASTEXITCODE -ne 0) {
+    Write-Host 'run_host_tests: test_rules compilation failed.' -ForegroundColor Red
+    exit 1
+}
+& $rulesExe
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 # Replay the codec-switch race through source extracted from our generated BT.
 & $Python (Join-Path $repoRoot 'tools\run_bta_reopen_tests.py') --cc $Cc
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

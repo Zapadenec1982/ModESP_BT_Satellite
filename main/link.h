@@ -106,10 +106,22 @@ bool link_try_cover_stream(uint32_t nonce, uint32_t generation, uint32_t offset,
 /* Counters, for the report that explains a bad cable or a wedged host. */
 typedef struct {
     uint32_t tx_frames;
-    uint32_t tx_dropped_bulk;      /* TRACK_POS, LOG, COVER: the spec allows this */
-    uint32_t tx_dropped_critical;  /* anything else: the spec does not, so it is a fault */
+    /* TRACK_POS and LOG lost: the oldest evicted from a full queue, or no heap for
+     * the copy. The spec allows this. */
+    uint32_t tx_dropped_bulk;
+    /* Anything else lost: a message with no slot, or longer than its slot. The spec
+     * does not allow it, so it is a fault in this build. */
+    uint32_t tx_dropped_critical;
+    /* Messages that must not be lost replaced, unsent, by a newer one of the same
+     * type (GPIO_IN: merged into it). Not a loss -- the host gets the newer state --
+     * but a count that climbs says the wire is behind. */
+    uint32_t tx_coalesced;
     uint32_t rx_bytes;             /* raw, before framing: tells a dead wire from a noisy one */
     uint32_t rx_frames;
+    /* Frames the reassembler threw away: COBS, CRC, runt, too long. The wire's fault. */
+    uint32_t rx_bad_frames;
+    /* Frames that arrived whole and whose payload did not match the layout of their
+     * type. Not the wire's fault: the two sides disagree about what they speak. */
     uint32_t rx_bad;
     uint32_t rx_seq_gaps;
     /* Frames of a type this build does not implement. A peer that is newer within
@@ -117,10 +129,13 @@ typedef struct {
      * nothing else arrives means the two sides disagree about what they speak,
      * and that used to be indistinguishable from silence. */
     uint32_t rx_unknown;
+    /* Frames from a host with another proto_major that the link does not act on:
+     * anything but HELLO, PING and PONG. */
+    uint32_t rx_refused;
     /* Times the receiver was not run often enough and the UART driver threw bytes
-     * away. Distinct from rx_bad, which counts frames that arrived and did not
-     * decode: an overrun is our fault, a bad frame is the wire's. Keeping them in
-     * one number hid the first behind the second. */
+     * away. Distinct from rx_bad_frames, which counts frames that arrived and did
+     * not decode: an overrun is our fault, a bad frame is the wire's. Keeping them
+     * in one number hid the first behind the second. */
     uint32_t rx_overruns;
     /* How many greetings we have actually put on the wire. "We never answered"
      * and "we answered and it was lost" are different faults with the same
@@ -136,10 +151,10 @@ typedef struct {
 void link_get_stats(link_stats_t *out);
 
 /*
- * How many droppable messages are still waiting to go out.
+ * How many cover parts are still waiting to go out.
  *
  * Exists for the cover stream, which is the only producer that can generate
- * more messages in one burst than the queue holds. Everything else emits one
+ * more messages in one burst than its queue holds. Everything else emits one
  * message per event and cannot outrun the wire.
  */
 uint32_t link_bulk_pending(void);

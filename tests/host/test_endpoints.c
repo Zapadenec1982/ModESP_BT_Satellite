@@ -162,6 +162,27 @@ static void test_codecs_reregister_when_idle(void)
     CHECK(!ep_stale(&g, RELOCK | K96, NO_LHDC));
 }
 
+static void test_host_can_follow(void)
+{
+    /* Without RELOCK only 44.1 kHz; 48 kHz used to play on regardless. */
+    CHECK(ep_host_can_follow(44100, 0));
+    CHECK(!ep_host_can_follow(48000, 0));
+    CHECK(!ep_host_can_follow(96000, 0));
+
+    CHECK(ep_host_can_follow(44100, RELOCK));
+    CHECK(ep_host_can_follow(48000, RELOCK));
+    CHECK(!ep_host_can_follow(96000, RELOCK));
+
+    CHECK(ep_host_can_follow(48000, RELOCK | K96));
+    CHECK(ep_host_can_follow(96000, RELOCK | K96));
+
+    /* Unrelated bits change nothing. */
+    CHECK(!ep_host_can_follow(48000, WIDE | COVER | SATLINK_HOST_CAP_FORMAT_READY));
+
+    /* Rates no endpoint offers are not this rule's business. */
+    CHECK(ep_host_can_follow(32000, 0));
+}
+
 int main(void)
 {
     test_boot_is_inert();
@@ -172,6 +193,7 @@ int main(void)
     test_refused_deinit_backs_off();
     test_refused_init_is_retried();
     test_retry_clock_wraps();
+    test_host_can_follow();
     printf("Endpoint re-registration: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

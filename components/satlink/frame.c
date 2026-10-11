@@ -101,6 +101,15 @@ void satlink_rx_init(satlink_rx_t *rx)
     }
 }
 
+void satlink_rx_discard(satlink_rx_t *rx)
+{
+    if (rx != NULL) {
+        rx->len = 0;
+        rx->overrun = false;
+        rx->have_seq = false;
+    }
+}
+
 static void rx_deliver(satlink_rx_t *rx, satlink_rx_frame_cb cb, void *ctx)
 {
     uint8_t type = 0, seq = 0;
