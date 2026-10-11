@@ -152,7 +152,7 @@ int main(void) {
     // A reader that sees the host present must also see its caps: presence last.
     reset_case(); present_at_caps_store = true; receive_hello(1, 9, 0xfb);
     CHECK(!present_at_caps_store); CHECK(s_host_present); CHECK(s_host_caps == 0xfb);
-    // Reply and retry share the same rate limiter.
+    // Replies keep the strict gap: one a microsecond short of a second is refused.
     reset_case(); answer_hello(false); clock_us += 999999; answer_hello(false);
     CHECK(hellos == 1); clock_us++; answer_hello(false); CHECK(hellos == 2);
     printf("HELLO recovery: %d checks, %d failures\n", g_checks, g_failures);

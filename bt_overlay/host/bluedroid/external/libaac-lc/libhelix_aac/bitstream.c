@@ -41,6 +41,10 @@
  * February 2005
  *
  * bitstream.c - bitstream parsing functions
+ *
+ * Modified 2026-10-12 for modesp-bt-satellite, bounds checks against malformed
+ * frames: RefillBitstreamCache() treats a negative byte count as an empty
+ * buffer.
  **************************************************************************************/
 
 #include "bitstream.h"

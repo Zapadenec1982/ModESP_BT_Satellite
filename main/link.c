@@ -599,14 +599,14 @@ static void send_hello(void)
     tx_push(SATLINK_MSG_HELLO, payload, len);
 }
 
-/* The reply half of the greeting. Without it a peer that started first never
- * learns our version or our capabilities, and is right to refuse to bring the
- * link up: it would be guessing at what we can do. */
+/* Every HELLO this device sends goes through here. RX, startup and retry timer
+ * share one reservation (the time of the last HELLO), but not one gap: the
+ * reply and startup paths ask for the full LINK_HELLO_MIN_GAP_US, the retry
+ * timer for LINK_HELLO_RETRY_SLACK_US less. */
 static void reserve_hello(bool force, int64_t min_gap_us)
 {
     int64_t now = esp_timer_get_time();
-    // RX, startup and retry timer share one reservation; do not hold the lock
-    // while encoding, logging or queueing the message.
+    // Do not hold the lock while encoding, logging or queueing the message.
     portENTER_CRITICAL(&s_hello_mux);
     // `force`: our capabilities changed, and a host that keeps the old ones would be
     // driving a line we now drive too, or not driving one we now need.
@@ -619,6 +619,9 @@ static void reserve_hello(bool force, int64_t min_gap_us)
     send_hello();
 }
 
+/* The reply half of the greeting, also used for the startup HELLO. Without it a
+ * peer that started first never learns our version or our capabilities, and is
+ * right to refuse to bring the link up: it would be guessing at what we can do. */
 static void answer_hello(bool force)
 {
     reserve_hello(force, LINK_HELLO_MIN_GAP_US);

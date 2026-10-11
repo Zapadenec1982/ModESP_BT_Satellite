@@ -42,6 +42,13 @@
  *
  * noiseless.c - decode channel info, scalefactors, quantized coefficients, 
  *                 scalefactor band codebook, and TNS coefficients from bitstream
+ *
+ * Modified 2026-10-12 for modesp-bt-satellite, bounds checks against malformed
+ * frames: DecodeICSInfo() rejects max_sfb above the band count;
+ * DecodeSectionData() rejects a section past max_sfb or a bitstream that ran
+ * out; pulse data and TNS filter orders are bounds-checked; the gain-control
+ * parser is gone (gain control is SSR only, so the frame is rejected). All
+ * errors propagate to the caller.
  **************************************************************************************/
 
 #include "coder.h"

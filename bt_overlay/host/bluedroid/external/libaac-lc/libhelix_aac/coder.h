@@ -41,6 +41,9 @@
  * February 2005
  *
  * coder.h - definitions of platform-specific data structures, functions, and tables
+ *
+ * Modified 2026-10-12 for modesp-bt-satellite, bounds checks against malformed
+ * frames: DecodeICSInfo() returns an error code.
  **************************************************************************************/
 
 #ifndef _CODER_H

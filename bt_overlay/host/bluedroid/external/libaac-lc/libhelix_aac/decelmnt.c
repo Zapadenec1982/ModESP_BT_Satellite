@@ -41,6 +41,10 @@
  * February 2005
  *
  * decelmnt.c - syntactic element decoding
+ *
+ * Modified 2026-10-12 for modesp-bt-satellite, bounds checks against malformed
+ * frames: the CPE propagates a DecodeICSInfo() error, and the M/S mask loop no
+ * longer clears the byte past msMaskBits.
  **************************************************************************************/
 
 #include "coder.h"
