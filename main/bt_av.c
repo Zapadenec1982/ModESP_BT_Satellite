@@ -212,11 +212,12 @@ static atomic_bool s_cover_refresh;
 static atomic_bool s_cover_query;
 static atomic_uint s_cover_epoch;
 static uint32_t s_cover_nonce;
-/* Repeats of ONE image already served, bounded by COVER_RETRY_MAX. Zeroed by a real
- * track change and by a transfer that completed -- both are evidence that the next
- * image starts from a clean link. Atomic because the link task raises it and the
- * Bluetooth callback task clears it. */
-static atomic_uint s_cover_retries;
+/* Repeats of ONE image already served, bounded by COVER_RETRY_MAX (cover_stream.h).
+ * Refilled by a real track change and by a transfer that completed and that the host
+ * did not then ask for again. Under a lock because the link task raises it and the
+ * Bluetooth callback task refills it. */
+static cover_retry_t s_cover_retries;
+static portMUX_TYPE s_cover_retry_mux = portMUX_INITIALIZER_UNLOCKED;
 static atomic_uint s_latest_codec_epoch;
 static uint32_t s_codec_epoch;
 static fmt_barrier_t s_format;
@@ -461,12 +462,14 @@ void bt_av_cover_retry(uint32_t boot_nonce, uint32_t track_generation)
         track_generation != (uint32_t)atomic_load(&s_cover_epoch)) {
         return;     /* the phone has moved on; the next RESET brings its own image */
     }
-    if (atomic_load(&s_cover_retries) >= COVER_RETRY_MAX) {
+    portENTER_CRITICAL(&s_cover_retry_mux);
+    const bool take = cover_retry_take(&s_cover_retries, track_generation);
+    portEXIT_CRITICAL(&s_cover_retry_mux);
+    if (!take) {
         ESP_LOGW(TAG, "cover art: %u repeats already for generation %" PRIu32 ", not asking the phone again",
                  (unsigned)COVER_RETRY_MAX, track_generation);
         return;
     }
-    atomic_fetch_add(&s_cover_retries, 1);
     /* The same two flags a late HELLO raises. Re-reading the metadata rather than
      * only repeating the GET is deliberate: it refreshes the image handle too, so a
      * retry also recovers the case where the handle, and not the transfer, was the
@@ -768,9 +771,14 @@ static void cover_on_data(const esp_avrc_ct_cb_param_t *param)
                  s_now.art_stream.finished ? "queued" : "discarded",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
         s_now.art_done_generation = s_now.art_generation;
-        /* Whatever this image cost in repeats, it arrived: the next one starts with
-         * its full allowance. */
-        if (s_now.art_stream.finished) atomic_store(&s_cover_retries, 0);
+        /* Whatever this image cost in repeats, it was sent whole: the next one starts
+         * with its full allowance -- unless the host names this generation in a
+         * retry, which takes the refill back. */
+        if (s_now.art_stream.finished) {
+            portENTER_CRITICAL(&s_cover_retry_mux);
+            cover_retry_completed(&s_cover_retries, s_now.art_generation);
+            portEXIT_CRITICAL(&s_cover_retry_mux);
+        }
     }
     cover_reset();
     // Preserve the OBEX session and its image handles between tracks.
@@ -1181,7 +1189,9 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             /* A new track is a new image, and its allowance is its own. Only here,
              * not in cover_new_track(): a retry goes through that function too, and
              * refilling there would make the bound mean nothing. */
-            atomic_store(&s_cover_retries, 0);
+            portENTER_CRITICAL(&s_cover_retry_mux);
+            cover_retry_track_change(&s_cover_retries);
+            portEXIT_CRITICAL(&s_cover_retry_mux);
             cover_new_track();
             portENTER_CRITICAL(&s_meta_mux);
             s_now.title[0] = s_now.artist[0] = s_now.album[0] = 0;

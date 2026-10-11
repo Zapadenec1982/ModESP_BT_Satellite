@@ -107,8 +107,47 @@ static void refetch_tests(void) {
      * with nothing pending and no further attempt. */
     CHECK(!cover_refetch_on_close(false,false,true,true));
 }
+/* The device's COVER_RETRY bound, driven the way bt_av.c drives it: track change,
+ * COVER_END queued for a generation, and the host asking for the current one again. */
+static unsigned retry_chain(bool retry_before_end, unsigned cycles) {
+    cover_retry_t r; cover_retry_track_change(&r);
+    uint32_t gen=7; unsigned honoured=0;
+    for (unsigned i=0;i<cycles;++i,++gen) {
+        // Every image loses a part on the UART: the device sends it whole each time.
+        if (!retry_before_end) cover_retry_completed(&r,gen);
+        if (!cover_retry_take(&r,gen)) break;
+        ++honoured;
+        if (retry_before_end) cover_retry_completed(&r,gen);
+    }
+    return honoured;
+}
+static void retry_tests(void) {
+    // The host asks after COVER_END (CRC/length mismatch) or mid-stream (a gap).
+    CHECK(retry_chain(false,10)==COVER_RETRY_MAX);
+    CHECK(retry_chain(true,10)==COVER_RETRY_MAX);
+    cover_retry_t r; cover_retry_track_change(&r);
+    // The device itself aborted (no COVER_END): nothing refills.
+    CHECK(cover_retry_take(&r,1)); CHECK(cover_retry_take(&r,2)); CHECK(!cover_retry_take(&r,3));
+    // A real track change gives the next image its own allowance.
+    cover_retry_track_change(&r);
+    CHECK(cover_retry_take(&r,4));
+    /* That repeat arrived and the host never named it: a successful transfer. A later
+     * generation of the same track (a HELLO) that fails gets the full allowance. */
+    cover_retry_completed(&r,5);
+    cover_retry_completed(&r,6);
+    CHECK(cover_retry_take(&r,6));
+    cover_retry_completed(&r,7);
+    CHECK(cover_retry_take(&r,7));
+    cover_retry_completed(&r,8);
+    CHECK(!cover_retry_take(&r,8));
+    // Refused stays refused until the track changes.
+    CHECK(!cover_retry_take(&r,8));
+    cover_retry_track_change(&r);
+    cover_retry_completed(&r,9);
+    CHECK(cover_retry_take(&r,9));
+}
 int main(void) {
-    pacing_tests(); stream_tests(); refetch_tests();
+    pacing_tests(); stream_tests(); refetch_tests(); retry_tests();
     printf("Cover streaming/pacing: %d checks, %d failures\n",g_checks,g_failures);
     return g_failures?1:0;
 }
