@@ -6,6 +6,7 @@
 #include "endpoint_policy.h"
 #include "esp_heap_caps.h"
 #include "pair_policy.h"
+#include "pause_policy.h"
 #include "reconnect_policy.h"
 #include "satlink/cover_wire.h"
 
@@ -322,6 +323,15 @@ static esp_timer_handle_t s_pause_timer;
  * when the phone connects or goes. */
 static atomic_bool s_own_suspend;
 static void resume_own_suspend(const char *why);
+
+static void pause_timer_apply(pause_timer_op_t op)
+{
+    if (op == PAUSE_TIMER_START) {
+        esp_timer_start_once(s_pause_timer, PAUSE_GRACE_US);
+    } else if (op == PAUSE_TIMER_STOP) {
+        esp_timer_stop(s_pause_timer);  /* ESP_ERR_INVALID_STATE when none is pending */
+    }
+}
 
 static const char *conn_state_name(esp_a2d_connection_state_t state)
 {
@@ -864,6 +874,7 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
                  started ? "started" : "suspended", audio_out_dropped_bytes());
         audio_out_set_streaming(started);
         s_now.state = started ? SATLINK_BT_STREAMING : SATLINK_BT_CONNECTED;
+        pause_timer_apply(pause_on_stream(started));
         if (started) {
             atomic_store(&s_own_suspend, false);
         }
@@ -1182,6 +1193,9 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             s_now.play_state = play_state_from_avrc(param->change_ntf.event_parameter.playback);
             s_now.elapsed_at_us = esp_timer_get_time();
             send_track_pos();
+            /* A phone that plays again after the host's PAUSE was resumed by its user:
+             * suspending it when the wait runs out would leave it playing with no sound. */
+            pause_timer_apply(pause_on_play_status(s_now.play_state));
             /* Only a change, never a polled status: a phone that ignored the PAUSE answers
              * "playing" to every poll, and starting on that would undo the suspend at once. */
             if (s_now.play_state == SATLINK_PLAY_PLAYING) {
@@ -2014,12 +2028,13 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 /* ------------------------------------------------------------ host commands */
 
 /* Runs PAUSE_GRACE_US after a PAUSE or STOP from the host, unless another transport
- * command came first. s_now.state is written on the BT task; a stale read costs at most
+ * command, the phone's stream stopping or the phone reporting that it plays came first
+ * (pause_policy.h). s_now.state is written on the BT task; a stale read costs at most
  * one suspend of a stream that had just stopped, which the stack answers as a no-op. */
 static void pause_check(void *arg)
 {
     (void)arg;
-    if (s_now.state != SATLINK_BT_STREAMING) {
+    if (!pause_suspends(s_now.state)) {
         return;
     }
     esp_err_t err = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
@@ -2069,13 +2084,7 @@ void bt_av_transport(uint8_t cmd)
      * a pause still waiting to be checked. A repeated PAUSE does not restart the wait: the
      * host repeats it every 3 s while the phone keeps playing, which is shorter than the
      * wait, so restarting it would mean it never ran out. */
-    if (cmd == SATLINK_XPORT_PAUSE || cmd == SATLINK_XPORT_STOP) {
-        if (!esp_timer_is_active(s_pause_timer)) {
-            esp_timer_start_once(s_pause_timer, PAUSE_GRACE_US);
-        }
-    } else {
-        esp_timer_stop(s_pause_timer);
-    }
+    pause_timer_apply(pause_on_transport(cmd, esp_timer_is_active(s_pause_timer)));
     if (cmd == SATLINK_XPORT_PLAY) {
         resume_own_suspend("PLAY from the host");
     }
