@@ -625,7 +625,9 @@ static void poll_format(void)
     }
 }
 
-void bt_av_report_state(void)
+/* On the bt_av task only, which writes every field it reads: the link's task asks for
+ * one through bt_av_request_state(). */
+static void bt_av_report_state(void)
 {
     link_send_bt_state(s_now.state, s_now.codec, s_now.addr, s_now.name);
 }
@@ -1367,6 +1369,7 @@ typedef enum {
     CFG_AUTH,           /* ESP_BT_GAP_AUTH_CMPL_EVT */
     CFG_NAME,           /* ESP_BT_GAP_READ_REMOTE_NAME_EVT */
     CFG_UNBONDED,       /* ESP_BT_GAP_REMOVE_BOND_DEV_COMPLETE_EVT */
+    CFG_STATE,          /* BT_STATE after a host HELLO */
 } cfg_event_t;
 
 typedef struct {
@@ -1773,6 +1776,10 @@ static void cfg_handle(const cfg_msg_t *m, uint32_t now)
         }
         break;
 
+    case CFG_STATE:
+        bt_av_report_state();
+        break;
+
     case CFG_REFRESH:
         sync_bonds();
         send_bt_config();
@@ -1932,6 +1939,12 @@ void bt_av_host_hello(void)
 {
     cfg_msg_t m = { .type = CFG_HELLO };
     cfg_post(&m);
+}
+
+bool bt_av_request_state(void)
+{
+    cfg_msg_t m = { .type = CFG_STATE };
+    return cfg_post(&m);
 }
 
 void bt_av_bt_refresh(void)

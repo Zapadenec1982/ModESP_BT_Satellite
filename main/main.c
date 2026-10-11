@@ -67,14 +67,17 @@ static void on_hello(const satlink_hello_t *hello)
     expander_send_map();
 
 #if !CONFIG_SAT_LINK_ONLY
+    /* Built on the Bluetooth task, behind the BT_CONFIG and BOND_LIST queued above:
+     * this task reading the phone's name while that one writes it could send half of
+     * one name and half of another. The limit only counts a request that was queued. */
     static int64_t next_announce_us;
     int64_t now = esp_timer_get_time();
     if (now < next_announce_us) {
         return;
     }
-    next_announce_us = now + (10 * 1000 * 1000);
-
-    bt_av_report_state();
+    if (bt_av_request_state()) {
+        next_announce_us = now + (10 * 1000 * 1000);
+    }
 #endif
 }
 
