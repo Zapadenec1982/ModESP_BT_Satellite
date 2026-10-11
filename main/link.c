@@ -197,8 +197,10 @@ static portMUX_TYPE s_hello_mux = portMUX_INITIALIZER_UNLOCKED;
 static esp_timer_handle_t s_ping_timer;
 
 /* Guards the log bridge against feeding on itself: a failure inside a send would
- * otherwise log, which would send, which would fail. */
-static volatile bool     s_in_log_bridge;
+ * otherwise log, which would send, which would fail. Per task: the hook runs
+ * unlocked from every task on both cores, and a shared flag dropped another
+ * task's line whenever two logged at once. */
+static __thread bool     s_in_log_bridge;
 static vprintf_like_t    s_prev_vprintf;
 
 /* ------------------------------------------------------------------ outbound */
