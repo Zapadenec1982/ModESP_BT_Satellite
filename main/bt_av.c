@@ -974,10 +974,15 @@ static void a2d_data_cb(const uint8_t *buf, uint32_t len)
     audio_out_write(buf, len);
 }
 
+/* Cut on a character boundary: the phone's text is UTF-8, and a title cut through
+ * its last character went to the host as invalid UTF-8 in TRACK_META. */
 static void copy_attr(char *dst, size_t cap, const uint8_t *text, int len)
 {
     if (len < 0) { len = 0; }
     size_t n = ((size_t)len < cap - 1) ? (size_t)len : cap - 1;
+    if (n < (size_t)len) {
+        n = satlink_utf8_prefix((const char *)text, n);
+    }
     memcpy(dst, text, n);
     dst[n] = '\0';
 }

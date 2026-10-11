@@ -1,12 +1,14 @@
 /*
  * Device-side rules of PROTOCOL.md that live in main/ as pure C, walked without a
- * board: the port expander's GPIO_CFG handling.
+ * board: the port expander's GPIO_CFG handling, and LOG lines from the ESP log.
  */
 
 #include <stdio.h>
+#include <string.h>
 
 #include "harness.h"
 #include "expander_policy.h"
+#include "log_line.h"
 
 int g_checks, g_failures;
 
@@ -102,10 +104,71 @@ static void test_adc_period(void)
     CHECK_EQ(at[0], 0);
 }
 
+/* ----------------------------------------------------------------------- LOG */
+
+/* The bridge's two steps on a copy of `in`: level first, then the tidy text. */
+static uint8_t tidy(const char *in, char *out, size_t cap)
+{
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", in);
+    uint8_t level = log_line_level(buf);
+    snprintf(out, cap, "%s", log_line_tidy(buf));
+    return level;
+}
+
+static void test_log_level(void)
+{
+    char text[256];
+
+    /* IDF log v1, colours off, which is this build. */
+    CHECK_EQ(tidy("E (1234) sat.link: bad\n", text, sizeof text), SATLINK_LOG_ERROR);
+    CHECK(strcmp(text, "E (1234) sat.link: bad") == 0);
+    CHECK_EQ(tidy("W (1) t: w\n", text, sizeof text), SATLINK_LOG_WARN);
+    CHECK_EQ(tidy("I (1) t: i\n", text, sizeof text), SATLINK_LOG_INFO);
+    CHECK_EQ(tidy("D (1) t: d\n", text, sizeof text), SATLINK_LOG_DEBUG);
+    CHECK_EQ(tidy("V (1) t: v\n", text, sizeof text), SATLINK_LOG_DEBUG);   /* no word for it */
+
+    /* Colours on: the escape in front no longer hides the letter, and both
+     * escapes are gone from the text. */
+    CHECK_EQ(tidy("\033[0;31mE (5) BT_HCI: oops\033[0m\n", text, sizeof text), SATLINK_LOG_ERROR);
+    CHECK(strcmp(text, "E (5) BT_HCI: oops") == 0);
+    CHECK_EQ(tidy("\033[0;33mW (5) t: careful\033[0m\n", text, sizeof text), SATLINK_LOG_WARN);
+    CHECK(strcmp(text, "W (5) t: careful") == 0);
+    CHECK_EQ(tidy("\033[0;32mI (5) t: fine\033[0m\n", text, sizeof text), SATLINK_LOG_INFO);
+    CHECK(strcmp(text, "I (5) t: fine") == 0);
+
+    /* No letter: a bare esp_log_write. Info, as it always was. */
+    CHECK_EQ(tidy("plain text\n", text, sizeof text), SATLINK_LOG_INFO);
+    CHECK(strcmp(text, "plain text") == 0);
+    CHECK_EQ(tidy("Error without the shape\n", text, sizeof text), SATLINK_LOG_INFO);
+    CHECK_EQ(tidy("E", text, sizeof text), SATLINK_LOG_INFO);
+    CHECK_EQ(tidy("", text, sizeof text), SATLINK_LOG_INFO);
+    CHECK(strcmp(text, "") == 0);
+
+    /* A trailing 'm' that is not an escape stays. */
+    CHECK_EQ(tidy("I (1) t: 42 m\n", text, sizeof text), SATLINK_LOG_INFO);
+    CHECK(strcmp(text, "I (1) t: 42 m") == 0);
+    tidy("I (1) t: x[0m\n", text, sizeof text);
+    CHECK(strcmp(text, "I (1) t: x[0m") == 0);
+
+    /* The reset cut short by a full buffer is dropped with the rest of it. */
+    tidy("\033[0;31mE (5) t: long\033[0", text, sizeof text);
+    CHECK(strcmp(text, "E (5) t: long") == 0);
+    tidy("\033[0;31mE (5) t: long\033[", text, sizeof text);
+    CHECK(strcmp(text, "E (5) t: long") == 0);
+    tidy("\033[0;31mE (5) t: long\033", text, sizeof text);
+    CHECK(strcmp(text, "E (5) t: long") == 0);
+
+    /* Only newlines and escapes: nothing to send. */
+    tidy("\033[0m\r\n", text, sizeof text);
+    CHECK(strcmp(text, "") == 0);
+}
+
 int main(void)
 {
     test_legal_mode();
     test_adc_period();
+    test_log_level();
     printf("Device rules: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

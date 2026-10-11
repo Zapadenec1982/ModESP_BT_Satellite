@@ -1,4 +1,5 @@
 #include "link.h"
+#include "log_line.h"
 #include "satlink/cover_wire.h"
 
 #include <inttypes.h>
@@ -868,19 +869,21 @@ static int log_bridge(const char *fmt, va_list args)
     }
     s_in_log_bridge = true;
 
-    char line[200];
+    /* Exactly what LOG carries, so nothing is cut twice. */
+    char line[LINK_LOG_MAX + 1];
     int n = vsnprintf(line, sizeof(line), fmt, args);
     if (n > 0) {
-        /* Strip the trailing newline and the colour escape the console adds: the
-         * host wants text, not terminal control. */
-        size_t len = strnlen(line, sizeof(line));
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' ||
-                           line[len - 1] == 'm'  || line[len - 1] == '\033')) {
-            if (line[len - 1] == 'm' && (len < 2 || line[len - 2] != '[')) { break; }
-            line[--len] = '\0';
+        if ((size_t)n >= sizeof(line)) {
+            /* vsnprintf cuts by bytes. A character that lost its tail would reach
+             * the host as invalid UTF-8 in a field the protocol says is UTF-8. */
+            line[satlink_utf8_prefix(line, sizeof(line) - 1)] = '\0';
         }
-        if (len > 0) {
-            link_send_log(SATLINK_LOG_INFO, line);
+        /* The level was always 2, whatever the line said. The letter IDF puts in
+         * front of it is the only place the level survives to this hook. */
+        const uint8_t level = log_line_level(line);
+        const char *text = log_line_tidy(line);
+        if (text[0] != '\0') {
+            link_send_log(level, text);
         }
     }
 
