@@ -166,6 +166,12 @@ static volatile uint32_t  s_fill_max;
  * person to widen either number should not have to check. */
 static volatile uint64_t  s_fill_sum;
 static volatile uint32_t  s_fill_n;
+/* Guards the window counters above (dry, fill min/max/sum/n): the writer updates
+ * them once per chunk and the report task reads and resets them. Not s_lock: the
+ * writer holds that across every DMA write, and in slave mode, waiting on the host's
+ * clock, it is almost never free -- a try-take failed every report for a whole
+ * session (11.10.2026), so the window was never shown. */
+static portMUX_TYPE       s_window_lock = portMUX_INITIALIZER_UNLOCKED;
 static atomic_bool        s_streaming;   /* an empty ring only matters while playing */
 static volatile uint32_t  s_peak;
 /*
@@ -625,7 +631,7 @@ static void audio_report(void)
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
                  s_slave ? "asrc" : "clock", s_servo_ppm, s_servo_delta_hz);
     } else {
-        ESP_LOGI(TAG, "stats snapshot skipped: writer busy; ring/peak window retained");
+        ESP_LOGI(TAG, "stats snapshot skipped: output not started");
     }
     /* These lifetime counters must remain visible while the writer owns s_lock.
      * Timestamp their acquisition, not the earlier report scheduling check. */
@@ -1039,9 +1045,11 @@ static void audio_out_task(void *arg)
                     audio_asrc_reset(&s_asrc);
                 }
                 rebuffer = true;
+                portENTER_CRITICAL(&s_window_lock);
                 s_ring_dry++;
                 s_fill_min = 0;
                 s_fill_n++;
+                portEXIT_CRITICAL(&s_window_lock);
                 audio_servo_sample(0);
             }
             /* Keep servicing DMA at its own pace; no sleep/refeed loop and no
@@ -1094,10 +1102,12 @@ static void audio_out_task(void *arg)
         /* Sampled after the read, so it is what was left behind. */
         size_t free_bytes = xRingbufferGetCurFreeSize(s_ring);
         uint32_t fill = (uint32_t)(AUDIO_RING_BYTES - free_bytes);
+        portENTER_CRITICAL(&s_window_lock);
         if (fill < s_fill_min) { s_fill_min = fill; }
         if (fill > s_fill_max) { s_fill_max = fill; }
         s_fill_sum += fill;
         s_fill_n++;
+        portEXIT_CRITICAL(&s_window_lock);
         audio_servo_sample(s_slave ? slave_buffered(fill) : fill);
 
         if (len != 0) {
@@ -1579,16 +1589,25 @@ void audio_out_set_streaming(bool streaming)
 
 bool audio_out_get_stats(audio_out_stats_t *out)
 {
-    if (out == NULL || s_lock == NULL || xSemaphoreTake(s_lock, 0) != pdTRUE) {
+    if (out == NULL || s_lock == NULL) {
         return false;
     }
     out->dropped_bytes = s_dropped;
-    out->ring_dry      = s_ring_dry;
     out->dma_starved   = s_dma_starved;
+    /* The window counters restart; dma_starved does not, because zero is the only
+     * good value it has and a running total is what anyone would check. */
+    portENTER_CRITICAL(&s_window_lock);
+    out->ring_dry      = s_ring_dry;
     out->fill_min      = (s_fill_min == UINT32_MAX) ? 0 : s_fill_min;
     out->fill_max      = s_fill_max;
     const uint32_t n   = s_fill_n;
     out->fill_avg      = n ? (uint32_t)(s_fill_sum / n) : 0;
+    s_ring_dry = 0;
+    s_fill_min = UINT32_MAX;
+    s_fill_max = 0;
+    s_fill_sum = 0;
+    s_fill_n   = 0;
+    portEXIT_CRITICAL(&s_window_lock);
     portENTER_CRITICAL(&s_peak_lock);
     out->peak      = s_peak;
     out->wire_peak = s_wire_peak;
@@ -1596,13 +1615,5 @@ bool audio_out_get_stats(audio_out_stats_t *out)
     s_peak      = 0;
     s_wire_peak = 0;
     portEXIT_CRITICAL(&s_peak_lock);
-    /* The window counters restart; dma_starved does not, because zero is the only
-     * good value it has and a running total is what anyone would check. */
-    s_ring_dry = 0;
-    s_fill_min = UINT32_MAX;
-    s_fill_max = 0;
-    s_fill_sum = 0;
-    s_fill_n   = 0;
-    xSemaphoreGive(s_lock);
     return true;
 }
