@@ -55,6 +55,12 @@ WS і DOUT лежать поруч у лівому ряду гребінки, BC
 наводив на WS хибні фронти (перенесено 04.10.2026). Пара UART лежить разом у правому ряду; 17 і 16
 — ще й IOMUX-піни UART2, тож 460800 бод не йдуть через матрицю GPIO.
 
+Та сама прошивка має другу конфігурацію — для **голого модуля**: лінк переїжджає на UART0, TX 1 і
+RX 3, саме ту пару, яку слухає ROM-завантажувач, тож хост і прошиває пристрій, і говорить з ним по
+одних двох дротах (EN та IO0 теж веде хост). Консоль там вимкнена. Це вибір у Kconfig
+(`SAT_LINK_PORT`), який робить збірка з `sdkconfig.bare`; див. [`docs/DEVICE_SPEC.md`](docs/DEVICE_SPEC.md),
+«Голий модуль».
+
 Процесор працює на 240 МГц: на 160 декодер aptX не встигав.
 
 ## Збірка
@@ -87,17 +93,17 @@ idf.py build
 `components/bt` генерується і в git не потрапляє; `tools/setup.sh --clean` (`-Clean` на Windows)
 будує його наново. Прошивка й логи на стенді — **COM13**. COM12 — це хост, а не ця плата.
 
-Для налагодження є три накладні конфігурації, кожна — файл `sdkconfig.*`, який називають у
-командному рядку:
+Інші збірки — це накладки, кожна — файл `sdkconfig.*`, який називають у командному рядку:
 
 | Накладка | Що збирає |
 |---|---|
+| `sdkconfig.bare` | голий модуль: лінк на UART0 (GPIO1/3), консоль вимкнена |
 | `sdkconfig.linkonly` | лише лінк: HELLO, порожній GPIO_MAP, PING/PONG, LOG |
 | `sdkconfig.loopback` | повну прошивку з UART, замкнутим сам на себе всередині чипа |
 | `sdkconfig.clockprobe` | вимірює такт I2S на самій платі й пише його в лог |
 
 ```bash
-idf.py -B build_loopback -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.loopback" build
+idf.py -B build_bare -D SDKCONFIG=build_bare/sdkconfig -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.bare" build
 ```
 
 ## Тести
