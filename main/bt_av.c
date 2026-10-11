@@ -260,6 +260,7 @@ static struct {
     uint32_t elapsed_ms;
     uint32_t total_ms;
     int64_t  elapsed_at_us;         /* when elapsed_ms was true, for interpolation */
+    bool     elapsed_unknown;       /* the phone gave no position: send 0, never count up */
 
     char     title[128];
     char     artist[128];
@@ -623,7 +624,8 @@ static void meta_settle_restart(void)
 static void send_track_pos(void)
 {
     uint32_t elapsed = s_now.elapsed_ms;
-    if (s_now.play_state == SATLINK_PLAY_PLAYING && s_now.elapsed_at_us != 0) {
+    if (s_now.play_state == SATLINK_PLAY_PLAYING && s_now.elapsed_at_us != 0
+        && !s_now.elapsed_unknown) {
         int64_t since_ms = (esp_timer_get_time() - s_now.elapsed_at_us) / 1000;
         if (since_ms > 0) {
             elapsed += (uint32_t)since_ms;
@@ -1088,7 +1090,8 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
 
     case ESP_AVRC_CT_PLAY_STATUS_RSP_EVT:
         s_now.total_ms      = satlink_sanitize_total_ms((int64_t)param->play_status_rsp.song_length);
-        s_now.elapsed_ms    = param->play_status_rsp.song_position;
+        s_now.elapsed_unknown = !satlink_elapsed_known(param->play_status_rsp.song_position);
+        s_now.elapsed_ms    = satlink_sanitize_elapsed_ms(param->play_status_rsp.song_position);
         s_now.elapsed_at_us = esp_timer_get_time();
         s_now.play_state    = play_state_from_avrc(param->play_status_rsp.play_status);
         send_track_pos();
@@ -1124,7 +1127,8 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             break;
 
         case ESP_AVRC_RN_PLAY_POS_CHANGED:
-            s_now.elapsed_ms = param->change_ntf.event_parameter.play_pos;
+            s_now.elapsed_unknown = !satlink_elapsed_known(param->change_ntf.event_parameter.play_pos);
+            s_now.elapsed_ms = satlink_sanitize_elapsed_ms(param->change_ntf.event_parameter.play_pos);
             s_now.elapsed_at_us = esp_timer_get_time();
             send_track_pos();
             esp_avrc_ct_send_register_notification_cmd(TL_PLAY_POS,

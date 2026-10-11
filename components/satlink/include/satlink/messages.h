@@ -108,6 +108,12 @@ bool   satlink_dec_track_pos(const uint8_t *buf, size_t len, satlink_track_pos_t
  * negative or longer than a day becomes 0, meaning unknown. */
 uint32_t satlink_sanitize_total_ms(int64_t reported_ms);
 
+/* AVRCP reports an unknown position as 0xFFFFFFFF (not supported, or no track
+ * selected), and Android's -1 arrives the same way. Past the same one-day bound
+ * the position is unknown: it goes out as 0 and must not be interpolated. */
+bool     satlink_elapsed_known(uint32_t reported_ms);
+uint32_t satlink_sanitize_elapsed_ms(uint32_t reported_ms);
+
 /* ------------------------------------------------------------- 0x13 STREAM_FMT */
 
 typedef struct {

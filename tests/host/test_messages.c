@@ -175,6 +175,23 @@ static void test_sanitize_total_ms(void)
     CHECK_EQ(satlink_sanitize_total_ms(0x7FFFFFFFFFFFLL), 0);
 }
 
+static void test_sanitize_elapsed_ms(void)
+{
+    /* AVRCP's "not supported" / "no track selected", and Android's -1. */
+    CHECK_EQ(satlink_sanitize_elapsed_ms(0xFFFFFFFFu), 0);
+    CHECK(!satlink_elapsed_known(0xFFFFFFFFu));
+    CHECK_EQ(satlink_sanitize_elapsed_ms(0x80000000u), 0);
+    CHECK(!satlink_elapsed_known(0x80000000u));
+    CHECK_EQ(satlink_sanitize_elapsed_ms(86400001u), 0);
+    CHECK(!satlink_elapsed_known(86400001u));
+    CHECK_EQ(satlink_sanitize_elapsed_ms(86400000u), 86400000);
+    CHECK(satlink_elapsed_known(86400000u));
+    CHECK_EQ(satlink_sanitize_elapsed_ms(286000u), 286000);
+    CHECK(satlink_elapsed_known(286000u));
+    CHECK_EQ(satlink_sanitize_elapsed_ms(0u), 0);
+    CHECK(satlink_elapsed_known(0u));
+}
+
 static void test_msg_stream_fmt(void)
 {
     satlink_stream_fmt_t in = { .rate_hz = 44100, .bits = 16, .channels = 2 };
@@ -817,6 +834,7 @@ const test_case_t message_tests[] = {
     { "track meta",            test_msg_track_meta },
     { "track pos",             test_msg_track_pos },
     { "sanitize total_ms",     test_sanitize_total_ms },
+    { "sanitize elapsed_ms",   test_sanitize_elapsed_ms },
     { "stream fmt",            test_msg_stream_fmt },
     { "cover",                 test_msg_cover },
     { "volume state",          test_msg_volume_state },
