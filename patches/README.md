@@ -48,6 +48,14 @@ then copy `bt_overlay/`. `tools/setup.ps1 -Clean` reproduces the local ignored
   stack bytes as SET_CONFIGURATION and decoder setup. The search now skips a SEP
   that does not build and tries the next; with none, getconfig fails and BTA
   takes its existing next-stream / GETCAP_FAIL path.
+- `0010-strict-sink-set-configuration.patch`: 0001 validated an incoming
+  SET_CONFIGURATION with `A2DP_IsPeerSourceCodecSupported`, the discovery check,
+  which parses capability masks and only asks that they intersect the sink's. A
+  config naming 44.1|48 kHz passed a 44.1-only offer and the application, testing
+  48 first, took it for 48 kHz. The sink branch of `bta_av_co_audio_setconfig` now
+  calls `A2DP_IsSinkCodecSupported`, which, as stock's `A2D_ParsSbcInfo(..., FALSE)`
+  did, wants one value per field, each offered: SBC, AAC, aptX, aptX HD and LHDC V5
+  (whose separate check from 0003 it replaces). Discovery keeps the liberal check.
 
 Patch paths are relative to `components/bt`; setup uses
 `git apply --directory=components/bt` and stops on a rejected hunk.

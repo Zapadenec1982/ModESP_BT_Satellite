@@ -161,4 +161,8 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Reconnecting as initiator must skip a source SEP that builds no config, not send garbage.
 & $Python (Join-Path $repoRoot 'tools\run_sink_getconfig_tests.py') --cc $Cc
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# SET_CONFIGURATION must name one value per field, not pass a 44.1|48 mask for 48 kHz.
+& $Python (Join-Path $repoRoot 'tools\run_sink_setconfig_tests.py') --cc $Cc
 exit $LASTEXITCODE

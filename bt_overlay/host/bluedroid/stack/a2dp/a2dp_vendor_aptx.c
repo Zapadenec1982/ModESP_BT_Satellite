@@ -184,6 +184,14 @@ tA2D_STATUS A2DP_IsVendorPeerSourceCodecValidAptx(const uint8_t* p_codec_info) {
   return A2D_SUCCESS;
 }
 
+tA2D_STATUS A2DP_IsVendorSinkCodecSupportedAptx(const uint8_t* p_codec_info) {
+  /* A SET_CONFIGURATION, not a capability: one rate and one channel mode, both
+   * among those this device offers. The check above parses liberally for
+   * discovery, so a 44.1|48 config would intersect a 44.1-only offer. */
+  return A2DP_CodecInfoMatchesCapabilityAptx(&a2dp_aptx_sink_caps, p_codec_info,
+                                             false);
+}
+
 bool A2DP_IsVendorPeerSinkCodecValidAptx(const uint8_t* p_codec_info) {
   tA2DP_APTX_CIE cfg_cie;
 

@@ -104,11 +104,14 @@ bool A2DP_IsPeerSinkCodecValid(const uint8_t* p_codec_info);
 **
 ** Function         A2DP_IsSinkCodecSupported
 **
-** Description      Checks whether an A2DP Sink codec is supported.
+** Description      Checks whether an A2DP Sink codec is supported: the SET_CONFIGURATION
+**                  check. |p_codec_info| must name exactly one value per field, each
+**                  offered by this sink; capability masks are rejected.
 **
-**                      p_codec_info:  Contains information about the codec capabilities.
+**                      p_codec_info:  Contains information about the codec configuration.
 **
-** Returns         Returns true if the A2DP Sink codec is supported, otherwise false.
+** Returns         A2D_SUCCESS if the configuration is acceptable, otherwise the
+**                 corresponding A2DP error status code.
 **
 ******************************************************************************/
 tA2D_STATUS A2DP_IsSinkCodecSupported(const uint8_t* p_codec_info);

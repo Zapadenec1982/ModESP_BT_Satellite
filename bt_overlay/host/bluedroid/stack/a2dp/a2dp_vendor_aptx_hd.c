@@ -205,6 +205,13 @@ tA2D_STATUS A2DP_IsVendorPeerSourceCodecValidAptxHd(const uint8_t* p_codec_info)
   return A2D_SUCCESS;
 }
 
+tA2D_STATUS A2DP_IsVendorSinkCodecSupportedAptxHd(const uint8_t* p_codec_info) {
+  /* A SET_CONFIGURATION, not a capability: one rate and one channel mode, both
+   * among those this device offers. */
+  return A2DP_CodecInfoMatchesCapabilityAptxHd(&a2dp_aptx_hd_sink_caps,
+                                               p_codec_info, false);
+}
+
 bool A2DP_IsVendorPeerSinkCodecValidAptxHd(const uint8_t* p_codec_info) {
   tA2DP_APTX_HD_CIE cfg_cie;
 

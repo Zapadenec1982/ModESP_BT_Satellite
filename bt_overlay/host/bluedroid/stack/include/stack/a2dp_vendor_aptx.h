@@ -124,6 +124,21 @@ tA2D_STATUS A2DP_IsVendorPeerSourceCodecValidAptx(const uint8_t* p_codec_info);
 
 /******************************************************************************
 **
+** Function         A2DP_IsVendorSinkCodecSupportedAptx
+**
+** Description      Checks a SET_CONFIGURATION from a peer aptX Source strictly: exactly one
+**                  sample rate and one channel mode, both offered by this sink.
+**
+**                      p_codec_info:  the codec configuration chosen by the peer.
+**
+** Returns          A2D_SUCCESS if the configuration is acceptable, otherwise the
+**                  corresponding A2DP error status code.
+**
+******************************************************************************/
+tA2D_STATUS A2DP_IsVendorSinkCodecSupportedAptx(const uint8_t* p_codec_info);
+
+/******************************************************************************
+**
 ** Function         A2DP_IsVendorPeerSinkCodecValidAptx
 **
 ** Description      Checks whether the codec capabilities contain a valid peer A2DP aptX Sink

@@ -93,3 +93,5 @@ fi
 "$python" "$repo/tools/run_sbc_tests.py" --cc "$cc"
 # Reconnecting as initiator must skip a source SEP that builds no config, not send garbage.
 "$python" "$repo/tools/run_sink_getconfig_tests.py" --cc "$cc"
+# SET_CONFIGURATION must name one value per field, not pass a 44.1|48 mask for 48 kHz.
+"$python" "$repo/tools/run_sink_setconfig_tests.py" --cc "$cc"
