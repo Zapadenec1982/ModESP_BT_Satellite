@@ -9,71 +9,10 @@ generates it; SBC, AAC, aptX, aptX HD and LHDC V5 are compiled whole. Pass
 import argparse
 import os
 from pathlib import Path
-import re
 import subprocess
+from a2dp_host_stubs import definition, write_stubs
 
 ROOT = Path(__file__).resolve().parents[1]
-
-STUBS = {
-    'common/bt_defs.h': '''#pragma once
-#include <stdint.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <sys/types.h>
-#define TRUE 1
-#define FALSE 0
-typedef uint8_t UINT8; typedef uint16_t UINT16; typedef uint32_t UINT32;
-typedef int8_t INT8; typedef int16_t INT16; typedef int32_t INT32;
-typedef bool BOOLEAN;
-typedef UINT8 BD_ADDR[6];
-typedef int bt_status_t;
-typedef struct { UINT16 event, len, offset, layer_specific; } BT_HDR;
-#define UNUSED(x) ((void)(x))
-#define A2D_INCLUDED TRUE
-#define SBC_DEC_INCLUDED TRUE
-#define APTX_DEC_INCLUDED TRUE
-#define AAC_DEC_INCLUDED TRUE
-#define LHDCV5_DEC_INCLUDED TRUE
-#define AVDT_CODEC_TYPE_INDEX 2
-#define AVDT_CODEC_SIZE 30
-#define AVDT_PROTECT_SIZE 90
-#include "common/bt_trace.h"
-''',
-    # a2dp_vendor_aptx.c reaches a2d_api.h before bt_target.h, so the switches
-    # live here, where every header sees them.
-    'common/bt_target.h': '#pragma once\n#include "common/bt_defs.h"\n',
-    'common/bt_trace.h': '''#pragma once
-#define APPL_TRACE_ERROR(...) ((void)0)
-#define APPL_TRACE_WARNING(...) ((void)0)
-#define APPL_TRACE_DEBUG(...) ((void)0)
-#define APPL_TRACE_EVENT(...) ((void)0)
-#define APPL_TRACE_API(...) ((void)0)
-#define LOG_ERROR(...) ((void)0)
-#define LOG_WARN(...) ((void)0)
-#define LOG_INFO(...) ((void)0)
-#define LOG_VERBOSE(...) ((void)0)
-''',
-    'stack/bt_types.h': '#pragma once\n#include "common/bt_defs.h"\n',
-    'stack/sdp_api.h': '#pragma once\ntypedef struct { int unused; } tSDP_DISCOVERY_DB;\n',
-    'a2d_int.h': '#pragma once\n#include "stack/a2d_api.h"\n',
-    'esp_log.h': '#pragma once\n',
-    'osi/future.h': '#pragma once\n',
-}
-
-def definition(text, signature):
-    """The body of the function whose definition (not prototype) starts with signature."""
-    for m in re.finditer(re.escape(signature), text):
-        close = text.index(")", m.end())
-        rest = text[close + 1:].lstrip()
-        if not rest.startswith("{"):
-            continue
-        brace = text.index("{", close)
-        depth, end = 1, brace + 1
-        while depth:
-            depth += (text[end] == "{") - (text[end] == "}")
-            end += 1
-        return text[m.start():end]
-    raise ValueError("no definition of " + signature)
 
 def licence_of(text):
     """The leading comment, to keep the upstream licence on extracted source."""
@@ -86,10 +25,12 @@ def main():
     args = parser.parse_args()
     out = ROOT / 'build/host/sink_setconfig'
     out.mkdir(parents=True, exist_ok=True)
-    for name, content in STUBS.items():
-        p = out / 'stub' / name
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content)
+    # a2dp_vendor_aptx.c reaches a2d_api.h before bt_target.h, so the switches
+    # live in bt_defs.h, where every header sees them.
+    write_stubs(out / 'stub', defs={
+        'A2D_INCLUDED': 'TRUE', 'SBC_DEC_INCLUDED': 'TRUE', 'APTX_DEC_INCLUDED': 'TRUE',
+        'AAC_DEC_INCLUDED': 'TRUE', 'LHDCV5_DEC_INCLUDED': 'TRUE',
+        'AVDT_CODEC_TYPE_INDEX': '2', 'AVDT_CODEC_SIZE': '30', 'AVDT_PROTECT_SIZE': '90'})
     bd = args.bt_root / 'host/bluedroid'
     a2dp = bd / 'btc/profile/std/a2dp'
     stack = bd / 'stack/a2dp'
