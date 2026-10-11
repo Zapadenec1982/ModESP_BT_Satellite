@@ -5,6 +5,7 @@
 #include "common/bt_trace.h"
 #include "stack/a2dp_vendor_aptx.h"
 #include "stack/a2dp_vendor_aptx_hd.h"
+#include "stack/a2dp_vendor_aptx_ll.h"
 #include "stack/a2dp_vendor_aptx_decoder.h"
 #include "stack/a2dp_decoder.h"
 #include "freertos/FreeRTOS.h"
@@ -230,6 +231,15 @@ void a2dp_aptx_decoder_configure(const uint8_t* p_codec_info) {
                                        FALSE);
     }
     if (status != A2D_SUCCESS) {
+        /* aptX Low Latency is plain aptX on the air: same octet for rate and
+         * channels, no RTP header, decoded with the standard context. Only its
+         * information element differs, by one octet of flags. */
+        tA2DP_APTX_LL_CIE ll = {0};
+        status = A2DP_ParseInfoAptxLl(&ll, p_codec_info, FALSE);
+        cie.sampleRate = ll.sampleRate;
+        cie.channelMode = ll.channelMode;
+    }
+    if (status != A2D_SUCCESS) {
         LOG_ERROR("%s: failed to parse codec info. 0x%x", __func__, status);
         return;
     }
@@ -257,7 +267,8 @@ void a2dp_aptx_decoder_configure(const uint8_t* p_codec_info) {
      * and which context libfreeaptx is initialised with. Getting it wrong is
      * not subtly wrong, it is silence. */
     APPL_TRACE_WARNING("%s: %s, codec index %d, %lu Hz, %s", __func__,
-                       a2dp_aptx_decoder_cb.aptx_type == APTX_HD ? "aptX HD" : "aptX",
+                       a2dp_aptx_decoder_cb.aptx_type == APTX_HD ? "aptX HD" :
+                       index == BTAV_A2DP_CODEC_INDEX_SINK_APTX_LL ? "aptX LL" : "aptX",
                        (int)index, sr,
                        cie.channelMode == A2DP_APTX_CHANNELS_MONO ? "mono" : "stereo");
 
