@@ -1547,6 +1547,7 @@ static void carry_out(const pair_out_t *out)
 
 static void cfg_phone_connected(const uint8_t addr[6])
 {
+    s_now.name[0] = '\0';                   /* whatever was here named another phone */
     rc_stop(&s_reconnect);                  /* a phone is here: nobody else is called */
     sync_bonds();
     int i = bond_index(&s_bonds, addr);
@@ -1554,9 +1555,7 @@ static void cfg_phone_connected(const uint8_t addr[6])
         bond_touch(&s_bonds, addr);
         s_bonds_dirty = true;
         if (s_bonds.e[i].name[0] != '\0') {
-            if (s_now.name[0] == '\0') {
-                memcpy(s_now.name, s_bonds.e[i].name, sizeof(s_bonds.e[i].name));
-            }
+            memcpy(s_now.name, s_bonds.e[i].name, sizeof(s_bonds.e[i].name));
         } else {
             /* A bond from before 1.8, or one whose name never came: ask the phone. */
             esp_bt_gap_read_remote_name((uint8_t *)addr);
@@ -1728,6 +1727,10 @@ static void cfg_handle(const cfg_msg_t *m, uint32_t now)
         carry_out(&out);
         if (m->ok) {
             send_bond_list();
+            if (m->name_len != 0 && bond_names_attached(s_now.state, s_now.addr, m->addr)) {
+                memcpy(s_now.name, m->name, (size_t)m->name_len + 1);
+            }
+            bt_av_report_state();
         }
         break;
 
@@ -1740,8 +1743,7 @@ static void cfg_handle(const cfg_msg_t *m, uint32_t now)
             s_bonds_dirty = true;
             send_bond_list();
         }
-        if (s_now.state >= SATLINK_BT_CONNECTED && memcmp(s_now.addr, m->addr, 6) == 0 &&
-            s_now.name[0] == '\0') {
+        if (bond_names_attached(s_now.state, s_now.addr, m->addr) && s_now.name[0] == '\0') {
             memcpy(s_now.name, m->name, (size_t)m->name_len + 1);
             bt_av_report_state();
         }
@@ -1865,10 +1867,8 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     switch (event) {
     case ESP_BT_GAP_AUTH_CMPL_EVT:
         if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
+            /* The name reaches BT_STATE from CFG_AUTH, on the bt_av task, clipped. */
             ESP_LOGI(TAG, "paired with %s", param->auth_cmpl.device_name);
-            strncpy(s_now.name, (const char *)param->auth_cmpl.device_name, sizeof(s_now.name) - 1);
-            s_now.name[sizeof(s_now.name) - 1] = '\0';
-            bt_av_report_state();
         } else {
             ESP_LOGE(TAG, "pairing failed, status %d", param->auth_cmpl.stat);
         }
