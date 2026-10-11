@@ -157,4 +157,8 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # The SBC sink offers stereo only and still decodes a mono stream to both channels.
 & $Python (Join-Path $repoRoot 'tools\run_sbc_tests.py') --cc $Cc
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# Reconnecting as initiator must skip a source SEP that builds no config, not send garbage.
+& $Python (Join-Path $repoRoot 'tools\run_sink_getconfig_tests.py') --cc $Cc
 exit $LASTEXITCODE

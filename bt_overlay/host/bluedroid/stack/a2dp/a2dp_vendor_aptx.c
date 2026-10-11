@@ -173,6 +173,14 @@ tA2D_STATUS A2DP_IsVendorPeerSourceCodecValidAptx(const uint8_t* p_codec_info) {
     return A2D_NS_SAMP_FREQ;
   }
 
+  /* Stereo only (DEVICE_SPEC.md). Without this a mono-only source passed here
+   * and then built no configuration in A2DP_VendorBuildCodecConfigAptx. */
+  if ((cfg_cie.channelMode & a2dp_aptx_sink_caps.channelMode) == 0) {
+    APPL_TRACE_WARNING("%s: channel mode 0x%x is not one of the 0x%x this device offers",
+                       __func__, cfg_cie.channelMode, a2dp_aptx_sink_caps.channelMode);
+    return A2D_NS_CH_MODE;
+  }
+
   return A2D_SUCCESS;
 }
 
@@ -314,10 +322,9 @@ bool A2DP_VendorBuildCodecConfigAptx(UINT8 *p_src_cap, UINT8 *p_result) {
     return false;
   }
 
+  /* Stereo only: the sink capability offers nothing else (DEVICE_SPEC.md). */
   if (src_cap.channelMode & A2DP_APTX_CHANNELS_STEREO) {
     pref_cap.channelMode = A2DP_APTX_CHANNELS_STEREO;
-  } else if (src_cap.channelMode & A2DP_APTX_CHANNELS_STEREO) {
-    pref_cap.channelMode = A2DP_APTX_CHANNELS_MONO;
   } else {
     APPL_TRACE_ERROR("%s: Unsupported channel mode 0x%x", __func__,
                      src_cap.channelMode);

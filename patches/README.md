@@ -41,6 +41,13 @@ then copy `bt_overlay/`. `tools/setup.ps1 -Clean` reproduces the local ignored
   DMA. The per-packet warnings for sequence gaps, a full codec queue and low-memory
   drops become calls to weak application hooks (`sat_audio_decode_begin`/`_end`,
   `sat_audio_encoded_event`), which `main/audio_out.c` counts and reports.
+- `0009-sink-getconfig-fail-when-no-config-builds.patch`: 0001 dropped stock's
+  SBC pre-fill of the preferred config and ignored a failed build, so when this
+  device initiates (reconnect) and the chosen source SEP passes the support check
+  but builds no config (SBC min_bitpool above 53), getconfig sent uninitialised
+  stack bytes as SET_CONFIGURATION and decoder setup. The search now skips a SEP
+  that does not build and tries the next; with none, getconfig fails and BTA
+  takes its existing next-stream / GETCAP_FAIL path.
 
 Patch paths are relative to `components/bt`; setup uses
 `git apply --directory=components/bt` and stops on a rejected hunk.

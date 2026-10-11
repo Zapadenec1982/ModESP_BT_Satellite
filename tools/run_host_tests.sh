@@ -91,3 +91,5 @@ fi
 "$python" "$repo/tools/run_aac_tests.py" --cc "$cc"
 # The SBC sink offers stereo only and still decodes a mono stream to both channels.
 "$python" "$repo/tools/run_sbc_tests.py" --cc "$cc"
+# Reconnecting as initiator must skip a source SEP that builds no config, not send garbage.
+"$python" "$repo/tools/run_sink_getconfig_tests.py" --cc "$cc"
