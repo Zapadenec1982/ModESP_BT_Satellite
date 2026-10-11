@@ -851,6 +851,65 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
     }
 }
 
+/* One read's worth of bytes, into the reassembler and the counters. */
+static void rx_feed_chunk(const uint8_t *chunk, size_t n)
+{
+    if (s_stats.rx_bytes == 0) {
+        /* The first byte ever. Worth its own line: it is the difference
+         * between a wire that is not connected and a peer that is not
+         * understood. */
+        ESP_LOGI(TAG, "something is transmitting on GPIO%d", BOARD_LINK_RX_GPIO);
+    }
+    s_stats.rx_bytes += (uint32_t)n;
+
+    satlink_rx_feed(&s_rx, chunk, n, on_frame, NULL);
+    s_stats.rx_seq_gaps = s_rx.seq_gaps;
+    /* Its own field. This one used to be rx_bad, and assigning it here
+     * erased every payload that on_frame had just counted as bad. */
+    s_stats.rx_bad_frames = s_rx.err_cobs + s_rx.err_crc + s_rx.err_runt + s_rx.err_too_long;
+}
+
+/*
+ * Whatever is still buffered once no event is waiting to claim it.
+ *
+ * The driver can hold bytes that no event announces: it pushes them into the
+ * ring before it posts the event, and when the event queue is full it drops the
+ * event and keeps the bytes; the xQueueReset after an overrun flush can erase
+ * one as well. Reading only what each event announces would then leave the
+ * newest bytes of every later burst behind -- the tail of each host frame, its
+ * delimiter included, waiting for the next PING -- until the next overrun.
+ *
+ * It stops as soon as an event is queued, so an overrun still being reported
+ * gets to flush the bytes after its hole instead of having them joined to the
+ * bytes before it. A data event whose bytes were taken here reads nothing.
+ */
+static void rx_drain_residue(uint8_t *chunk, size_t cap)
+{
+    while (uxQueueMessagesWaiting(s_uart_events) == 0) {
+        int n = uart_read_bytes(BOARD_LINK_UART_NUM, chunk, cap, 0);
+        if (n <= 0) {
+            break;
+        }
+        rx_feed_chunk(chunk, (size_t)n);
+    }
+}
+
+/* One UART_DATA event. Its size is a hint, not a count of what is buffered. */
+static void rx_data_event(size_t announced, uint8_t *chunk, size_t cap)
+{
+    size_t remaining = announced;
+    while (remaining > 0) {
+        size_t want = (remaining < cap) ? remaining : cap;
+        int n = uart_read_bytes(BOARD_LINK_UART_NUM, chunk, want, 0);
+        if (n <= 0) {
+            break;
+        }
+        remaining -= (size_t)n;
+        rx_feed_chunk(chunk, (size_t)n);
+    }
+    rx_drain_residue(chunk, cap);
+}
+
 /*
  * Driven by the driver's event queue rather than by polling.
  *
@@ -876,32 +935,9 @@ static void link_rx_task(void *arg)
         }
 
         switch (event.type) {
-        case UART_DATA: {
-            size_t remaining = event.size;
-            while (remaining > 0) {
-                size_t want = (remaining < sizeof(chunk)) ? remaining : sizeof(chunk);
-                int n = uart_read_bytes(BOARD_LINK_UART_NUM, chunk, want, 0);
-                if (n <= 0) {
-                    break;
-                }
-                remaining -= (size_t)n;
-
-                if (s_stats.rx_bytes == 0) {
-                    /* The first byte ever. Worth its own line: it is the
-                     * difference between a wire that is not connected and a peer
-                     * that is not understood. */
-                    ESP_LOGI(TAG, "something is transmitting on GPIO%d", BOARD_LINK_RX_GPIO);
-                }
-                s_stats.rx_bytes += (uint32_t)n;
-
-                satlink_rx_feed(&s_rx, chunk, (size_t)n, on_frame, NULL);
-                s_stats.rx_seq_gaps = s_rx.seq_gaps;
-                /* Its own field. This one used to be rx_bad, and assigning it here
-                 * erased every payload that on_frame had just counted as bad. */
-                s_stats.rx_bad_frames = s_rx.err_cobs + s_rx.err_crc + s_rx.err_runt + s_rx.err_too_long;
-            }
+        case UART_DATA:
+            rx_data_event(event.size, chunk, sizeof(chunk));
             break;
-        }
 
         case UART_FIFO_OVF:
         case UART_BUFFER_FULL:
@@ -914,6 +950,10 @@ static void link_rx_task(void *arg)
             uart_flush_input(BOARD_LINK_UART_NUM);
             xQueueReset(s_uart_events);
             satlink_rx_discard(&s_rx);
+            /* Bytes that landed between the flush and the reset lost their
+             * event with it. They came after the hole, so they are fine to
+             * keep. */
+            rx_drain_residue(chunk, sizeof(chunk));
             /* Its own counter. This used to increment rx_bad, which the next data
              * event overwrote from the reassembler's totals -- so the one number
              * that said "we were too slow" was reliably erased by the one that

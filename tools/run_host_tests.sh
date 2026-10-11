@@ -79,6 +79,8 @@ fi
 "$python" "$repo/tools/run_bta_reopen_tests.py" --cc "$cc"
 # A live PING/PONG link must recover a dropped startup capability greeting.
 "$python" "$repo/tools/run_hello_tests.py" --cc "$cc"
+# A UART event that announces fewer bytes than are buffered must not strand the rest.
+"$python" "$repo/tools/run_link_rx_tests.py" --cc "$cc"
 # Cover streaming must survive queue refusals and cancel delayed OBEX pulls.
 "$python" "$repo/tools/run_cover_tests.py" --cc "$cc"
 "$python" "$repo/tools/run_audio_tests.py" --cc "$cc"

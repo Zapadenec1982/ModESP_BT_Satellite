@@ -131,6 +131,10 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $Python (Join-Path $repoRoot 'tools\run_hello_tests.py') --cc $Cc
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+# A UART event that announces fewer bytes than are buffered must not strand the rest.
+& $Python (Join-Path $repoRoot 'tools\run_link_rx_tests.py') --cc $Cc
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 # Cover buffering must survive fragmented heaps and cancel delayed OBEX pulls.
 & $Python (Join-Path $repoRoot 'tools\run_cover_tests.py') --cc $Cc
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
