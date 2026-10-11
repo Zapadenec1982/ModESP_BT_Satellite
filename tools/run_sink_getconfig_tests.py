@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile the generated sink-initiator getconfig with the real SBC and aptX code on a host.
+"""Compile the generated sink-initiator getconfig with the real SBC, aptX and aptX HD code on a host.
 
 The peer table types come from btc_av_co.h and the three functions from bta_av_co.c,
 both in components/bt as tools/setup.sh generates it. Pass --bt-root to try another tree.
@@ -101,7 +101,8 @@ def main():
 
     oi = bd / 'external/sbc/decoder'
     sources = [bd / 'stack/a2dp' / name for name in
-               ('a2d_sbc.c', 'a2d_sbc_decoder.c', 'a2dp_rtp.c', 'a2dp_vendor_aptx.c')]
+               ('a2d_sbc.c', 'a2d_sbc_decoder.c', 'a2dp_rtp.c', 'a2dp_vendor_aptx.c',
+                'a2dp_vendor_aptx_hd.c')]
     sources += sorted((oi / 'srce').glob('*.c'))
     sources += [ROOT / 'tests/host/test_sink_getconfig.c']
     env = dict(os.environ)
