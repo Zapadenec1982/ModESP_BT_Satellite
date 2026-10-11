@@ -78,6 +78,12 @@ static uint16_t s_adc_countdown[SATLINK_GPIO_MAX];
 static adc_oneshot_unit_handle_t s_adc[2];
 static adc_cali_handle_t s_cali[2];             /* NULL: no calibration, linear mv */
 
+/* What expander_init found wrong with the ADC units. It runs before link_start
+ * installs the LOG bridge and nothing before that is kept, so it only records;
+ * expander_start, after the bridge, is the one that says so. */
+static bool s_adc_unit_failed[2];
+static bool s_adc_cali_missing[2];
+
 /* Everything above is shared between the link's RX task (GPIO_CFG, GPIO_OUT,
  * ADC_READ) and the poller, on either core. A mutex rather than a critical
  * section, because GPIO, the ADC and the link are called with it held. It also
@@ -235,7 +241,7 @@ static void adc_sample_and_send(uint8_t index)
     }
     /* PROTOCOL.md 11 promises millivolts calibrated on the device. Without a
      * calibration scheme, the nominal 12 bits over roughly 3.1 V at this
-     * attenuation; expander_init has said so in LOG. */
+     * attenuation; expander_start has said so in LOG. */
     int mv = -1;
     if (s_cali[pin->adc_unit] == NULL ||
         adc_cali_raw_to_voltage(s_cali[pin->adc_unit], raw, &mv) != ESP_OK || mv < 0) {
@@ -351,7 +357,7 @@ esp_err_t expander_init(void)
         }
         adc_oneshot_unit_init_cfg_t cfg = { .unit_id = (adc_unit_t)unit };
         if (adc_oneshot_new_unit(&cfg, &s_adc[unit]) != ESP_OK) {
-            ESP_LOGE(TAG, "ADC unit %d would not start", unit + 1);
+            s_adc_unit_failed[unit] = true;
             s_adc[unit] = NULL;
             continue;
         }
@@ -366,7 +372,7 @@ esp_err_t expander_init(void)
             .default_vref = 1100,
         };
         if (adc_cali_create_scheme_line_fitting(&cali, &s_cali[unit]) != ESP_OK) {
-            ESP_LOGW(TAG, "ADC unit %d: no calibration; mv will be a linear estimate", unit + 1);
+            s_adc_cali_missing[unit] = true;
             s_cali[unit] = NULL;
         }
     }
@@ -379,6 +385,15 @@ esp_err_t expander_start(void)
      * empty map is the answer to "what have you got", not the absence of one.
      * Every host HELLO gets it again, from main.c. */
     expander_send_map();
+
+    /* expander_init's findings, now that LOG is there to carry them. */
+    for (int unit = 0; unit < 2; unit++) {
+        if (s_adc_unit_failed[unit]) {
+            ESP_LOGE(TAG, "ADC unit %d would not start", unit + 1);
+        } else if (s_adc_cali_missing[unit]) {
+            ESP_LOGW(TAG, "ADC unit %d: no calibration; mv will be a linear estimate", unit + 1);
+        }
+    }
 
     if (EXP_PIN_COUNT == 0) {
         ESP_LOGI(TAG, "no lines offered yet; GPIO_MAP sent empty, poller not started");
