@@ -149,7 +149,7 @@ static const char *TAG = "sat.bt";
  * 48 KB store-and-forward path that served protocol 1.5 hosts took that heap in
  * 1000-byte pieces, in competition with the decoder, and the bench showed
  * `ring full` bursts right after every "cover art ... queued" on it while the
- * 1.6 streaming path showed none (docs/BT_COVER_2026-09-20.md). The 1.6 path
+ * 1.6 streaming path showed none (bench, 20.09.2026). The 1.6 path
  * copies each OBEX chunk straight into one bounded UART frame and keeps nothing.
  * A host that speaks less than 1.6 therefore gets no cover at all: a missing
  * image is a blank tile, a starved decoder is a click.

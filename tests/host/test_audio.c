@@ -34,6 +34,8 @@ static atomic_uint s_frames_per_packet_q4;
 static uint32_t s_writer_gate, s_writer_epoch;
 static int64_t s_decode_start_us;
 static atomic_uint s_decode_last_us, s_pcm_drop_us, s_tx_error_us;
+static atomic_uint s_tx_events, s_tx_noclock, s_tx_noclock_us;
+static bool s_slave;
 static int s_decoder_task, task_id=1, s_producer_lock=1, s_ring, s_tx;
 static bool s_dma_primed, s_streaming, s_running=true, s_tx_recover;
 static unsigned s_slot_bits=32, s_src_bits=32;
@@ -41,7 +43,7 @@ static uint32_t now_ms;
 static uint8_t sent_data[65536];
 static size_t sent_len, ring_fill, ring_capacity=24576;
 static unsigned sends, cancel_on_send, drain_per_wait, tx_limit, tx_fail;
-static bool tx_zero, gate_on_send;
+static bool tx_zero, gate_on_send, tx_clock;
 static unsigned refill_change, refill_receives, refill_returns, refill_delay_ms;
 static size_t refill_bytes;
 static bool refill_borrowed;
@@ -88,6 +90,7 @@ static int i2s_channel_write(int tx,const void *p,size_t n,size_t *written,unsig
     size_t count=tx_zero ? 0 : (tx_limit && n>tx_limit ? tx_limit:n);
     memcpy(sent_data+sent_len,p,count);sent_len+=count;*written=count;
     now_ms+=count<n ? timeout:1;
+    if(tx_clock)s_tx_events++;   /* a descriptor finished: BCLK is running */
     after_send();return tx_fail ? ESP_FAIL : (count<n ? ESP_ERR_TIMEOUT:ESP_OK);
 }
 static void audio_ring_put(const void *,size_t);
@@ -131,6 +134,7 @@ static void reset(void) {
     memset(&s_events,0,sizeof s_events);
     s_gate=2;s_play_epoch=0;s_writer_gate=2;s_writer_epoch=0;
     s_running=true;s_streaming=true;s_tx_recover=false;s_short_writes=0;s_tx_errors=0;
+    s_slave=false;tx_clock=false;s_tx_events=0;s_tx_noclock=0;s_tx_noclock_us=0;
     s_tx_cancelled_bytes=0;s_pcm_cancelled_frames=0;s_dropped_frames=0;s_dropped=0;
     now_ms=0;sends=0;cancel_on_send=0;sent_len=0;ring_fill=0;
     drain_per_wait=0;tx_limit=0;tx_fail=0;tx_zero=false;gate_on_send=false;task_id=1;
@@ -142,21 +146,34 @@ static void reset(void) {
 int main(void) {
     uint8_t data[3840];for(size_t i=0;i<sizeof data;i++)data[i]=(uint8_t)(i*71);
     reset();tx_limit=137; /* deliberately non-frame-aligned accepted prefix */
-    i2s_write_locked(data,1024);
+    i2s_write_locked(data,1024,false);
     assert(sent_len==1024 && !memcmp(sent_data,data,1024));
     assert(s_short_writes==7 && !s_tx_errors && !s_tx_cancelled_bytes);
     reset();tx_zero=true;
-    i2s_write_locked(data,1024);
+    i2s_write_locked(data,1024,false);
     assert(now_ms==100 && s_tx_recover && s_tx_errors==1 && s_tx_cancelled_bytes==1024);
     reset();tx_limit=256;cancel_on_send=1;gate_on_send=true;
-    i2s_write_locked(data,1024);
+    i2s_write_locked(data,1024,false);
     assert(sent_len==256 && !s_tx_recover && s_tx_cancelled_bytes==768);
     reset();tx_limit=137;cancel_on_send=1;
-    i2s_write_locked(data,1024);
+    i2s_write_locked(data,1024,false);
     assert(sent_len==137 && s_tx_recover && s_tx_cancelled_bytes==887);
     reset();tx_fail=1;tx_limit=256;
-    i2s_write_locked(data,1024);
+    i2s_write_locked(data,1024,false);
     assert(sent_len==256 && s_tx_recover && s_tx_cancelled_bytes==768);
+    /* A slave with no BCLK: no descriptor finishes, so it is no clock, not a fault.
+     * Silence is left alone; PCM is still invalidated so none plays late. */
+    reset();s_slave=true;tx_zero=true;
+    i2s_write_locked(data,1024,true);
+    assert(now_ms==100 && s_tx_noclock==1 && s_tx_noclock_us==100000 && !s_tx_errors);
+    assert(!s_tx_recover && s_play_epoch==0 && s_tx_cancelled_bytes==1024);
+    reset();s_slave=true;tx_zero=true;
+    i2s_write_locked(data,1024,false);
+    assert(s_tx_noclock==1 && !s_tx_errors && s_tx_recover && s_play_epoch==1);
+    /* The same timeout while descriptors do finish is a real fault, slave or not. */
+    reset();s_slave=true;tx_zero=true;tx_clock=true;
+    i2s_write_locked(data,1024,true);
+    assert(s_tx_errors==1 && !s_tx_noclock && s_tx_recover && s_play_epoch==1);
     reset();ring_fill=ring_capacity;cancel_on_send=1;
     audio_out_write(data,sizeof data);
     assert(now_ms==10 && sent_len==0 && s_pcm_cancelled_frames==480 && !s_dropped);

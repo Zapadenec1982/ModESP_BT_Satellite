@@ -8,7 +8,7 @@ code came from and under what terms; it draws no legal conclusion.
 - Imported: `decoder/`, the component `CMakeLists.txt` and `README.md`, byte for
   byte. Not imported: the bundled IDF tree, applications, the proprietary encoder,
   binaries, the LDAC decoder. The A2DP glue was adapted into `bt_overlay/`
-  (`docs/LHDC_V5_2026-09-19.md`).
+  (`docs/DEVICE_SPEC.md`, section "LHDC V5").
 
 ## Licence: what the upstream repository actually contains
 
