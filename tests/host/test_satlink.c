@@ -424,6 +424,48 @@ static void test_rx_seq_gaps(void)
     CHECK_EQ(rx.seq_gaps, 2);       /* and the wrap at 255 -> 0 is not a gap */
 }
 
+static void test_rx_discard_keeps_counters(void)
+{
+    /* What the link does after the UART driver threw bytes away: the half frame
+     * goes, the totals stay. Resetting them made the error count run backwards. */
+    capture_t cap = {0};
+    satlink_rx_t rx;
+    satlink_rx_init(&rx);
+
+    const uint8_t garbage[] = { 0x41, 0x42, SATLINK_DELIMITER };
+    satlink_rx_feed(&rx, garbage, sizeof(garbage), on_frame, &cap);
+    const uint32_t errors = rx.err_cobs + rx.err_crc + rx.err_runt + rx.err_too_long;
+    CHECK_EQ(errors, 1);
+
+    const uint8_t body[] = { 7 };
+    uint8_t wire[SATLINK_WIRE_MAX];
+    size_t wire_len = 0;
+    CHECK(satlink_frame_encode(SATLINK_MSG_PING, 10, body, 1, wire, sizeof(wire), &wire_len));
+    satlink_rx_feed(&rx, wire, wire_len, on_frame, &cap);
+    CHECK(satlink_frame_encode(SATLINK_MSG_PING, 12, body, 1, wire, sizeof(wire), &wire_len));
+    satlink_rx_feed(&rx, wire, wire_len, on_frame, &cap);
+    CHECK_EQ(rx.seq_gaps, 1);
+
+    /* Half of the next frame arrives, then the overrun. */
+    CHECK(satlink_frame_encode(SATLINK_MSG_PING, 20, body, 1, wire, sizeof(wire), &wire_len));
+    satlink_rx_feed(&rx, wire, wire_len / 2, on_frame, &cap);
+    satlink_rx_discard(&rx);
+
+    CHECK_EQ(rx.len, 0);
+    CHECK_EQ(rx.frames_ok, 2);
+    CHECK_EQ(rx.err_cobs + rx.err_crc + rx.err_runt + rx.err_too_long, errors);
+    CHECK_EQ(rx.seq_gaps, 1);
+
+    /* The frames lost to the overrun are not counted as gaps on the wire. */
+    CHECK(satlink_frame_encode(SATLINK_MSG_PING, 30, body, 1, wire, sizeof(wire), &wire_len));
+    uint8_t delim = SATLINK_DELIMITER;
+    satlink_rx_feed(&rx, &delim, 1, on_frame, &cap);
+    satlink_rx_feed(&rx, wire, wire_len, on_frame, &cap);
+    CHECK_EQ(cap.calls, 3);
+    CHECK_EQ(cap.seq, 30);
+    CHECK_EQ(rx.seq_gaps, 1);
+}
+
 /* -------------------------------------------------------------------- codec */
 
 static void test_codec(void)
@@ -525,6 +567,7 @@ const test_case_t frame_tests[] = {
     { "rx shared delimiter",    test_rx_shared_delimiter },
     { "rx oversize keeps sync", test_rx_oversize_keeps_sync },
     { "rx seq gaps",            test_rx_seq_gaps },
+    { "rx discard keeps counters", test_rx_discard_keeps_counters },
     { "codec",                  test_codec },
     { "hello roundtrip",        test_hello_roundtrip },
 };

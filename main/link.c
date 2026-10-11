@@ -758,7 +758,9 @@ static void link_rx_task(void *arg)
 
                 satlink_rx_feed(&s_rx, chunk, (size_t)n, on_frame, NULL);
                 s_stats.rx_seq_gaps = s_rx.seq_gaps;
-                s_stats.rx_bad = s_rx.err_cobs + s_rx.err_crc + s_rx.err_runt + s_rx.err_too_long;
+                /* Its own field. This one used to be rx_bad, and assigning it here
+                 * erased every payload that on_frame had just counted as bad. */
+                s_stats.rx_bad_frames = s_rx.err_cobs + s_rx.err_crc + s_rx.err_runt + s_rx.err_too_long;
             }
             break;
         }
@@ -773,7 +775,7 @@ static void link_rx_task(void *arg)
                      event.type == UART_FIFO_OVF ? "hardware fifo" : "ring buffer");
             uart_flush_input(BOARD_LINK_UART_NUM);
             xQueueReset(s_uart_events);
-            satlink_rx_init(&s_rx);
+            satlink_rx_discard(&s_rx);
             /* Its own counter. This used to increment rx_bad, which the next data
              * event overwrote from the reassembler's totals -- so the one number
              * that said "we were too slow" was reliably erased by the one that
@@ -808,11 +810,13 @@ static void report_stats(void)
 
     ESP_LOGI(TAG, "tx %" PRIu32 " (dropped %" PRIu32 "/%" PRIu32 ", hello %" PRIu32 "), "
                   "rx %" PRIu32 " bytes %" PRIu32 " frames "
-                  "(bad %" PRIu32 ", gaps %" PRIu32 ", unknown %" PRIu32 ", overrun %" PRIu32
+                  "(bad frames %" PRIu32 ", bad payloads %" PRIu32 ", gaps %" PRIu32
+                  ", unknown %" PRIu32 ", overrun %" PRIu32
                   ", own hello %" PRIu32 "), pings unanswered %" PRIu32,
              s_stats.tx_frames, s_stats.tx_dropped_bulk, s_stats.tx_dropped_critical,
              s_stats.hello_sent,
-             s_stats.rx_bytes, s_stats.rx_frames, s_stats.rx_bad, s_stats.rx_seq_gaps,
+             s_stats.rx_bytes, s_stats.rx_frames, s_stats.rx_bad_frames, s_stats.rx_bad,
+             s_stats.rx_seq_gaps,
              s_stats.rx_unknown, s_stats.rx_overruns, s_stats.rx_echoes, s_stats.pings_unanswered);
     if (s_host_present) {
         ESP_LOGI(TAG, "round trip %" PRIu32 " ms", s_stats.rtt_ms);
