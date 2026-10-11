@@ -30,6 +30,27 @@
  * announces is applied per format transaction and needs no re-registration. */
 #define EP_DECIDING_CAPS   (SATLINK_HOST_CAP_RELOCK | SATLINK_HOST_CAP_96KHZ)
 
+/*
+ * Whether the host can follow a stream at this rate, from the same bits the
+ * endpoints are decided from: 48 kHz needs RELOCK, 96 kHz needs 96KHZ (which the
+ * HELLO normalisation already clears without RELOCK). Endpoints change only
+ * between connections, so a host that greets mid-stream can find the phone at a
+ * rate offered to its predecessor. Such a stream stays gated and unannounced,
+ * PROTOCOL.md 6.5 for 96 kHz and by the same reasoning for 48 kHz, until a host
+ * that can follow it greets or the phone reconnects to endpoints decided for this
+ * one. Other rates are never offered and are left to the caller.
+ */
+static inline bool ep_host_can_follow(uint32_t rate_hz, uint32_t host_caps)
+{
+    if (rate_hz == 48000) {
+        return (host_caps & SATLINK_HOST_CAP_RELOCK) != 0;
+    }
+    if (rate_hz == 96000) {
+        return (host_caps & SATLINK_HOST_CAP_96KHZ) != 0;
+    }
+    return true;
+}
+
 /* How long a refused deinit or init is left alone before the next attempt. */
 #define EP_RETRY_MS        5000u
 
