@@ -1,0 +1,11 @@
+# The bare module: flashed and spoken to by the host on one UART, whatever the host is.
+#
+#   idf.py -B build_bare -D SDKCONFIG=build_bare/sdkconfig -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.bare" build
+#
+# The link moves to UART0 (GPIO1/3), the pair the ROM bootloader listens on, so the host can
+# reflash this device over the same wires. Nothing else may talk there: the console is off,
+# and so is the second-stage bootloader's log. The ROM's own boot text still appears at
+# 115200 on every reset; the link's COBS framing and CRC discard it (or tie GPIO15 low).
+CONFIG_SAT_LINK_UART0=y
+CONFIG_ESP_CONSOLE_NONE=y
+CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y

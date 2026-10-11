@@ -1,5 +1,25 @@
 menu "Satellite"
 
+choice SAT_LINK_PORT
+    prompt "UART that carries the link to the host"
+    default SAT_LINK_UART2
+    help
+        UART2 on GPIO17 (TX) and GPIO16 (RX) is the DevKitC configuration. UART0 on
+        that board belongs to the USB bridge, which flashes it and shows its console.
+
+        UART0 on GPIO1 (TX) and GPIO3 (RX) is the bare-module configuration. The
+        host reaches the ROM bootloader over the same two wires, so it flashes this
+        device and talks to it on one pair. Nothing else may speak on UART0 then:
+        build with sdkconfig.bare, which turns the console off.
+
+config SAT_LINK_UART2
+    bool "UART2, GPIO17/16 (DevKitC)"
+
+config SAT_LINK_UART0
+    bool "UART0, GPIO1/3 (bare module, flashed by the host)"
+
+endchoice
+
 config SAT_LINK_LOOPBACK
     bool "Loop the control link back on itself"
     default n
