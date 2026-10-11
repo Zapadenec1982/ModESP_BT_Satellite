@@ -1,14 +1,15 @@
 /*
  * Device-side rules of PROTOCOL.md that live in main/ as pure C, walked without a
  * board: the port expander's GPIO_CFG handling, LOG lines from the ESP log, what
- * the link lets through for a host with another proto_major, and the slots that
- * hold the messages which must not be lost.
+ * the link lets through for a host with another proto_major, the slots that
+ * hold the messages which must not be lost, and the range of VOLUME_STATE.
  */
 
 #include <stdio.h>
 #include <string.h>
 
 #include "harness.h"
+#include "avrc_volume.h"
 #include "expander_policy.h"
 #include "link_policy.h"
 #include "log_line.h"
@@ -195,6 +196,24 @@ static void test_incompatible_host(void)
     /* And what the cover stream sends. */
     CHECK(!link_incompatible_allows(0x18));      /* COVER_DATA */
     CHECK(!link_incompatible_allows(0x19));      /* COVER_END */
+}
+
+/* -------------------------------------------------------------------- volume */
+
+static void test_abs_volume(void)
+{
+    /* PROTOCOL.md 7: VOLUME_STATE carries 0..127. AVRCP's bit 7 is reserved, and
+     * the controller path of the stack passes it through. */
+    for (unsigned raw = 0; raw <= 0xFF; raw++) {
+        CHECK(avrc_abs_volume((uint8_t)raw) <= 127);
+    }
+    CHECK_EQ(avrc_abs_volume(0x00), 0x00);
+    CHECK_EQ(avrc_abs_volume(0x40), 0x40);
+    CHECK_EQ(avrc_abs_volume(0x7F), 0x7F);
+    /* Masked like the stack's own target parser, not clamped. */
+    CHECK_EQ(avrc_abs_volume(0x80), 0x00);
+    CHECK_EQ(avrc_abs_volume(0xC0), 0x40);
+    CHECK_EQ(avrc_abs_volume(0xFF), 0x7F);
 }
 
 /* ---------------------------------------------------------------- tx slots */
@@ -417,6 +436,7 @@ int main(void)
     test_adc_period();
     test_log_level();
     test_incompatible_host();
+    test_abs_volume();
     test_slots_replace_in_order();
     test_slots_never_lose_the_latest();
     test_slots_merge_gpio_in();

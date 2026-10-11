@@ -1,4 +1,5 @@
 #include "bt_av.h"
+#include "avrc_volume.h"
 #include "bond_table.h"
 #include "bt_settings.h"
 #include "cover_stream.h"
@@ -1134,7 +1135,7 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         case ESP_AVRC_RN_VOLUME_CHANGE:
             /* This is the hole the host pointed out: the phone moved the slider,
              * and without VOLUME_STATE nobody downstream would ever know. */
-            s_now.volume = param->change_ntf.event_parameter.volume;
+            s_now.volume = avrc_abs_volume(param->change_ntf.event_parameter.volume);
             ESP_LOGI(TAG, "volume %u, set on the phone", s_now.volume);
             link_send_volume_state(s_now.volume, 1);
             esp_avrc_ct_send_register_notification_cmd(TL_VOLUME, ESP_AVRC_RN_VOLUME_CHANGE, 0);
@@ -1163,7 +1164,7 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         break;
 
     case ESP_AVRC_CT_SET_ABSOLUTE_VOLUME_RSP_EVT:
-        s_now.volume = param->set_volume_rsp.volume;
+        s_now.volume = avrc_abs_volume(param->set_volume_rsp.volume);
         ESP_LOGI(TAG, "volume %u, set from the host", s_now.volume);
         link_send_volume_state(s_now.volume, 0);
         break;
@@ -1209,7 +1210,7 @@ static void avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *par
         break;
 
     case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:
-        s_now.volume = param->set_abs_vol.volume;
+        s_now.volume = avrc_abs_volume(param->set_abs_vol.volume);
         ESP_LOGI(TAG, "volume %u, set on the phone", s_now.volume);
         /* Source 1: the peer moved it. The host scales; we do not. */
         link_send_volume_state(s_now.volume, 1);
