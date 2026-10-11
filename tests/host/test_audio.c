@@ -58,8 +58,16 @@ static uint8_t refill_data[1024];
 static int64_t esp_timer_get_time(void) {return (int64_t)now_ms*1000;}
 static int xTaskGetCurrentTaskHandle(void) {return task_id;}
 static unsigned uxTaskGetStackHighWaterMark(void *p) {(void)p;return 1000;}
-static int xSemaphoreTake(void *s, unsigned t) {(void)t;return s ? pdTRUE : 0;}
-static void xSemaphoreGive(void *s) {(void)s;}
+/* s_lock handoff: what a control caller had announced when it took a lock, and the
+ * writer's sleeps after a give, the waiter getting in on the n-th one. */
+static atomic_uint s_ctrl_waiting;
+static unsigned lock_gives, waiting_at_take, writer_sleeps, waiter_in_after;
+static int xSemaphoreTake(void *s, unsigned t) {(void)t;waiting_at_take=s_ctrl_waiting;return s ? pdTRUE : 0;}
+static void xSemaphoreGive(void *s) {(void)s;lock_gives++;}
+static void vTaskDelay(unsigned ticks) {
+    assert(ticks==1 && lock_gives && s_ctrl_waiting); /* asleep off the lock, for a waiter */
+    if(++writer_sleeps==waiter_in_after)atomic_fetch_sub(&s_ctrl_waiting,1);
+}
 static void *xRingbufferReceiveUpTo(int ring,size_t *len,TickType_t ticks,size_t limit) {
     (void)ring;
     assert(ticks==1 && limit==1024 && !refill_borrowed);
@@ -222,6 +230,15 @@ int main(void) {
     assert(!sent_len && s_pcm_cancelled_frames==64); /* the packet in flight is dropped */
     sat_audio_decode_begin(1);audio_out_write(data,512);sat_audio_decode_end();
     assert(!sent_len); /* and so is the next, until bt_av starts a new transaction */
+    assert(waiting_at_take==1 && !s_ctrl_waiting); /* it took s_lock as a control caller */
+    /* The writer gives s_lock and takes it straight back; a lower-priority control
+     * caller only woken by the give would lose that race. With nobody waiting the
+     * writer goes on at once; with a waiter it stays off the lock until it got in. */
+    reset();lock_gives=0;writer_sleeps=0;s_ctrl_waiting=0;
+    writer_unlock();assert(lock_gives==1 && !writer_sleeps);
+    s_ctrl_waiting=1;waiter_in_after=3;
+    writer_unlock();assert(lock_gives==2 && writer_sleeps==3 && !s_ctrl_waiting);
+    ctrl_take_lock();assert(waiting_at_take==1 && !s_ctrl_waiting);
     /* Burst pacing across multiple packets: no extra ring memory or PCM loss. */
     reset();drain_per_wait=3840;
     for(unsigned i=0;i<16;i++) {sat_audio_decode_begin(16-i);audio_out_write(data,sizeof data);}
@@ -321,6 +338,6 @@ int main(void) {
     assert(refill.status==AUDIO_REFILL_CANCELLED && !refill_receives);
     reset();refill_change=3;refill=audio_wait_refill(2,0);
     assert(refill.status==AUDIO_REFILL_CANCELLED && !refill_returns && !s_wait_timeout);
-    puts("satellite audio: 18 transfer/generation/pacing/worker + 8 telemetry + 13 refill adapter scenarios PASS");
+    puts("satellite audio: 18 transfer/generation/pacing/worker + 2 lock handoff + 8 telemetry + 13 refill adapter scenarios PASS");
     return 0;
 }

@@ -72,6 +72,8 @@ static i2s_chan_handle_t  s_tx;
 static RingbufHandle_t    s_ring;
 static SemaphoreHandle_t  s_lock;       /* guards the channel against retune-while-writing */
 static SemaphoreHandle_t  s_producer_lock;
+/* Control callers blocked on s_lock, see ctrl_take_lock(). */
+static atomic_uint       s_ctrl_waiting;
 static atomic_uint       s_gate = 1; /* bit 0 closed; upper bits invalidate old resumes */
 static bool              s_running;
 static bool              s_slave = true;   /* protocol 1.9, see i2s_open() */
@@ -938,6 +940,29 @@ static size_t audio_tone_fill(uint8_t *buf, size_t cap)
 }
 #endif /* AUDIO_TEST_TONE_HZ */
 
+/*
+ * The writer gives s_lock at the end of a pass and takes it again a few dozen
+ * instructions later. A mutex give hands nothing over: it only readies the waiter,
+ * which must win the take again. bt_av sits below the writer and is woken on the
+ * other core, so in that race it loses nearly every time and a format transaction
+ * could wait for as long as no interrupt happened to land in the gap. So control
+ * callers announce themselves, and the writer stays off the lock until they have
+ * had it. They wait in a format transaction or a role change, with the gate closed,
+ * so the writer has only zeros to give and DMA plays zeros on its own meanwhile. */
+static void ctrl_take_lock(void)
+{
+    atomic_fetch_add(&s_ctrl_waiting, 1u);
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    atomic_fetch_sub(&s_ctrl_waiting, 1u);
+}
+
+/* Writer task: the end of every pass. */
+static void writer_unlock(void)
+{
+    xSemaphoreGive(s_lock);
+    while (atomic_load(&s_ctrl_waiting)) vTaskDelay(1);
+}
+
 static void audio_out_task(void *arg)
 {
     (void)arg;
@@ -980,7 +1005,7 @@ static void audio_out_task(void *arg)
             /* Never invert the control task's lock order by waiting here. */
             if (xSemaphoreTake(s_producer_lock, 0) != pdTRUE) {
                 if (s_running) i2s_write_silence_locked(silence, sizeof silence);
-                xSemaphoreGive(s_lock);
+                writer_unlock();
                 continue;
             }
             flush_ring();
@@ -1028,7 +1053,7 @@ static void audio_out_task(void *arg)
                 if (refill.status == AUDIO_REFILL_CANCELLED) {
                     /* The helper already returned any item it borrowed. Go
                      * through generation/stream handling before touching PCM. */
-                    xSemaphoreGive(s_lock);
+                    writer_unlock();
                     continue;
                 }
                 item = refill.item;
@@ -1055,7 +1080,7 @@ static void audio_out_task(void *arg)
             /* Keep servicing DMA at its own pace; no sleep/refeed loop and no
              * clock stop during a routine underrun or FORMAT_READY wait. */
             if (s_running) i2s_write_silence_locked(silence, sizeof silence);
-            xSemaphoreGive(s_lock);
+            writer_unlock();
             if (!s_running) vTaskDelay(1); /* driver fault, not normal refill */
             continue;
         }
@@ -1126,7 +1151,7 @@ static void audio_out_task(void *arg)
             s_dma_primed = true;
         }
         vRingbufferReturnItem(s_ring, item);
-        xSemaphoreGive(s_lock);
+        writer_unlock();
     }
 }
 
@@ -1444,7 +1469,7 @@ esp_err_t audio_out_begin_format(uint32_t *token)
     *token = audio_out_gate();
     if (s_fault) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(s_producer_lock, portMAX_DELAY); // finish any old decoder packet
-    xSemaphoreTake(s_lock, portMAX_DELAY);          // finish and return any old ring item
+    ctrl_take_lock();                               // finish and return any old ring item
     flush_ring();
     esp_err_t err = ESP_OK;
     if (s_running) {
@@ -1467,7 +1492,7 @@ esp_err_t audio_out_configure(uint32_t rate, uint8_t bits, uint8_t source_bits)
     if (!rate || (bits != 16 && bits != 32) || (source_bits != 16 && source_bits != 32))
         return ESP_ERR_INVALID_ARG;
     xSemaphoreTake(s_producer_lock, portMAX_DELAY);
-    xSemaphoreTake(s_lock, portMAX_DELAY);
+    ctrl_take_lock();
     /* A 1.9 host clocks the link in 32-bit slots only. Read under the locks, since
      * audio_out_set_role runs on the link task. */
     if (s_slave) bits = 32;
@@ -1516,7 +1541,7 @@ esp_err_t audio_out_set_role(bool slave)
      * channel carries zeros until bt_av runs a new format transaction for this role. */
     (void)audio_out_gate();
     xSemaphoreTake(s_producer_lock, portMAX_DELAY); // finish any decoder packet
-    xSemaphoreTake(s_lock, portMAX_DELAY);          // and any writer pass
+    ctrl_take_lock();                               // and any writer pass
     flush_ring();
     if (s_tx != NULL) {
         if (s_running) i2s_channel_disable(s_tx);
