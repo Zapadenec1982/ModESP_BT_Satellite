@@ -18,8 +18,12 @@
 #include "esp_err.h"
 #include "satlink/messages.h"
 
-/* Builds the map, starts the debounce poller if there is anything to poll, and
- * sends GPIO_MAP. Call after link_start(). */
+/* The lock and the ADC units. Call before link_start(): from then on the host can
+ * send GPIO_CFG, and a mode 6 line needs its unit to exist. */
+esp_err_t expander_init(void);
+
+/* Sends GPIO_MAP and starts the debounce poller if there is anything to poll.
+ * Call after link_start(), so that the map follows the HELLO. */
 esp_err_t expander_start(void);
 
 /* GPIO_MAP again. PROTOCOL.md 3.4 sends it after every host HELLO, because a host

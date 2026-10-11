@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 static const char *TAG = "sat.gpio";
@@ -73,6 +74,14 @@ static uint16_t s_adc_period[SATLINK_GPIO_MAX];   /* poll ticks, 0 = on request 
 static uint16_t s_adc_countdown[SATLINK_GPIO_MAX];
 static adc_oneshot_unit_handle_t s_adc[2];
 
+/* Everything above is shared between the link's RX task (GPIO_CFG, GPIO_OUT,
+ * ADC_READ) and the poller, on either core. A mutex rather than a critical
+ * section, because GPIO, the ADC and the link are called with it held. It also
+ * serialises the ADC: adc_oneshot_read on a unit someone else is reading fails
+ * instead of waiting. */
+static StaticSemaphore_t s_lock_buf;
+static SemaphoreHandle_t s_lock;
+
 static gpio_mode_t mode_to_gpio(uint8_t mode)
 {
     switch (mode) {
@@ -88,6 +97,8 @@ static gpio_mode_t mode_to_gpio(uint8_t mode)
 void expander_apply_cfg(const satlink_gpio_cfg_t *cfg)
 {
     uint32_t newly_input = 0;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
 
     for (uint8_t i = 0; i < cfg->count; i++) {
         uint8_t index   = cfg->pins[i].index;
@@ -171,7 +182,6 @@ void expander_apply_cfg(const satlink_gpio_cfg_t *cfg)
         } else if (exp_mode_is_input(mode)) {
             s_input_mask |= (1u << index);
             newly_input |= (1u << index);
-            s_stable[index] = EXP_STABLE_SAMPLES;    /* take the first read as settled */
         }
     }
 
@@ -184,14 +194,15 @@ void expander_apply_cfg(const satlink_gpio_cfg_t *cfg)
                 values |= (1u << i);
             }
         }
-        s_reported = (s_reported & ~newly_input) | values;
-        s_candidate = s_reported;
+        exp_debounce_adopt(newly_input, values, &s_candidate, s_stable, &s_reported);
         link_send_gpio_in(s_reported, newly_input);
     }
+    xSemaphoreGive(s_lock);
 }
 
 void expander_set_outputs(uint32_t values, uint32_t mask)
 {
+    xSemaphoreTake(s_lock, portMAX_DELAY);
     for (uint8_t i = 0; i < EXP_PIN_COUNT; i++) {
         uint32_t bit = 1u << i;
         if ((mask & bit) == 0 || (s_output_mask & bit) == 0) {
@@ -199,8 +210,10 @@ void expander_set_outputs(uint32_t values, uint32_t mask)
         }
         gpio_set_level(s_pins[i].gpio, (values & bit) ? 1 : 0);
     }
+    xSemaphoreGive(s_lock);
 }
 
+/* Called with s_lock held. */
 static void adc_sample_and_send(uint8_t index)
 {
     const exp_pin_t *pin = &s_pins[index];
@@ -208,7 +221,9 @@ static void adc_sample_and_send(uint8_t index)
         return;
     }
     int raw = 0;
-    if (adc_oneshot_read(s_adc[pin->adc_unit], pin->adc_channel, &raw) != ESP_OK) {
+    esp_err_t err = adc_oneshot_read(s_adc[pin->adc_unit], pin->adc_channel, &raw);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "index %u: ADC read failed (%s)", index, esp_err_to_name(err));
         return;
     }
     /* Uncalibrated for now: 12 bits over roughly 3.1 V at this attenuation. The
@@ -225,7 +240,9 @@ void expander_read_adc(uint8_t index)
                  index, (unsigned)EXP_PIN_COUNT);
         return;
     }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
     adc_sample_and_send(index);
+    xSemaphoreGive(s_lock);
 }
 
 /* The poll period. Not vTaskDelay: below one FreeRTOS tick (10 ms at the 100 Hz
@@ -242,6 +259,10 @@ static void expander_task(void *arg)
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
+        /* One pass under the lock, the send included: a GPIO_CFG on the other
+         * core must neither undo a level this pass reports nor queue a GPIO_IN
+         * built from the levels before it. */
+        xSemaphoreTake(s_lock, portMAX_DELAY);
         uint32_t changed = 0;
         for (uint8_t i = 0; i < EXP_PIN_COUNT; i++) {
             uint32_t bit = 1u << i;
@@ -265,6 +286,7 @@ static void expander_task(void *arg)
                 adc_sample_and_send(i);
             }
         }
+        xSemaphoreGive(s_lock);
     }
 }
 
@@ -293,8 +315,10 @@ void expander_send_map(void)
     link_send_gpio_map(&map);
 }
 
-esp_err_t expander_start(void)
+esp_err_t expander_init(void)
 {
+    s_lock = xSemaphoreCreateMutexStatic(&s_lock_buf);
+
     bool needs_adc[2] = { false, false };
 
     for (uint8_t i = 0; i < EXP_PIN_COUNT; i++) {
@@ -313,7 +337,11 @@ esp_err_t expander_start(void)
             s_adc[unit] = NULL;
         }
     }
+    return ESP_OK;
+}
 
+esp_err_t expander_start(void)
+{
     /* Straight after our own HELLO, always, even when there is nothing in it: an
      * empty map is the answer to "what have you got", not the absence of one.
      * Every host HELLO gets it again, from main.c. */

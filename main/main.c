@@ -170,6 +170,8 @@ void app_main(void)
         .on_adc_read  = on_adc_read,
         .on_host_caps = on_host_caps,
     };
+    /* The expander's state before the link that delivers GPIO_CFG to it. */
+    ESP_ERROR_CHECK(expander_init());
     ESP_ERROR_CHECK(link_start(&handlers, own_caps()));
     ESP_ERROR_CHECK(expander_start());
 

@@ -177,6 +177,77 @@ static void test_debounce(void)
     }
 }
 
+/*
+ * Line 0 is an input and is pressed at `edge_ms`; GPIO_CFG makes line 1 an input
+ * at `cfg_ms`, between two polls. Returns when line 0's press was reported, 0 if
+ * it never was, and checks the configuration's own report on the way.
+ */
+static unsigned press_with_cfg(unsigned edge_ms, unsigned cfg_ms)
+{
+    const uint32_t press = 1u << 0, other = 1u << 1;
+    uint32_t candidate = 0, reported = 0, input_mask = press;
+    uint8_t stable[SATLINK_GPIO_MAX];
+    memset(stable, EXP_STABLE_SAMPLES, sizeof(stable));
+    unsigned at = 0;
+    bool configured = false;
+
+    for (unsigned ms = 0; ms <= edge_ms + 100; ms += EXP_POLL_MS) {
+        if (!configured && cfg_ms < ms) {
+            /* Line 1 reads high when it becomes an input. */
+            exp_debounce_adopt(other, other | press, &candidate, stable, &reported);
+            CHECK_EQ(reported & other, other);
+            CHECK_EQ(stable[1], EXP_STABLE_SAMPLES);
+            input_mask |= other;
+            configured = true;
+        }
+        uint32_t levels = other | (ms >= edge_ms ? press : 0);
+        for (unsigned i = 0; i < 2; i++) {
+            uint32_t bit = 1u << i;
+            if ((input_mask & bit) == 0) {
+                continue;
+            }
+            if (exp_debounce_step(levels & bit, bit, &candidate, &stable[i], &reported) &&
+                bit == press && at == 0) {
+                at = ms;
+            }
+        }
+    }
+    CHECK(configured);
+    return at;
+}
+
+static void test_debounce_cfg(void)
+{
+    /* A GPIO_CFG for another line at any moment of a press must not start the
+     * press's debounce over: still under the 30 ms of PROTOCOL.md 11. */
+    const unsigned edge = 101;          /* just after a poll, the worst phase */
+    for (unsigned cfg = edge - 10; cfg <= edge + 30; cfg++) {
+        unsigned at = press_with_cfg(edge, cfg);
+        CHECK(at != 0);
+        CHECK(at >= edge + EXP_DEBOUNCE_MS - EXP_POLL_MS);
+        CHECK(at - edge < 30);
+    }
+
+    /* Adopting leaves every other line's debounce exactly as it was, and takes
+     * only the configured lines from `levels`. */
+    uint32_t candidate = 0x5, reported = 0x1;
+    uint8_t stable[SATLINK_GPIO_MAX];
+    memset(stable, 2, sizeof(stable));
+    exp_debounce_adopt(0x30, 0xFF, &candidate, stable, &reported);
+    CHECK_EQ(candidate, 0x35);
+    CHECK_EQ(reported, 0x31);
+    CHECK_EQ(stable[0], 2);
+    CHECK_EQ(stable[2], 2);
+    CHECK_EQ(stable[3], 2);
+    CHECK_EQ(stable[4], EXP_STABLE_SAMPLES);
+    CHECK_EQ(stable[5], EXP_STABLE_SAMPLES);
+    CHECK_EQ(stable[6], 2);
+
+    exp_debounce_adopt(0x30, 0x10, &candidate, stable, &reported);
+    CHECK_EQ(candidate, 0x15);
+    CHECK_EQ(reported, 0x11);
+}
+
 /* ----------------------------------------------------------------------- LOG */
 
 /* The bridge's two steps on a copy of `in`: level first, then the tidy text. */
@@ -661,6 +732,7 @@ int main(void)
     test_legal_mode();
     test_adc_period();
     test_debounce();
+    test_debounce_cfg();
     test_log_level();
     test_incompatible_host();
     test_abs_volume();

@@ -99,6 +99,26 @@ static inline bool exp_debounce_step(uint32_t level, uint32_t bit, uint32_t *can
     return false;
 }
 
+/*
+ * GPIO_CFG made the lines in `lines` inputs, and `levels` is what they read now.
+ * Those levels are taken as settled and reported straight away, because the host
+ * has no other way to learn a level that never changes. Only those lines: one
+ * that is already an input may be in the middle of its debounce, and starting
+ * that over would put its edge past the 30 ms of PROTOCOL.md 11.
+ */
+static inline void exp_debounce_adopt(uint32_t lines, uint32_t levels, uint32_t *candidate,
+                                      uint8_t stable[SATLINK_GPIO_MAX], uint32_t *reported)
+{
+    levels &= lines;
+    *reported  = (*reported & ~lines) | levels;
+    *candidate = (*candidate & ~lines) | levels;
+    for (unsigned i = 0; i < SATLINK_GPIO_MAX; i++) {
+        if (lines & (1u << i)) {
+            stable[i] = EXP_STABLE_SAMPLES;
+        }
+    }
+}
+
 /* Mode 6: `initial` is the report period in hundreds of milliseconds, 0 = only on
  * ADC_READ. In poll ticks, which is what the expander counts. */
 static inline uint16_t exp_adc_period_ticks(uint8_t initial)
