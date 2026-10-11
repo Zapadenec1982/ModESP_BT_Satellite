@@ -78,6 +78,13 @@ static const char *TAG = "sat.link";
  * with no limit would greet each other until the wire melted. */
 #define LINK_HELLO_MIN_GAP_US (1000 * 1000)
 
+/* The retry timer ticks on a fixed 1 s grid (esp_timer re-arms with
+ * alarm += period), but each tick is seen a few microseconds early or late.
+ * Measured against the strict gap, every tick that came in a little earlier
+ * than the last one was refused, and the once-a-second retry became 1 s or 2 s
+ * at random. The timer path alone gets this much slack. */
+#define LINK_HELLO_RETRY_SLACK_US (50 * 1000)
+
 /*
  * How much stack a sender is allowed to take.
  *
@@ -593,7 +600,7 @@ static void send_hello(void)
 /* The reply half of the greeting. Without it a peer that started first never
  * learns our version or our capabilities, and is right to refuse to bring the
  * link up: it would be guessing at what we can do. */
-static void answer_hello(bool force)
+static void reserve_hello(bool force, int64_t min_gap_us)
 {
     int64_t now = esp_timer_get_time();
     // RX, startup and retry timer share one reservation; do not hold the lock
@@ -601,13 +608,18 @@ static void answer_hello(bool force)
     portENTER_CRITICAL(&s_hello_mux);
     // `force`: our capabilities changed, and a host that keeps the old ones would be
     // driving a line we now drive too, or not driving one we now need.
-    if (!force && s_last_hello_us != 0 && now - s_last_hello_us < LINK_HELLO_MIN_GAP_US) {
+    if (!force && s_last_hello_us != 0 && now - s_last_hello_us < min_gap_us) {
         portEXIT_CRITICAL(&s_hello_mux);
         return;
     }
     s_last_hello_us = now;
     portEXIT_CRITICAL(&s_hello_mux);
     send_hello();
+}
+
+static void answer_hello(bool force)
+{
+    reserve_hello(force, LINK_HELLO_MIN_GAP_US);
 }
 
 /* ------------------------------------------------------------------- inbound */
@@ -957,7 +969,10 @@ static void ping_tick(void *arg)
 
     // PONG proves liveness, not capability negotiation. A lost startup HELLO
     // or reply must not leave a restarted satellite permanently in legacy mode.
-    if (!s_host_present && !s_peer_incompatible) answer_hello(false);
+    // Only the startup HELLO and these retries go out while no host has greeted,
+    // so the grid already keeps them a second apart; the slack absorbs jitter.
+    if (!s_host_present && !s_peer_incompatible)
+        reserve_hello(false, LINK_HELLO_MIN_GAP_US - LINK_HELLO_RETRY_SLACK_US);
 
     if (s_ping_outstanding > 0) {
         s_stats.pings_unanswered++;

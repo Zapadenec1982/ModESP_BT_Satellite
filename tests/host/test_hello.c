@@ -12,6 +12,7 @@ int g_checks, g_failures;
 #define LINK_BUILD_MAX 80
 #define LINK_BUF_HELLO (1 + 1 + 4 + 2 + LINK_BUILD_MAX)
 #define LINK_HELLO_MIN_GAP_US (1000 * 1000)
+#define LINK_HELLO_RETRY_SLACK_US (50 * 1000)
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGE(...) ((void)0)
 #define ESP_LOGW(...) ((void)0)
@@ -60,8 +61,12 @@ static void receive_hello(unsigned major, unsigned minor, uint32_t caps) {
     size_t len = satlink_enc_hello(payload, sizeof payload, &h);
     CHECK(len != 0); handle_hello(payload, len);
 }
+// The ping timer ticks on a fixed grid but is seen with jitter: alternate a
+// tick seen 10 us late with one seen 10 us early, as esp_timer dispatch does.
 static void beat(void) {
-    clock_us += 1000000;
+    static int late;
+    late = !late;
+    clock_us += late ? 1000010 : 999990;
     // Successful PONGs do not mean we received the peer's capabilities.
     s_ping_outstanding = 0; ping_tick(NULL);
 }
@@ -126,6 +131,16 @@ int main(void) {
     receive_hello(1, 9, 0x1fb); CHECK(hellos == 2);  // unchanged: rate limited
     receive_hello(1, 8, 0x1fb); CHECK(s_host_caps == 0xfb); CHECK(s_own_caps == 0);
     CHECK(hellos == 3);
+    // No host: one retry per tick, even when a tick is seen a little early.
+    reset_case(); answer_hello(false);
+    for (int i=0; i<10; i++) beat();
+    CHECK(hellos == 11); CHECK(pings == 10);
+    // The slack is for jitter only: a tick far short of a second is refused.
+    reset_case(); answer_hello(false); clock_us += 900000; ping_tick(NULL);
+    CHECK(hellos == 1); CHECK(pings == 1);
+    // A host HELLO inside the second after ours, caps unchanged, gets no reply.
+    reset_case(); answer_hello(false); clock_us += 990000;
+    receive_hello(1, 9, 0xfb); CHECK(s_host_present); CHECK(hellos == 1);
     // Reply and retry share the same rate limiter.
     reset_case(); answer_hello(false); clock_us += 999999; answer_hello(false);
     CHECK(hellos == 1); clock_us++; answer_hello(false); CHECK(hellos == 2);
