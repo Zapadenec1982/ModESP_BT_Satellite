@@ -113,11 +113,12 @@ void a2dp_sbc_decoder_configure(const uint8_t* p_codec_info) {
   LOG_INFO("%s: SBC Maximum bitpool = %lu", __func__, cie.max_bitpool);
   LOG_INFO("%s: SBC Minimum bitpool = %lu", __func__, cie.min_bitpool);
 
-  if (cie.ch_mode == A2D_SBC_IE_CH_MD_MONO) {
-    a2dp_sbc_decoder_cb.maxChannels = 1;
-  } else {
-    a2dp_sbc_decoder_cb.maxChannels = 2;
-  }
+  /* Always two channels, as in AOSP. OI rejects pcmStride > maxChannels, and a
+   * failed reset leaves the context zeroed so every frame fails after it. With
+   * (2, 2) OI writes a mono stream to both channels, which is what STREAM_FMT
+   * announces anyway. */
+  a2dp_sbc_decoder_cb.maxChannels = 2;
+  a2dp_sbc_decoder_cb.pcmStride = 2;
 
   a2dp_sbc_decoder_reset();
 }

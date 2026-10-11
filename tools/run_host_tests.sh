@@ -87,3 +87,5 @@ fi
 "$python" "$repo/tools/run_lhdc_tests.py" --cc "$cc"
 # The Helix AAC decoder must refuse malformed frames, not overrun or spin on them.
 "$python" "$repo/tools/run_aac_tests.py" --cc "$cc"
+# The SBC sink offers stereo only and still decodes a mono stream to both channels.
+"$python" "$repo/tools/run_sbc_tests.py" --cc "$cc"
