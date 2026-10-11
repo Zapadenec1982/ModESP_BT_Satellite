@@ -1466,9 +1466,11 @@ esp_err_t audio_out_configure(uint32_t rate, uint8_t bits, uint8_t source_bits)
 {
     if (!rate || (bits != 16 && bits != 32) || (source_bits != 16 && source_bits != 32))
         return ESP_ERR_INVALID_ARG;
-    if (s_slave) bits = 32;     /* a 1.9 host clocks the link in 32-bit slots only */
     xSemaphoreTake(s_producer_lock, portMAX_DELAY);
     xSemaphoreTake(s_lock, portMAX_DELAY);
+    /* A 1.9 host clocks the link in 32-bit slots only. Read under the locks, since
+     * audio_out_set_role runs on the link task. */
+    if (s_slave) bits = 32;
     esp_err_t err = (atomic_load(&s_gate) & 1u) ? ESP_OK : ESP_ERR_INVALID_STATE;
     if (err == ESP_OK && s_running) {
         err = i2s_channel_disable(s_tx);
@@ -1509,6 +1511,10 @@ esp_err_t audio_out_set_role(bool slave)
 {
     if (s_lock == NULL || s_producer_lock == NULL) return ESP_ERR_INVALID_STATE;
     if (s_tx != NULL && slave == s_slave) return ESP_OK;
+    /* PROTOCOL.md 6.1: a role change can change the slot width, and none is played
+     * unannounced. Gate first, which also voids the pending resume token: the reopened
+     * channel carries zeros until bt_av runs a new format transaction for this role. */
+    (void)audio_out_gate();
     xSemaphoreTake(s_producer_lock, portMAX_DELAY); // finish any decoder packet
     xSemaphoreTake(s_lock, portMAX_DELAY);          // and any writer pass
     flush_ring();

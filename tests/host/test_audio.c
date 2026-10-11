@@ -18,6 +18,11 @@ static audio_event_state_t s_events;
 #define ESP_OK 0
 #define ESP_ERR_TIMEOUT 1
 #define ESP_FAIL 2
+#define ESP_ERR_INVALID_STATE 3
+#define portMAX_DELAY 0xffffffffu
+#define ESP_LOGE(tag, ...) ((void)(tag))
+#define ESP_LOGW(tag, ...) ((void)(tag))
+static const char *TAG = "audio";
 typedef int esp_err_t;
 typedef unsigned TickType_t;
 typedef struct { uint32_t gate, epoch; bool silence; } transfer_context_t;
@@ -36,8 +41,10 @@ static int64_t s_decode_start_us;
 static atomic_uint s_decode_last_us, s_pcm_drop_us, s_tx_error_us;
 static atomic_uint s_tx_events, s_tx_noclock, s_tx_noclock_us;
 static bool s_slave;
-static int s_decoder_task, task_id=1, s_producer_lock=1, s_ring, s_tx;
-static bool s_dma_primed, s_streaming, s_running=true, s_tx_recover;
+static int s_decoder_task, task_id=1, s_ring, s_lock_obj, s_tx_obj;
+static void *s_producer_lock=&s_lock_obj, *s_lock=&s_lock_obj, *s_tx=&s_tx_obj;
+static bool s_dma_primed, s_streaming, s_running=true, s_tx_recover, s_fault;
+static unsigned role_reopens;
 static unsigned s_slot_bits=32, s_src_bits=32;
 static uint32_t now_ms;
 static uint8_t sent_data[65536];
@@ -51,8 +58,8 @@ static uint8_t refill_data[1024];
 static int64_t esp_timer_get_time(void) {return (int64_t)now_ms*1000;}
 static int xTaskGetCurrentTaskHandle(void) {return task_id;}
 static unsigned uxTaskGetStackHighWaterMark(void *p) {(void)p;return 1000;}
-static int xSemaphoreTake(int s, unsigned t) {(void)t;return s;}
-static void xSemaphoreGive(int s) {(void)s;}
+static int xSemaphoreTake(void *s, unsigned t) {(void)t;return s ? pdTRUE : 0;}
+static void xSemaphoreGive(void *s) {(void)s;}
 static void *xRingbufferReceiveUpTo(int ring,size_t *len,TickType_t ticks,size_t limit) {
     (void)ring;
     assert(ticks==1 && limit==1024 && !refill_borrowed);
@@ -85,7 +92,7 @@ static int xRingbufferSend(int r,const void *p,size_t n,unsigned ticks) {
     if(ring_capacity-ring_fill<n) return 0;
     memcpy(sent_data+sent_len,p,n);sent_len+=n;ring_fill+=n;return pdTRUE;
 }
-static int i2s_channel_write(int tx,const void *p,size_t n,size_t *written,unsigned timeout) {
+static int i2s_channel_write(void *tx,const void *p,size_t n,size_t *written,unsigned timeout) {
     (void)tx;
     size_t count=tx_zero ? 0 : (tx_limit && n>tx_limit ? tx_limit:n);
     memcpy(sent_data+sent_len,p,count);sent_len+=count;*written=count;
@@ -94,6 +101,15 @@ static int i2s_channel_write(int tx,const void *p,size_t n,size_t *written,unsig
     after_send();return tx_fail ? ESP_FAIL : (count<n ? ESP_ERR_TIMEOUT:ESP_OK);
 }
 static void audio_ring_put(const void *,size_t);
+/* The channel reopen behind audio_out_set_role: what the IDF calls leave behind. */
+static void flush_ring(void) {ring_fill=0;}
+static esp_err_t i2s_channel_disable(void *tx) {(void)tx;return ESP_OK;}
+static esp_err_t i2s_del_channel(void *tx) {(void)tx;return ESP_OK;}
+static esp_err_t i2s_open(bool slave) {
+    role_reopens++;s_tx=&s_tx_obj;s_slave=slave;if(slave)s_slot_bits=32;
+    s_running=true;return ESP_OK;
+}
+static void audio_servo_reset(void) {}
 static void audio_write_packet(const uint8_t *p,size_t n) {audio_ring_put(p,n);}
 #include "audio_handlers.inc"
 /* Replay actual generated worker scheduling with a coalesced event. */
@@ -194,6 +210,18 @@ int main(void) {
     reset();audio_out_set_streaming(false);audio_out_set_streaming(true);
     audio_out_write(data,512);assert(!sent_len); /* old packet after resume */
     reset();task_id=2;audio_out_write(data,512);assert(!sent_len && !sends); /* control nonblocking */
+    /* A role change on the link task reopens I2S, maybe at another slot width, and plays
+     * nothing on it unannounced (PROTOCOL.md 6.1): the gate closes, the token dies. */
+    reset();s_slave=true;role_reopens=0;token=audio_out_gate();assert(audio_out_resume(token));
+    uint32_t open_gate=s_gate;
+    assert(audio_out_set_role(true)==ESP_OK && !role_reopens && s_gate==open_gate); /* same role */
+    sat_audio_decode_begin(1);
+    assert(audio_out_set_role(false)==ESP_OK && role_reopens==1 && !s_slave && s_running);
+    assert((s_gate&1u) && !audio_out_resume(token));
+    audio_out_write(data,512);sat_audio_decode_end();
+    assert(!sent_len && s_pcm_cancelled_frames==64); /* the packet in flight is dropped */
+    sat_audio_decode_begin(1);audio_out_write(data,512);sat_audio_decode_end();
+    assert(!sent_len); /* and so is the next, until bt_av starts a new transaction */
     /* Burst pacing across multiple packets: no extra ring memory or PCM loss. */
     reset();drain_per_wait=3840;
     for(unsigned i=0;i<16;i++) {sat_audio_decode_begin(16-i);audio_out_write(data,sizeof data);}
@@ -293,6 +321,6 @@ int main(void) {
     assert(refill.status==AUDIO_REFILL_CANCELLED && !refill_receives);
     reset();refill_change=3;refill=audio_wait_refill(2,0);
     assert(refill.status==AUDIO_REFILL_CANCELLED && !refill_returns && !s_wait_timeout);
-    puts("satellite audio: 17 transfer/generation/pacing/worker + 8 telemetry + 13 refill adapter scenarios PASS");
+    puts("satellite audio: 18 transfer/generation/pacing/worker + 8 telemetry + 13 refill adapter scenarios PASS");
     return 0;
 }

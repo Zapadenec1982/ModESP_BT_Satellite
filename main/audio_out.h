@@ -32,7 +32,8 @@ uint32_t audio_out_rate_hz(void);
 /* Protocol 1.9. The I2S role: master (this device clocks the link, every host before 1.9)
  * or slave (the host clocks it and this device drives DATA only, always in 32-bit slots).
  * Boots as a slave, which drives nothing a host might also drive; the first host HELLO
- * decides. Control task only: it closes and reopens the channel under both locks. */
+ * decides. Runs on the link task: it closes the PCM gate first, then closes and reopens
+ * the channel under both locks; bt_av sees the new role and starts a new format. */
 esp_err_t audio_out_set_role(bool slave);
 /* True while the channel exists and is a slave: what DEV_CAP_I2S_SLAVE says. */
 bool audio_out_is_slave(void);

@@ -5,6 +5,7 @@
 #include "cover_stream.h"
 #include "endpoint_policy.h"
 #include "esp_heap_caps.h"
+#include "format_policy.h"
 #include "pair_policy.h"
 #include "pause_policy.h"
 #include "reconnect_policy.h"
@@ -208,6 +209,7 @@ static ep_fsm_t s_endpoints;            /* bt_av task only */
  * still gets the endpoints registered again (endpoint_policy.h). */
 #define BT_AV_HELLO_WAIT_MS 10000
 static atomic_bool s_caps_pending;
+static bool s_fmt_slave;                /* the I2S role the current transaction was begun in */
 static atomic_bool s_cover_refresh;
 static atomic_bool s_cover_query;
 static atomic_uint s_cover_epoch;
@@ -425,6 +427,7 @@ static void begin_format(uint32_t rate, uint8_t bits, uint8_t channels, uint8_t 
 {
     s_decoder_bits = source_bits;
     s_now.rate_hz = rate; s_now.bits = bits; s_now.channels = channels;
+    s_fmt_slave = audio_out_is_slave();   /* before the gate: a later role change is seen */
     s_format_pending = false;
     esp_err_t err = audio_out_begin_format(&s_gate_token);
     if (err != ESP_OK) { ESP_LOGE(TAG, "cannot silence I2S: %s", esp_err_to_name(err)); return; }
@@ -584,14 +587,19 @@ static void poll_format(void)
         if (esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS) != ESP_OK)
             atomic_store(&s_cover_refresh, false);
     }
-    if (atomic_exchange(&s_caps_pending, false) && s_now.rate_hz) {
+    /* audio_out_set_role runs on the link task and gates PCM; the new role is followed
+     * here with a new transaction, even when the host's greeting has not been seen yet. */
+    const bool caps_pending = atomic_exchange(&s_caps_pending, false);
+    const bool slave = audio_out_is_slave();
+    if ((caps_pending || slave != s_fmt_slave) && s_now.rate_hz) {
         uint32_t caps = link_host_caps();
         bool ack = (caps & FMT_HOST_CAP) != 0;
         /* 1.9: a host that clocks the link does it in 32-bit slots, whatever the decoder. */
-        uint8_t bits = audio_out_is_slave() ? 32
+        uint8_t bits = slave ? 32
                      : fmt_slot_bits(s_decoder_bits, (caps & SATLINK_HOST_CAP_WIDE) != 0, ack);
-        if (!fmt_valid(&s_format.request) || bits != s_now.bits || ack != s_format.require_ack ||
-            !ep_host_can_follow(s_now.rate_hz, caps))
+        if (fmt_needs_restart(fmt_valid(&s_format.request), s_now.bits, bits,
+                              s_format.require_ack, ack, slave != s_fmt_slave,
+                              ep_host_can_follow(s_now.rate_hz, caps)))
             begin_format(s_now.rate_hz, bits, s_now.channels, s_decoder_bits);
         else announce_format(); // a restarted host must relearn the current transaction
     }

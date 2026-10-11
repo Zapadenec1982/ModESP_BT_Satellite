@@ -2,8 +2,9 @@
  * Device-side rules of PROTOCOL.md that live in main/ as pure C, walked without a
  * board: the port expander's GPIO_CFG handling, LOG lines from the ESP log, what
  * the link lets through for a host with another proto_major, the slots that
- * hold the messages which must not be lost, the range of VOLUME_STATE, and the
- * stream suspend after a pause from the host.
+ * hold the messages which must not be lost, the range of VOLUME_STATE, the
+ * stream suspend after a pause from the host, and when a greeting or an I2S role
+ * change starts a new format transaction.
  */
 
 #include <stdio.h>
@@ -12,6 +13,7 @@
 #include "harness.h"
 #include "avrc_volume.h"
 #include "expander_policy.h"
+#include "format_policy.h"
 #include "link_policy.h"
 #include "log_line.h"
 #include "pause_policy.h"
@@ -567,6 +569,29 @@ static void test_pause_check(void)
     CHECK_EQ(s.suspends, 0);
 }
 
+/* ------------------------------------------------------------- format restart */
+
+static void test_format_restart(void)
+{
+    /* Nothing changed: the current transaction is only announced again. */
+    CHECK(!fmt_needs_restart(true, 16, 16, false, false, false, true));
+    CHECK(!fmt_needs_restart(true, 32, 32, true, true, false, true));
+
+    /* A new role with the same slots and acknowledgement still needs one: set_role
+     * gated PCM and voided the resume token, so a repeat would never resume. */
+    CHECK(fmt_needs_restart(true, 32, 32, false, false, true, true));
+    CHECK(fmt_needs_restart(true, 32, 32, true, true, true, true));
+    /* The slave-to-legacy-master case: 32-bit slots become 16, announced first. */
+    CHECK(fmt_needs_restart(true, 32, 16, false, false, true, true));
+
+    /* The reasons a greeting alone starts one. */
+    CHECK(fmt_needs_restart(true, 16, 32, false, false, false, true));
+    CHECK(fmt_needs_restart(true, 32, 32, false, true, false, true));
+    CHECK(fmt_needs_restart(true, 32, 32, true, false, false, true));
+    CHECK(fmt_needs_restart(false, 32, 32, false, false, false, true));
+    CHECK(fmt_needs_restart(true, 32, 32, false, false, false, false));
+}
+
 int main(void)
 {
     test_legal_mode();
@@ -582,6 +607,7 @@ int main(void)
     test_slots_faults_and_wrap();
     test_slots_encode_in_place();
     test_pause_check();
+    test_format_restart();
     printf("Device rules: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }
