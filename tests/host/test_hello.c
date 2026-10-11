@@ -23,7 +23,10 @@ static uint32_t s_host_caps, s_own_caps, s_ping_outstanding;
 static uint8_t s_host_minor;
 static int64_t s_last_hello_us, clock_us;
 static struct { unsigned rx_bad, hello_sent, rx_echoes, pings_unanswered; } s_stats;
-static struct { void (*on_hello)(const satlink_hello_t *); } s_handlers;
+static struct {
+    void (*on_hello)(const satlink_hello_t *);
+    uint32_t (*on_host_caps)(uint32_t);
+} s_handlers;
 typedef struct { char version[32], idf_ver[32]; } esp_app_desc_t;
 static const esp_app_desc_t *esp_app_get_description(void) {
     static const esp_app_desc_t app = {"test", "5.5.5"}; return &app;
@@ -39,6 +42,8 @@ static void tx_push(uint8_t type, const uint8_t *payload, size_t len) {
     } else if (type == SATLINK_MSG_PING) pings++;
 }
 static void on_hello(const satlink_hello_t *h) { (void)h; callbacks++; }
+// Stands in for the I2S role switch: device bit 8 follows host bit 8.
+static uint32_t own_caps_for(uint32_t host_caps) { return host_caps & SATLINK_HOST_CAP_I2S_MASTER; }
 #include "hello_handlers.inc"
 static void reset_case(void) {
     s_hello_mux = 0;
@@ -47,6 +52,7 @@ static void reset_case(void) {
     s_last_hello_us = 0; clock_us = 1000;
     memset(&s_stats, 0, sizeof s_stats);
     hellos = pings = callbacks = 0; s_handlers.on_hello = on_hello;
+    s_handlers.on_host_caps = NULL;
 }
 static void receive_hello(unsigned major, unsigned minor, uint32_t caps) {
     satlink_hello_t h = {.major=major, .minor=minor, .caps=caps};
@@ -60,7 +66,7 @@ static void beat(void) {
     s_ping_outstanding = 0; ping_tick(NULL);
 }
 int main(void) {
-    reset_case(); answer_hello(); CHECK(hellos == 1);
+    reset_case(); answer_hello(false); CHECK(hellos == 1);
     // Drop the initial greeting and the next reply; a live PING/PONG link remains.
     beat(); CHECK(hellos == 2); CHECK(!s_host_present);
     beat(); CHECK(hellos == 3); CHECK(!s_host_present);
@@ -70,7 +76,7 @@ int main(void) {
     for (int i=0; i<30; i++) beat();
     CHECK(hellos == 3); CHECK(pings == 32);
     // Late host, damaged response: keep retrying, never infer capabilities.
-    reset_case(); answer_hello();
+    reset_case(); answer_hello(false);
     for (int i=0; i<5; i++) beat();
     CHECK(hellos == 6); handle_hello(NULL, 0); CHECK(s_stats.rx_bad == 1);
     beat(); CHECK(hellos == 7);
@@ -98,7 +104,7 @@ int main(void) {
     receive_hello(1, 6, 0xfb); CHECK(s_host_caps == 0x7b); CHECK(s_host_minor == 6);
     // Our own greeting heard back off a floating wire is not a host: nothing
     // changes, and above all our BT_SETTINGS is not taken for PAIR_CONFIRM.
-    reset_case(); s_own_caps = 0xdf; answer_hello(); CHECK(hellos == 1);
+    reset_case(); s_own_caps = 0xdf; answer_hello(false); CHECK(hellos == 1);
     uint8_t own[LINK_BUF_HELLO];
     size_t own_len = encode_own_hello(own, sizeof own);
     CHECK(own_len != 0);
@@ -110,12 +116,19 @@ int main(void) {
     receive_hello(1, 8, 0xdf); CHECK(s_host_present); CHECK(s_host_caps == 0xdf);
     s_own_caps = 0;
     // A known incompatible host is not a lost greeting; do not retry forever.
-    reset_case(); answer_hello(); receive_hello(2, 0, 0);
+    reset_case(); answer_hello(false); receive_hello(2, 0, 0);
     CHECK(s_peer_incompatible); CHECK(!s_host_present); CHECK(callbacks == 0);
     beat(); CHECK(hellos == 1); CHECK(pings == 1);
+    // 1.9: a HELLO that changes our caps is answered at once, past the rate limit.
+    reset_case(); s_handlers.on_host_caps = own_caps_for; answer_hello(false);
+    receive_hello(1, 9, 0x1fb); CHECK(s_host_caps == 0x1fb); CHECK(s_own_caps == 0x100);
+    CHECK(hellos == 2);
+    receive_hello(1, 9, 0x1fb); CHECK(hellos == 2);  // unchanged: rate limited
+    receive_hello(1, 8, 0x1fb); CHECK(s_host_caps == 0xfb); CHECK(s_own_caps == 0);
+    CHECK(hellos == 3);
     // Reply and retry share the same rate limiter.
-    reset_case(); answer_hello(); clock_us += 999999; answer_hello();
-    CHECK(hellos == 1); clock_us++; answer_hello(); CHECK(hellos == 2);
+    reset_case(); answer_hello(false); clock_us += 999999; answer_hello(false);
+    CHECK(hellos == 1); clock_us++; answer_hello(false); CHECK(hellos == 2);
     printf("HELLO recovery: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }
