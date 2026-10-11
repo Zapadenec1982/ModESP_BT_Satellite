@@ -1,7 +1,8 @@
 /* The vendored Helix AAC decoder against malformed raw_data_blocks, the way
  * aac_decoder_helix.c drives it: a static decoder buffer, raw-block mode.
  * Every frame here is a few hand-built header fields, not a real stream; the
- * point is the guards on max_sfb, section data, pulse data and over-reads. */
+ * point is the guards on max_sfb, section, pulse, TNS and gain control data
+ * and over-reads. */
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -139,6 +140,32 @@ int main(void) {
     begin(&f, AAC_ID_SCE); ics_long(&f, 0);
     put(&f, 1, 1); put(&f, 0, 2); put(&f, 49, 6); put(&f, 0, 5); put(&f, 1, 4);
     put(&f, 0, 2); put(&f, AAC_ID_END, 3);
+    assert(decode(&f, 1) < 0);
+
+    /* TNS, long window: three filters of order 20 fill coef[60] exactly; the
+     * 5-bit order field allows 31, i.e. 93 coefficients into coef[60]. */
+    for (unsigned order = 20; order <= 31; order += 11) {
+        begin(&f, AAC_ID_SCE); ics_long(&f, 0);
+        put(&f, 0, 1);                       /* pulse_data_present */
+        put(&f, 1, 1); put(&f, 3, 2); put(&f, 1, 1);  /* tns: n_filt 3, coef_res */
+        for (unsigned i = 0; i < 3; i++) {
+            put(&f, 0, 6); put(&f, order, 5); put(&f, 0, 1); put(&f, 0, 1);
+            for (unsigned k = 0; k < order; k++) put(&f, 0, 4);
+        }
+        put(&f, 0, 1); put(&f, AAC_ID_END, 3);
+        assert((decode(&f, 1) == ERR_AAC_NONE) == (order == 20));
+    }
+
+    /* Gain control is SSR only. With max_band 3 Helix wrote row 3 of the
+     * [MAX_GAIN_BANDS = 3] arrays, 8 windows deep for a short block. */
+    begin(&f, AAC_ID_SCE);
+    put(&f, 100, 8);
+    put(&f, 0, 1); put(&f, 2, 2); put(&f, 0, 1);  /* EIGHT_SHORT_SEQUENCE */
+    put(&f, 0, 4); put(&f, 0x7f, 7);              /* max_sfb 0, one group */
+    put(&f, 0, 1); put(&f, 0, 1);                 /* no pulse (unused), no TNS */
+    put(&f, 1, 1); put(&f, 3, 2);                 /* gain_control_data, max_band 3 */
+    for (unsigned i = 0; i < 3 * 8; i++) put(&f, 0, 3);
+    put(&f, AAC_ID_END, 3);
     assert(decode(&f, 1) < 0);
 
     puts("test_aac: all passed");

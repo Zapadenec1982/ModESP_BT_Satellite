@@ -124,8 +124,10 @@ static int DecodeChannelPairElement(AACDecInfo *aacDecInfo, BitStreamInfo *bsi)
 					currBit = (unsigned char)GetBits(bsi, 1);
 					*maskPtr |= currBit << maskOffset;
 					if (++maskOffset == 8) {
-						maskPtr++;
-						*maskPtr = 0;
+						/* 15 sfb * 8 groups fills msMaskBits exactly; do not
+						 * clear the byte past it after the last bit */
+						if (++maskPtr < psi->msMaskBits + MAX_MS_MASK_BYTES)
+							*maskPtr = 0;
 						maskOffset = 0;
 					}
 				}		

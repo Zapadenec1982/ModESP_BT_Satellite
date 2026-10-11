@@ -19,16 +19,21 @@ def main():
     # The decoder's overruns are what this is about; use ASan where the compiler has it.
     probe = out / 'asan_probe.c'
     probe.write_text('int main(void){return 0;}\n')
-    asan = subprocess.call([args.cc, '-fsanitize=address', str(probe), '-o', str(out / 'asan_probe.exe')],
-                           env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+    def supported(flags):
+        return subprocess.call([args.cc, *flags, str(probe), '-o', str(out / 'asan_probe.exe')],
+                               env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+    asan = ['-fsanitize=address'] if supported(['-fsanitize=address']) else []
     if not asan:
         print('run_aac_tests: no ASan here, relying on the guard band.')
+    # ASan cannot see an index past a row that stays inside PSInfoBase; bounds can.
+    bounds = ['-fsanitize=bounds', '-fno-sanitize-recover=bounds']
+    bounds = bounds if supported(asan + bounds) else []
     exe = out / 'test_aac.exe'
     # The same files as the component's CMakeLists, in patches/0001.
     names = ('aacdec', 'aactabs', 'bitstream', 'buffers', 'dct4', 'decelmnt', 'dequant', 'fft',
              'filefmt', 'huffman', 'hufftabs', 'imdct', 'noiseless', 'pns', 'stproc', 'tns', 'trigtabs')
     sources = [helix / (name + '.c') for name in names] + [ROOT / 'tests/host/test_aac.c']
-    subprocess.run([args.cc, '-std=c17', '-O1', '-g', *(['-fsanitize=address'] if asan else []),
+    subprocess.run([args.cc, '-std=c17', '-O1', '-g', *asan, *bounds,
                     '-Werror=implicit-function-declaration', '-I'+str(helix),
                     *map(str, sources), '-o', str(exe)],
                    env=env, check=True)

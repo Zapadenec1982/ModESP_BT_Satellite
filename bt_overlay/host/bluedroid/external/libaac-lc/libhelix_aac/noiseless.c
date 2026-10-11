@@ -288,12 +288,13 @@ static int DecodeOneScaleFactor(BitStreamInfo *bsi)
  * Outputs:     updated TNSInfo struct
  *              buffer of decoded (signed) TNS filter coefficients
  *
- * Return:      none
+ * Return:      0 if successful, error code (< 0) if a long-window filter order
+ *                would not fit in tnsCoef (MAX_TNS_COEFS = 3 * MAX_TNS_ORDER)
  **************************************************************************************/
 static const signed char sgnMask[3] = {0x02,  0x04,  0x08};
 static const signed char negMask[3] = {~0x03, ~0x07, ~0x0f};
 
-static void DecodeTNSInfo(BitStreamInfo *bsi, int winSequence, TNSInfo *ti, signed char *tnsCoef)
+static int DecodeTNSInfo(BitStreamInfo *bsi, int winSequence, TNSInfo *ti, signed char *tnsCoef)
 {
 	int i, w, f, coefBits, compress;
 	signed char c, s, n;
@@ -336,6 +337,11 @@ static void DecodeTNSInfo(BitStreamInfo *bsi, int winSequence, TNSInfo *ti, sign
 		for (f = 0; f < ti->numFilt[0]; f++) {
 			*filtLength =      GetBits(bsi, 6);
 			*filtOrder =       GetBits(bsi, 5);
+			/* the field is 5 bits, but 3 filters of order 31 overrun coef[] */
+			if (*filtOrder > MAX_TNS_ORDER) {
+				ti->numFilt[0] = 0;
+				return ERR_AAC_INVALID_FRAME;
+			}
 			if (*filtOrder) {
 				*filtDir++ =     GetBits(bsi, 1);
 				compress =       GetBits(bsi, 1);
@@ -352,52 +358,8 @@ static void DecodeTNSInfo(BitStreamInfo *bsi, int winSequence, TNSInfo *ti, sign
 			filtOrder++;
 		}
 	}
-}
 
-/* bitstream field lengths for gain control data:
- *   gainBits[winSequence][0] = maxWindow (how many gain windows there are)
- *   gainBits[winSequence][1] = locBitsZero (bits for alocCode if window == 0)
- *   gainBits[winSequence][2] = locBits (bits for alocCode if window != 0)
- */
-static const unsigned char gainBits[4][3] = {
-	{1, 5, 5},  /* long */
-	{2, 4, 2},  /* start */
-	{8, 2, 2},  /* short */
-	{2, 4, 5},  /* stop */
-};
-
-/**************************************************************************************
- * Function:    DecodeGainControlInfo
- *
- * Description: decode gain control information (SSR profile only)
- *
- * Inputs:      BitStreamInfo struct pointing to start of gain control info
- *                (14496-3, table 4.4.12)
- *              window sequence (short or long blocks)
- *
- * Outputs:     updated GainControlInfo struct
- *
- * Return:      none
- **************************************************************************************/
-static void DecodeGainControlInfo(BitStreamInfo *bsi, int winSequence, GainControlInfo *gi)
-{
-	int bd, wd, ad;
-	int locBits, locBitsZero, maxWin;
-	
-	gi->maxBand = GetBits(bsi, 2);
-	maxWin =      (int)gainBits[winSequence][0];
-	locBitsZero = (int)gainBits[winSequence][1];
-	locBits =     (int)gainBits[winSequence][2];
-
-	for (bd = 1; bd <= gi->maxBand; bd++) {
-		for (wd = 0; wd < maxWin; wd++) {
-			gi->adjNum[bd][wd] = GetBits(bsi, 3);
-			for (ad = 0; ad < gi->adjNum[bd][wd]; ad++) {
-				gi->alevCode[bd][wd][ad] = GetBits(bsi, 4);
-				gi->alocCode[bd][wd][ad] = GetBits(bsi, (wd == 0 ? locBitsZero : locBits));
-			}
-		}
-	}
+	return ERR_AAC_NONE;
 }
 
 /**************************************************************************************
@@ -460,13 +422,23 @@ static int DecodeICS(PSInfoBase *psi, BitStreamInfo *bsi, int ch)
 
 	ti = &psi->tnsInfo[ch];
 	ti->tnsDataPresent = GetBits(bsi, 1);
-	if (ti->tnsDataPresent)
-		DecodeTNSInfo(bsi, icsInfo->winSequence, ti, ti->coef);
+	if (ti->tnsDataPresent) {
+		err = DecodeTNSInfo(bsi, icsInfo->winSequence, ti, ti->coef);
+		if (err) {
+			ti->tnsDataPresent = 0;
+			return err;
+		}
+	}
 
+	/* Gain control is SSR only; in AAC-LC, the only profile this decoder runs,
+	 * the flag must be 0. (Helix's parser for it wrote max_band 3 one row past
+	 * the MAX_GAIN_BANDS arrays, so it is gone rather than kept unreachable.) */
 	gi = &psi->gainControlInfo[ch];
 	gi->gainControlDataPresent = GetBits(bsi, 1);
-	if (gi->gainControlDataPresent)
-		DecodeGainControlInfo(bsi, icsInfo->winSequence, gi);
+	if (gi->gainControlDataPresent) {
+		gi->gainControlDataPresent = 0;
+		return ERR_AAC_INVALID_FRAME;
+	}
 
 	return ERR_AAC_NONE;
 }
