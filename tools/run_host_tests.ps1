@@ -145,4 +145,8 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 & $Python (Join-Path $repoRoot 'tools\run_lhdc_tests.py') --cc $Cc
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# The Helix AAC decoder must refuse malformed frames, not overrun or spin on them.
+& $Python (Join-Path $repoRoot 'tools\run_aac_tests.py') --cc $Cc
 exit $LASTEXITCODE

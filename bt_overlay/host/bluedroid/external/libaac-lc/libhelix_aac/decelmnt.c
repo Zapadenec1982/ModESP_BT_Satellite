@@ -112,7 +112,8 @@ static int DecodeChannelPairElement(AACDecInfo *aacDecInfo, BitStreamInfo *bsi)
 	 */
 	psi->commonWin = GetBits(bsi, 1);
 	if (psi->commonWin) {
-		DecodeICSInfo(bsi, icsInfo, psi->sampRateIdx);
+		if (DecodeICSInfo(bsi, icsInfo, psi->sampRateIdx))
+			return -1;
 		psi->msMaskPresent = GetBits(bsi, 2);
 		if (psi->msMaskPresent == 1) {
 			maskPtr = psi->msMaskBits;

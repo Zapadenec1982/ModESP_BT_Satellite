@@ -63,9 +63,10 @@
  *
  * Outputs:     updated icsInfo struct
  *
- * Return:      none
+ * Return:      0 if successful, error code (< 0) if max_sfb exceeds the number of
+ *                scalefactor bands at this sample rate (maxSFB is then set to 0)
  **************************************************************************************/
-/* __attribute__ ((section (".data"))) */ void DecodeICSInfo(BitStreamInfo *bsi, ICSInfo *icsInfo, int sampRateIdx)
+/* __attribute__ ((section (".data"))) */ int DecodeICSInfo(BitStreamInfo *bsi, ICSInfo *icsInfo, int sampRateIdx)
 {
 	int sfb, g, mask;
 
@@ -102,6 +103,13 @@
 		icsInfo->numWinGroup = 1;
 		icsInfo->winGroupLen[0] = 1;
 	}
+
+	/* every table indexed by maxSFB has only the bands of this sample rate */
+	if (icsInfo->maxSFB > (int)(icsInfo->winSequence == 2 ? sfBandTotalShort[sampRateIdx] : sfBandTotalLong[sampRateIdx])) {
+		icsInfo->maxSFB = 0;
+		return ERR_AAC_INVALID_FRAME;
+	}
+	return ERR_AAC_NONE;
 }
 
 /**************************************************************************************
@@ -118,11 +126,12 @@
  *
  * Outputs:     index of Huffman codebook for each scalefactor band in each section
  *
- * Return:      none
+ * Return:      0 if successful, error code (< 0) if a section runs past maxSFB or
+ *                the bitstream runs out
  *
  * Notes:       sectCB, sectEnd, sfbCodeBook, ordered by window groups for short blocks
  **************************************************************************************/
-/* __attribute__ ((section (".data"))) */ static void DecodeSectionData(BitStreamInfo *bsi, int winSequence, int numWinGrp, int maxSFB, unsigned char *sfbCodeBook)
+/* __attribute__ ((section (".data"))) */ static int DecodeSectionData(BitStreamInfo *bsi, int winSequence, int numWinGrp, int maxSFB, unsigned char *sfbCodeBook)
 {
 	int g, cb, sfb;
 	int sectLen, sectLenBits, sectLenIncr, sectEscapeVal;
@@ -140,12 +149,19 @@
 				sectLen += sectLenIncr;
 			} while (sectLenIncr == sectEscapeVal);
 
+			/* GetBits() returns zeros past the end of the buffer, so a truncated frame
+			 * would add empty sections forever; and sfbCodeBook has room for maxSFB only
+			 */
+			if (bsi->cachedBits < 0 || sectLen > maxSFB - sfb)
+				return ERR_AAC_INVALID_FRAME;
+
 			sfb += sectLen;
 			while (sectLen--)
 				*sfbCodeBook++ = (unsigned char)cb;
 		}
 		ASSERT(sfb == maxSFB);
 	}
+	return ERR_AAC_NONE;
 }
 
 /**************************************************************************************
@@ -397,11 +413,11 @@ static void DecodeGainControlInfo(BitStreamInfo *bsi, int winSequence, GainContr
  * Outputs:     updated section data, scale factor data, pulse data, TNS data, 
  *                and gain control data
  *
- * Return:      none
+ * Return:      0 if successful, error code (< 0) if error
  **************************************************************************************/
-static void DecodeICS(PSInfoBase *psi, BitStreamInfo *bsi, int ch)
+static int DecodeICS(PSInfoBase *psi, BitStreamInfo *bsi, int ch)
 {
-	int globalGain;
+	int globalGain, err, i, offset;
 	ICSInfo *icsInfo;
 	PulseInfo *pi;
 	TNSInfo *ti;
@@ -410,17 +426,37 @@ static void DecodeICS(PSInfoBase *psi, BitStreamInfo *bsi, int ch)
 	icsInfo = (ch == 1 && psi->commonWin == 1) ? &(psi->icsInfo[0]) : &(psi->icsInfo[ch]);
 
 	globalGain = GetBits(bsi, 8);
-	if (!psi->commonWin)
-		DecodeICSInfo(bsi, icsInfo, psi->sampRateIdx);
+	if (!psi->commonWin) {
+		err = DecodeICSInfo(bsi, icsInfo, psi->sampRateIdx);
+		if (err)
+			return err;
+	}
 
-	DecodeSectionData(bsi, icsInfo->winSequence, icsInfo->numWinGroup, icsInfo->maxSFB, psi->sfbCodeBook[ch]);
+	err = DecodeSectionData(bsi, icsInfo->winSequence, icsInfo->numWinGroup, icsInfo->maxSFB, psi->sfbCodeBook[ch]);
+	if (err)
+		return err;
 
 	DecodeScaleFactors(bsi, icsInfo->numWinGroup, icsInfo->maxSFB, globalGain, psi->sfbCodeBook[ch], psi->scaleFactors[ch]);
 	
 	pi = &psi->pulseInfo[ch];
 	pi->pulseDataPresent = GetBits(bsi, 1);
-	if (pi->pulseDataPresent)
+	if (pi->pulseDataPresent) {
 		DecodePulseInfo(bsi, pi);
+		/* DecodeSpectrumLong() adds the pulses at these positions in coef[ch] */
+		if (icsInfo->winSequence != 2) {
+			if (pi->startSFB >= sfBandTotalLong[psi->sampRateIdx]) {
+				pi->pulseDataPresent = 0;
+				return ERR_AAC_INVALID_FRAME;
+			}
+			offset = sfBandTabLong[sfBandTabLongOffset[psi->sampRateIdx] + pi->startSFB];
+			for (i = 0; i < pi->numPulse; i++)
+				offset += pi->offset[i];
+			if (offset >= NSAMPS_LONG) {
+				pi->pulseDataPresent = 0;
+				return ERR_AAC_INVALID_FRAME;
+			}
+		}
+	}
 
 	ti = &psi->tnsInfo[ch];
 	ti->tnsDataPresent = GetBits(bsi, 1);
@@ -431,6 +467,8 @@ static void DecodeICS(PSInfoBase *psi, BitStreamInfo *bsi, int ch)
 	gi->gainControlDataPresent = GetBits(bsi, 1);
 	if (gi->gainControlDataPresent)
 		DecodeGainControlInfo(bsi, icsInfo->winSequence, gi);
+
+	return ERR_AAC_NONE;
 }
 
 /**************************************************************************************
@@ -452,7 +490,7 @@ static void DecodeICS(PSInfoBase *psi, BitStreamInfo *bsi, int ch)
  **************************************************************************************/
 int DecodeNoiselessData(AACDecInfo *aacDecInfo, unsigned char **buf, int *bitOffset, int *bitsAvail, int ch)
 {
-	int bitsUsed;
+	int bitsUsed, err;
 	BitStreamInfo bsi;
 	PSInfoBase *psi;
 	ICSInfo *icsInfo;
@@ -463,10 +501,16 @@ int DecodeNoiselessData(AACDecInfo *aacDecInfo, unsigned char **buf, int *bitOff
 	psi = (PSInfoBase *)(aacDecInfo->psInfoBase);
 	icsInfo = (ch == 1 && psi->commonWin == 1) ? &(psi->icsInfo[0]) : &(psi->icsInfo[ch]);
 	
+	/* the previous channel of this element may have read past the end */
+	if (*bitsAvail < 0)
+		return ERR_AAC_INDATA_UNDERFLOW;
+
 	SetBitstreamPointer(&bsi, (*bitsAvail+7) >> 3, *buf);
 	GetBits(&bsi, *bitOffset);
 
-	DecodeICS(psi, &bsi, ch);
+	err = DecodeICS(psi, &bsi, ch);
+	if (err)
+		return err;
 
 	if (icsInfo->winSequence == 2)
 		DecodeSpectrumShort(psi, &bsi, ch);
