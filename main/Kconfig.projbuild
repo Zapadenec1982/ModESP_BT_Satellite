@@ -55,8 +55,9 @@ config SAT_CLOCK_PROBE
     bool "Measure the I2S bit clock and log it"
     default n
     help
-        Feeds the BCLK pin's own output back into the pulse counter and reports
-        the frequency every five seconds. No wire and no oscilloscope.
+        Counts edges on the BCLK and WS pads through their input buffers and
+        reports the frequency every six seconds, without ever driving them. No
+        wire and no oscilloscope.
 
         It exists because "does the clock keep running when nothing is playing"
         is a question the host's receiver depends on, and one that deserves a

@@ -68,7 +68,10 @@ void bt_av_bt_refresh(void);
  */
 void bt_av_apply_host_caps(void);
 
-void bt_av_report_state(void);
+/* From the link's task: queue a BT_STATE for the Bluetooth task, which owns the
+ * phone's state, address and name, so the message is never built from a half-written
+ * name. False when it could not be queued, so the caller can ask again later. */
+bool bt_av_request_state(void);
 void bt_av_report_stream_fmt(void);
 
 /*

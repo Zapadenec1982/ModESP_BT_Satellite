@@ -99,11 +99,26 @@ tA2D_STATUS A2DP_IsVendorSinkCodecSupported(const uint8_t* p_codec_info) {
   uint32_t vendor_id = A2DP_VendorCodecGetVendorId(p_codec_info);
   uint16_t codec_id = A2DP_VendorCodecGetCodecId(p_codec_info);
 
+  /* The SET_CONFIGURATION check for a local Sink: one value per field, not the
+   * capability masks A2DP_IsVendorPeerSourceCodecSupported accepts. */
+#if (defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE)
+  if (vendor_id == A2DP_APTX_VENDOR_ID &&
+      codec_id == A2DP_APTX_CODEC_ID_BLUETOOTH) {
+    return A2DP_IsVendorSinkCodecSupportedAptx(p_codec_info);
+  }
+  if (vendor_id == A2DP_APTX_HD_VENDOR_ID &&
+      codec_id == A2DP_APTX_HD_CODEC_ID_BLUETOOTH) {
+    return A2DP_IsVendorSinkCodecSupportedAptxHd(p_codec_info);
+  }
+#endif /* defined(APTX_DEC_INCLUDED) && APTX_DEC_INCLUDED == TRUE) */
+#if (defined(LHDCV5_DEC_INCLUDED) && LHDCV5_DEC_INCLUDED == TRUE)
+  if (vendor_id == A2DP_LHDCV5_VENDOR_ID && codec_id == A2DP_LHDCV5_CODEC_ID) {
+    return A2DP_IsVendorPeerSourceCodecValidLhdcV5(p_codec_info);
+  }
+#endif
+
   UNUSED(vendor_id);
   UNUSED(codec_id);
-
-  // Add checks based on <vendor_id, codec_id>
-  // NOTE: Should be done only for local Sink codecs.
 
   return A2D_FAIL;
 }

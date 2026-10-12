@@ -88,8 +88,66 @@ static void pacing_tests(void) {
     r->handle=1; cover_schedule_continue(r);
     cover_continue_cb(&cover_continue_timer[1]); CHECK(sent==2);
 }
+/* What bt_av.c does when the OBEX channel closes, walked through the ways it closes. */
+static void refetch_tests(void) {
+    /* The old track's drain ended in an OBEX error: cover_on_data cleared busy and
+     * asked for the close. The new track's handle came during the drain. */
+    CHECK(cover_refetch_on_close(true,false,false,true));
+    // The channel dropped by itself in the middle of that drain.
+    CHECK(cover_refetch_on_close(false,true,true,true));
+    // No handle for the new track yet: its metadata answer will fetch it.
+    CHECK(!cover_refetch_on_close(true,false,false,false));
+    CHECK(!cover_refetch_on_close(false,true,true,false));
+    // The current track's own transfer died: part of it may be out, so COVER_RETRY.
+    CHECK(!cover_refetch_on_close(false,false,false,true));
+    CHECK(!cover_refetch_on_close(false,true,false,true));
+    // A GET of the current track went out before the drain's close arrived.
+    CHECK(!cover_refetch_on_close(true,true,false,true));
+    /* The flag is spent on the first close, so the reconnect failing as well closes
+     * with nothing pending and no further attempt. */
+    CHECK(!cover_refetch_on_close(false,false,true,true));
+}
+/* The device's COVER_RETRY bound, driven the way bt_av.c drives it: track change,
+ * COVER_END queued for a generation, and the host asking for the current one again. */
+static unsigned retry_chain(bool retry_before_end, unsigned cycles) {
+    cover_retry_t r; cover_retry_track_change(&r);
+    uint32_t gen=7; unsigned honoured=0;
+    for (unsigned i=0;i<cycles;++i,++gen) {
+        // Every image loses a part on the UART: the device sends it whole each time.
+        if (!retry_before_end) cover_retry_completed(&r,gen);
+        if (!cover_retry_take(&r,gen)) break;
+        ++honoured;
+        if (retry_before_end) cover_retry_completed(&r,gen);
+    }
+    return honoured;
+}
+static void retry_tests(void) {
+    // The host asks after COVER_END (CRC/length mismatch) or mid-stream (a gap).
+    CHECK(retry_chain(false,10)==COVER_RETRY_MAX);
+    CHECK(retry_chain(true,10)==COVER_RETRY_MAX);
+    cover_retry_t r; cover_retry_track_change(&r);
+    // The device itself aborted (no COVER_END): nothing refills.
+    CHECK(cover_retry_take(&r,1)); CHECK(cover_retry_take(&r,2)); CHECK(!cover_retry_take(&r,3));
+    // A real track change gives the next image its own allowance.
+    cover_retry_track_change(&r);
+    CHECK(cover_retry_take(&r,4));
+    /* That repeat arrived and the host never named it: a successful transfer. A later
+     * generation of the same track (a HELLO) that fails gets the full allowance. */
+    cover_retry_completed(&r,5);
+    cover_retry_completed(&r,6);
+    CHECK(cover_retry_take(&r,6));
+    cover_retry_completed(&r,7);
+    CHECK(cover_retry_take(&r,7));
+    cover_retry_completed(&r,8);
+    CHECK(!cover_retry_take(&r,8));
+    // Refused stays refused until the track changes.
+    CHECK(!cover_retry_take(&r,8));
+    cover_retry_track_change(&r);
+    cover_retry_completed(&r,9);
+    CHECK(cover_retry_take(&r,9));
+}
 int main(void) {
-    pacing_tests(); stream_tests();
+    pacing_tests(); stream_tests(); refetch_tests(); retry_tests();
     printf("Cover streaming/pacing: %d checks, %d failures\n",g_checks,g_failures);
     return g_failures?1:0;
 }

@@ -41,6 +41,10 @@
  * February 2005
  *
  * bitstream.c - bitstream parsing functions
+ *
+ * Modified 2026-10-12 for modesp-bt-satellite, bounds checks against malformed
+ * frames: RefillBitstreamCache() treats a negative byte count as an empty
+ * buffer.
  **************************************************************************************/
 
 #include "bitstream.h"
@@ -86,6 +90,9 @@ void SetBitstreamPointer(BitStreamInfo *bsi, int nBytes, unsigned char *buf)
 static __inline void RefillBitstreamCache(BitStreamInfo *bsi)
 {
 	int nBytes = bsi->nBytes;	
+	/* a negative count (a caller that ran past the end) is an empty buffer */
+	if (nBytes < 0)
+		nBytes = bsi->nBytes = 0;
 	if (nBytes >= 4) {
 		/* optimize for common case, independent of machine endian-ness */
 		bsi->iCache  = (*bsi->bytePtr++) << 24;

@@ -131,6 +131,10 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $Python (Join-Path $repoRoot 'tools\run_hello_tests.py') --cc $Cc
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+# A UART event that announces fewer bytes than are buffered must not strand the rest.
+& $Python (Join-Path $repoRoot 'tools\run_link_rx_tests.py') --cc $Cc
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 # Cover buffering must survive fragmented heaps and cancel delayed OBEX pulls.
 & $Python (Join-Path $repoRoot 'tools\run_cover_tests.py') --cc $Cc
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -145,4 +149,20 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 & $Python (Join-Path $repoRoot 'tools\run_lhdc_tests.py') --cc $Cc
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# The Helix AAC decoder must refuse malformed frames, not overrun or spin on them.
+& $Python (Join-Path $repoRoot 'tools\run_aac_tests.py') --cc $Cc
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# The SBC sink offers stereo only and still decodes a mono stream to both channels.
+& $Python (Join-Path $repoRoot 'tools\run_sbc_tests.py') --cc $Cc
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# Reconnecting as initiator must skip a source SEP that builds no config, not send garbage.
+& $Python (Join-Path $repoRoot 'tools\run_sink_getconfig_tests.py') --cc $Cc
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# SET_CONFIGURATION must name one value per field, not pass a 44.1|48 mask for 48 kHz.
+& $Python (Join-Path $repoRoot 'tools\run_sink_setconfig_tests.py') --cc $Cc
 exit $LASTEXITCODE

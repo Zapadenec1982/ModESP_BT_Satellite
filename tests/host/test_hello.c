@@ -12,6 +12,7 @@ int g_checks, g_failures;
 #define LINK_BUILD_MAX 80
 #define LINK_BUF_HELLO (1 + 1 + 4 + 2 + LINK_BUILD_MAX)
 #define LINK_HELLO_MIN_GAP_US (1000 * 1000)
+#define LINK_HELLO_RETRY_SLACK_US (50 * 1000)
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGE(...) ((void)0)
 #define ESP_LOGW(...) ((void)0)
@@ -44,7 +45,15 @@ static void tx_push(uint8_t type, const uint8_t *payload, size_t len) {
 static void on_hello(const satlink_hello_t *h) { (void)h; callbacks++; }
 // Stands in for the I2S role switch: device bit 8 follows host bit 8.
 static uint32_t own_caps_for(uint32_t host_caps) { return host_caps & SATLINK_HOST_CAP_I2S_MASTER; }
+// Records whether the host was already published as present when its caps were
+// stored: link_wait_for_host reads the caps as soon as it sees the flag.
+static bool present_at_caps_store;
+static void note_store(const void *p) {
+    if (p == (const void *)&s_host_caps) present_at_caps_store = s_host_present;
+}
+#define __atomic_store_n(p, v, o) (note_store((const void *)(p)), __atomic_store_n((p), (v), (o)))
 #include "hello_handlers.inc"
+#undef __atomic_store_n
 static void reset_case(void) {
     s_hello_mux = 0;
     s_host_present = s_peer_incompatible = false;
@@ -60,8 +69,12 @@ static void receive_hello(unsigned major, unsigned minor, uint32_t caps) {
     size_t len = satlink_enc_hello(payload, sizeof payload, &h);
     CHECK(len != 0); handle_hello(payload, len);
 }
+// The ping timer ticks on a fixed grid but is seen with jitter: alternate a
+// tick seen 10 us late with one seen 10 us early, as esp_timer dispatch does.
 static void beat(void) {
-    clock_us += 1000000;
+    static int late;
+    late = !late;
+    clock_us += late ? 1000010 : 999990;
     // Successful PONGs do not mean we received the peer's capabilities.
     s_ping_outstanding = 0; ping_tick(NULL);
 }
@@ -126,7 +139,20 @@ int main(void) {
     receive_hello(1, 9, 0x1fb); CHECK(hellos == 2);  // unchanged: rate limited
     receive_hello(1, 8, 0x1fb); CHECK(s_host_caps == 0xfb); CHECK(s_own_caps == 0);
     CHECK(hellos == 3);
-    // Reply and retry share the same rate limiter.
+    // No host: one retry per tick, even when a tick is seen a little early.
+    reset_case(); answer_hello(false);
+    for (int i=0; i<10; i++) beat();
+    CHECK(hellos == 11); CHECK(pings == 10);
+    // The slack is for jitter only: a tick far short of a second is refused.
+    reset_case(); answer_hello(false); clock_us += 900000; ping_tick(NULL);
+    CHECK(hellos == 1); CHECK(pings == 1);
+    // A host HELLO inside the second after ours, caps unchanged, gets no reply.
+    reset_case(); answer_hello(false); clock_us += 990000;
+    receive_hello(1, 9, 0xfb); CHECK(s_host_present); CHECK(hellos == 1);
+    // A reader that sees the host present must also see its caps: presence last.
+    reset_case(); present_at_caps_store = true; receive_hello(1, 9, 0xfb);
+    CHECK(!present_at_caps_store); CHECK(s_host_present); CHECK(s_host_caps == 0xfb);
+    // Replies keep the strict gap: one a microsecond short of a second is refused.
     reset_case(); answer_hello(false); clock_us += 999999; answer_hello(false);
     CHECK(hellos == 1); clock_us++; answer_hello(false); CHECK(hellos == 2);
     printf("HELLO recovery: %d checks, %d failures\n", g_checks, g_failures);

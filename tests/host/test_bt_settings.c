@@ -204,6 +204,32 @@ static void test_bonds_follow_the_stack(void)
     CHECK_EQ(t.count, 1);
 }
 
+/* A pairing names the phone in BT_STATE only when it is that phone, attached. */
+static void test_names_attached(void)
+{
+    CHECK(bond_names_attached(SATLINK_BT_CONNECTED, A, A));
+    CHECK(bond_names_attached(SATLINK_BT_STREAMING, A, A));
+    CHECK(!bond_names_attached(SATLINK_BT_STREAMING, A, B));    /* B pairs while A plays */
+    CHECK(!bond_names_attached(SATLINK_BT_CONNECTED, A, B));
+    CHECK(!bond_names_attached(SATLINK_BT_CONNECTING, A, A));
+    static const uint8_t none[6] = { 0 };
+    CHECK(!bond_names_attached(SATLINK_BT_DISCOVERABLE, none, B));  /* pairs, never connects */
+    CHECK(!bond_names_attached(SATLINK_BT_IDLE, none, none));
+
+    /* The name it brings, as the stack hands it over: 40 Cyrillic letters, 80 bytes,
+     * kept to 32 on a character boundary and still text. */
+    char raw[81];
+    for (int i = 0; i < 40; i++) {
+        raw[2 * i] = (char)0xD0;
+        raw[2 * i + 1] = (char)0x90;                        /* А */
+    }
+    raw[80] = '\0';
+    size_t len = bt_utf8_clip(raw, strlen(raw), SATLINK_BT_NAME_MAX);
+    CHECK_EQ(len, 32);
+    CHECK(bt_utf8_valid(raw, len));
+    CHECK_EQ(bt_utf8_clip(raw, 80, 63), 62);                /* never half a letter */
+}
+
 static void test_bonds_full_and_saved(void)
 {
     static bond_table_t t, back;
@@ -407,6 +433,7 @@ int main(void)
     test_apply_set();
     test_settings_blob();
     test_bonds_follow_the_stack();
+    test_names_attached();
     test_bonds_full_and_saved();
     test_pair_without_host();
     test_pair_numeric_yes();

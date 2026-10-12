@@ -217,6 +217,16 @@ uint32_t satlink_sanitize_total_ms(int64_t reported_ms)
     return (uint32_t)reported_ms;
 }
 
+bool satlink_elapsed_known(uint32_t reported_ms)
+{
+    return reported_ms <= 24UL * 60 * 60 * 1000;
+}
+
+uint32_t satlink_sanitize_elapsed_ms(uint32_t reported_ms)
+{
+    return satlink_elapsed_known(reported_ms) ? reported_ms : 0;
+}
+
 /* ----------------------------------------------------------------- STREAM_FMT */
 
 size_t satlink_enc_stream_fmt(uint8_t *buf, size_t cap, const satlink_stream_fmt_t *m)

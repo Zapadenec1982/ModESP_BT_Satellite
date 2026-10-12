@@ -165,6 +165,14 @@ static inline bool bond_set_name(bond_table_t *t, const uint8_t addr[6], const c
     return true;
 }
 
+/* Whether a name learned at pairing or from a name read is the name of the phone
+ * BT_STATE shows: only when it is that phone, and attached. Another phone may pair
+ * while one is playing, and its name must not stand next to the first one's address. */
+static inline bool bond_names_attached(uint8_t state, const uint8_t now_addr[6], const uint8_t addr[6])
+{
+    return state >= SATLINK_BT_CONNECTED && memcmp(now_addr, addr, 6) == 0;
+}
+
 /* The NVS record: version, count, the counter, then per entry the address, its
  * seq and the name with its length. */
 #define BOND_TABLE_BLOB_VERSION 1

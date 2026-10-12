@@ -41,6 +41,10 @@
  * February 2005
  *
  * decelmnt.c - syntactic element decoding
+ *
+ * Modified 2026-10-12 for modesp-bt-satellite, bounds checks against malformed
+ * frames: the CPE propagates a DecodeICSInfo() error, and the M/S mask loop no
+ * longer clears the byte past msMaskBits.
  **************************************************************************************/
 
 #include "coder.h"
@@ -112,7 +116,8 @@ static int DecodeChannelPairElement(AACDecInfo *aacDecInfo, BitStreamInfo *bsi)
 	 */
 	psi->commonWin = GetBits(bsi, 1);
 	if (psi->commonWin) {
-		DecodeICSInfo(bsi, icsInfo, psi->sampRateIdx);
+		if (DecodeICSInfo(bsi, icsInfo, psi->sampRateIdx))
+			return -1;
 		psi->msMaskPresent = GetBits(bsi, 2);
 		if (psi->msMaskPresent == 1) {
 			maskPtr = psi->msMaskBits;
@@ -123,8 +128,10 @@ static int DecodeChannelPairElement(AACDecInfo *aacDecInfo, BitStreamInfo *bsi)
 					currBit = (unsigned char)GetBits(bsi, 1);
 					*maskPtr |= currBit << maskOffset;
 					if (++maskOffset == 8) {
-						maskPtr++;
-						*maskPtr = 0;
+						/* 15 sfb * 8 groups fills msMaskBits exactly; do not
+						 * clear the byte past it after the last bit */
+						if (++maskPtr < psi->msMaskBits + MAX_MS_MASK_BYTES)
+							*maskPtr = 0;
 						maskOffset = 0;
 					}
 				}		

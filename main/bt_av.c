@@ -1,10 +1,13 @@
 #include "bt_av.h"
+#include "avrc_volume.h"
 #include "bond_table.h"
 #include "bt_settings.h"
 #include "cover_stream.h"
 #include "endpoint_policy.h"
 #include "esp_heap_caps.h"
+#include "format_policy.h"
 #include "pair_policy.h"
+#include "pause_policy.h"
 #include "reconnect_policy.h"
 #include "satlink/cover_wire.h"
 
@@ -29,6 +32,7 @@
 #include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "satlink/proto.h"
 
@@ -205,15 +209,17 @@ static ep_fsm_t s_endpoints;            /* bt_av task only */
  * still gets the endpoints registered again (endpoint_policy.h). */
 #define BT_AV_HELLO_WAIT_MS 10000
 static atomic_bool s_caps_pending;
+static bool s_fmt_slave;                /* the I2S role the current transaction was begun in */
 static atomic_bool s_cover_refresh;
 static atomic_bool s_cover_query;
 static atomic_uint s_cover_epoch;
 static uint32_t s_cover_nonce;
-/* Repeats of ONE image already served, bounded by COVER_RETRY_MAX. Zeroed by a real
- * track change and by a transfer that completed -- both are evidence that the next
- * image starts from a clean link. Atomic because the link task raises it and the
- * Bluetooth callback task clears it. */
-static atomic_uint s_cover_retries;
+/* Repeats of ONE image already served, bounded by COVER_RETRY_MAX (cover_stream.h).
+ * Refilled by a real track change and by a transfer that completed and that the host
+ * did not then ask for again. Under a lock because the link task raises it and the
+ * Bluetooth callback task refills it. */
+static cover_retry_t s_cover_retries;
+static portMUX_TYPE s_cover_retry_mux = portMUX_INITIALIZER_UNLOCKED;
 static atomic_uint s_latest_codec_epoch;
 static uint32_t s_codec_epoch;
 static fmt_barrier_t s_format;
@@ -259,6 +265,7 @@ static struct {
     uint32_t elapsed_ms;
     uint32_t total_ms;
     int64_t  elapsed_at_us;         /* when elapsed_ms was true, for interpolation */
+    bool     elapsed_unknown;       /* the phone gave no position: send 0, never count up */
 
     char     title[128];
     char     artist[128];
@@ -282,9 +289,19 @@ static struct {
     uint32_t art_done_generation;
     char     art_request[8];
     bool     art_busy;
+    bool     art_drain_failed;      /* the old track's drain failed: refetch on close */
 } s_now;
 
 static esp_timer_handle_t s_meta_timer;
+
+/* Title, artist and album are written on the BTC task, read by the meta timer on the
+ * esp_timer task and cleared by the bt_av task. s_meta_mux guards the three strings and
+ * s_meta_live (A2DP is up, so TRACK_META may go out): a spinlock, because a Bluetooth
+ * callback must not wait. s_meta_send keeps the timer's send and the empty one on
+ * disconnect in order, so a send already under way cannot land after the empty one. */
+static portMUX_TYPE s_meta_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_meta_live;
+static SemaphoreHandle_t s_meta_send;
 static esp_timer_handle_t s_pos_timer;
 
 /* How long a phone gets to act on the host's PAUSE before the stream itself is suspended.
@@ -310,6 +327,15 @@ static esp_timer_handle_t s_pause_timer;
  * when the phone connects or goes. */
 static atomic_bool s_own_suspend;
 static void resume_own_suspend(const char *why);
+
+static void pause_timer_apply(pause_timer_op_t op)
+{
+    if (op == PAUSE_TIMER_START) {
+        esp_timer_start_once(s_pause_timer, PAUSE_GRACE_US);
+    } else if (op == PAUSE_TIMER_STOP) {
+        esp_timer_stop(s_pause_timer);  /* ESP_ERR_INVALID_STATE when none is pending */
+    }
+}
 
 static const char *conn_state_name(esp_a2d_connection_state_t state)
 {
@@ -401,6 +427,7 @@ static void begin_format(uint32_t rate, uint8_t bits, uint8_t channels, uint8_t 
 {
     s_decoder_bits = source_bits;
     s_now.rate_hz = rate; s_now.bits = bits; s_now.channels = channels;
+    s_fmt_slave = audio_out_is_slave();   /* before the gate: a later role change is seen */
     s_format_pending = false;
     esp_err_t err = audio_out_begin_format(&s_gate_token);
     if (err != ESP_OK) { ESP_LOGE(TAG, "cannot silence I2S: %s", esp_err_to_name(err)); return; }
@@ -438,12 +465,14 @@ void bt_av_cover_retry(uint32_t boot_nonce, uint32_t track_generation)
         track_generation != (uint32_t)atomic_load(&s_cover_epoch)) {
         return;     /* the phone has moved on; the next RESET brings its own image */
     }
-    if (atomic_load(&s_cover_retries) >= COVER_RETRY_MAX) {
+    portENTER_CRITICAL(&s_cover_retry_mux);
+    const bool take = cover_retry_take(&s_cover_retries, track_generation);
+    portEXIT_CRITICAL(&s_cover_retry_mux);
+    if (!take) {
         ESP_LOGW(TAG, "cover art: %u repeats already for generation %" PRIu32 ", not asking the phone again",
                  (unsigned)COVER_RETRY_MAX, track_generation);
         return;
     }
-    atomic_fetch_add(&s_cover_retries, 1);
     /* The same two flags a late HELLO raises. Re-reading the metadata rather than
      * only repeating the GET is deliberate: it refreshes the image handle too, so a
      * retry also recovers the case where the handle, and not the transfer, was the
@@ -558,14 +587,19 @@ static void poll_format(void)
         if (esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS) != ESP_OK)
             atomic_store(&s_cover_refresh, false);
     }
-    if (atomic_exchange(&s_caps_pending, false) && s_now.rate_hz) {
+    /* audio_out_set_role runs on the link task and gates PCM; the new role is followed
+     * here with a new transaction, even when the host's greeting has not been seen yet. */
+    const bool caps_pending = atomic_exchange(&s_caps_pending, false);
+    const bool slave = audio_out_is_slave();
+    if ((caps_pending || slave != s_fmt_slave) && s_now.rate_hz) {
         uint32_t caps = link_host_caps();
         bool ack = (caps & FMT_HOST_CAP) != 0;
         /* 1.9: a host that clocks the link does it in 32-bit slots, whatever the decoder. */
-        uint8_t bits = audio_out_is_slave() ? 32
+        uint8_t bits = slave ? 32
                      : fmt_slot_bits(s_decoder_bits, (caps & SATLINK_HOST_CAP_WIDE) != 0, ack);
-        if (!fmt_valid(&s_format.request) || bits != s_now.bits || ack != s_format.require_ack ||
-            !ep_host_can_follow(s_now.rate_hz, caps))
+        if (fmt_needs_restart(fmt_valid(&s_format.request), s_now.bits, bits,
+                              s_format.require_ack, ack, slave != s_fmt_slave,
+                              ep_host_can_follow(s_now.rate_hz, caps)))
             begin_format(s_now.rate_hz, bits, s_now.channels, s_decoder_bits);
         else announce_format(); // a restarted host must relearn the current transaction
     }
@@ -591,7 +625,9 @@ static void poll_format(void)
     }
 }
 
-void bt_av_report_state(void)
+/* On the bt_av task only, which writes every field it reads: the link's task asks for
+ * one through bt_av_request_state(). */
+static void bt_av_report_state(void)
 {
     link_send_bt_state(s_now.state, s_now.codec, s_now.addr, s_now.name);
 }
@@ -606,8 +642,23 @@ void bt_av_report_stream_fmt(void)
 static void send_track_meta(void *arg)
 {
     (void)arg;
-    link_send_track_meta(s_now.title, s_now.artist, s_now.album);
-    ESP_LOGI(TAG, "meta: \"%s\" / \"%s\" / \"%s\"", s_now.title, s_now.artist, s_now.album);
+    /* A snapshot, so an attribute copied in meanwhile cannot tear what is encoded. Static:
+     * only the esp_timer task runs this, and its stack is small. */
+    static char snap[3][sizeof s_now.title];
+    xSemaphoreTake(s_meta_send, portMAX_DELAY);
+    portENTER_CRITICAL(&s_meta_mux);
+    const bool live = s_meta_live;
+    memcpy(snap[0], s_now.title, sizeof snap[0]);
+    memcpy(snap[1], s_now.artist, sizeof snap[1]);
+    memcpy(snap[2], s_now.album, sizeof snap[2]);
+    portEXIT_CRITICAL(&s_meta_mux);
+    if (live) {
+        link_send_track_meta(snap[0], snap[1], snap[2]);
+    }
+    xSemaphoreGive(s_meta_send);
+    if (live) {
+        ESP_LOGI(TAG, "meta: \"%s\" / \"%s\" / \"%s\"", snap[0], snap[1], snap[2]);
+    }
 }
 
 static void meta_settle_restart(void)
@@ -622,7 +673,8 @@ static void meta_settle_restart(void)
 static void send_track_pos(void)
 {
     uint32_t elapsed = s_now.elapsed_ms;
-    if (s_now.play_state == SATLINK_PLAY_PLAYING && s_now.elapsed_at_us != 0) {
+    if (s_now.play_state == SATLINK_PLAY_PLAYING && s_now.elapsed_at_us != 0
+        && !s_now.elapsed_unknown) {
         int64_t since_ms = (esp_timer_get_time() - s_now.elapsed_at_us) / 1000;
         if (since_ms > 0) {
             elapsed += (uint32_t)since_ms;
@@ -708,11 +760,13 @@ static bool cover_emit(void *ctx, uint32_t offset, const uint8_t *data,
 static void cover_on_data(const esp_avrc_ct_cb_param_t *param)
 {
     if (!s_now.art_busy) return;
+    bool stale = s_now.art_generation != atomic_load(&s_cover_epoch);
     if (param->cover_art_data.status != ESP_BT_STATUS_SUCCESS) {
         ESP_LOGW(TAG, "cover art: transfer failed");
+        // The new track's fetch waits for the close: the channel is still up here.
+        s_now.art_drain_failed = stale;
         cover_reset(); esp_avrc_ct_cover_art_disconnect(); return;
     }
-    bool stale = s_now.art_generation != atomic_load(&s_cover_epoch);
     size_t len = param->cover_art_data.data_len;
     if (!stale && !s_now.art_stream.failed &&
         !cover_stream_feed(&s_now.art_stream, param->cover_art_data.p_data, len,
@@ -727,9 +781,14 @@ static void cover_on_data(const esp_avrc_ct_cb_param_t *param)
                  s_now.art_stream.finished ? "queued" : "discarded",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
         s_now.art_done_generation = s_now.art_generation;
-        /* Whatever this image cost in repeats, it arrived: the next one starts with
-         * its full allowance. */
-        if (s_now.art_stream.finished) atomic_store(&s_cover_retries, 0);
+        /* Whatever this image cost in repeats, it was sent whole: the next one starts
+         * with its full allowance -- unless the host names this generation in a
+         * retry, which takes the refill back. */
+        if (s_now.art_stream.finished) {
+            portENTER_CRITICAL(&s_cover_retry_mux);
+            cover_retry_completed(&s_cover_retries, s_now.art_generation);
+            portEXIT_CRITICAL(&s_cover_retry_mux);
+        }
     }
     cover_reset();
     // Preserve the OBEX session and its image handles between tracks.
@@ -782,11 +841,20 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
         atomic_store(&s_own_suspend, false);    /* a suspend belongs to the link it was on */
 
         switch (p->conn_stat.state) {
-        case ESP_A2D_CONNECTION_STATE_CONNECTED:
+        case ESP_A2D_CONNECTION_STATE_CONNECTED: {
             memcpy(s_now.addr, bda, sizeof(s_now.addr));
             s_now.state = SATLINK_BT_CONNECTED;
             cfg_phone_connected(bda);
+            /* Metadata from a phone whose AVRCP came up first was kept, not sent. */
+            portENTER_CRITICAL(&s_meta_mux);
+            s_meta_live = true;
+            const bool have_meta = s_now.title[0] || s_now.artist[0] || s_now.album[0];
+            portEXIT_CRITICAL(&s_meta_mux);
+            if (have_meta) {
+                meta_settle_restart();
+            }
             break;
+        }
         case ESP_A2D_CONNECTION_STATE_CONNECTING:
             s_now.state = SATLINK_BT_CONNECTING;
             break;
@@ -802,8 +870,16 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
             audio_out_set_streaming(false);
             s_now.state = idle_state();
             s_now.play_state = SATLINK_PLAY_STOPPED;
+            /* Nothing non-empty may follow the empty TRACK_META: not a settle already
+             * pending, nor one armed by an attribute that arrives after this. */
+            esp_timer_stop(s_meta_timer);
+            xSemaphoreTake(s_meta_send, portMAX_DELAY);
+            portENTER_CRITICAL(&s_meta_mux);
+            s_meta_live = false;
             s_now.title[0] = s_now.artist[0] = s_now.album[0] = '\0';
+            portEXIT_CRITICAL(&s_meta_mux);
             link_send_track_meta("", "", "");
+            xSemaphoreGive(s_meta_send);
             break;
         }
         bt_av_report_state();
@@ -819,6 +895,7 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
                  started ? "started" : "suspended", audio_out_dropped_bytes());
         audio_out_set_streaming(started);
         s_now.state = started ? SATLINK_BT_STREAMING : SATLINK_BT_CONNECTED;
+        pause_timer_apply(pause_on_stream(started));
         if (started) {
             atomic_store(&s_own_suspend, false);
         }
@@ -971,15 +1048,31 @@ static void a2d_data_cb(const uint8_t *buf, uint32_t len)
 
 /* Cut on a character boundary: the phone's text is UTF-8, and a title cut through
  * its last character went to the host as invalid UTF-8 in TRACK_META. */
-static void copy_attr(char *dst, size_t cap, const uint8_t *text, int len)
+static size_t attr_fit(size_t cap, const uint8_t *text, int len)
 {
     if (len < 0) { len = 0; }
     size_t n = ((size_t)len < cap - 1) ? (size_t)len : cap - 1;
     if (n < (size_t)len) {
         n = satlink_utf8_prefix((const char *)text, n);
     }
+    return n;
+}
+
+static void copy_attr(char *dst, size_t cap, const uint8_t *text, int len)
+{
+    size_t n = attr_fit(cap, text, len);
     memcpy(dst, text, n);
     dst[n] = '\0';
+}
+
+/* Title, artist and album: the meta timer reads them on its own task. */
+static void copy_meta(char *dst, size_t cap, const uint8_t *text, int len)
+{
+    size_t n = attr_fit(cap, text, len);
+    portENTER_CRITICAL(&s_meta_mux);
+    memcpy(dst, text, n);
+    dst[n] = '\0';
+    portEXIT_CRITICAL(&s_meta_mux);
 }
 
 /* AVRCP responses are handled in place. It is all cheap, and it sidesteps the
@@ -1004,7 +1097,13 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             s_now.art_connected = false;
             s_now.art_connecting = false;
             s_now.art_supported = false;
+            s_now.art_drain_failed = false;
             cover_reset();
+            /* So that a late refill cannot carry over into the next connection. */
+            esp_timer_stop(s_meta_timer);
+            portENTER_CRITICAL(&s_meta_mux);
+            s_now.title[0] = s_now.artist[0] = s_now.album[0] = '\0';
+            portEXIT_CRITICAL(&s_meta_mux);
         }
         break;
 
@@ -1048,15 +1147,15 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         }
         switch (param->meta_rsp.attr_id) {
         case ESP_AVRC_MD_ATTR_TITLE:
-            copy_attr(s_now.title, sizeof(s_now.title),
+            copy_meta(s_now.title, sizeof(s_now.title),
                       param->meta_rsp.attr_text, param->meta_rsp.attr_length);
             break;
         case ESP_AVRC_MD_ATTR_ARTIST:
-            copy_attr(s_now.artist, sizeof(s_now.artist),
+            copy_meta(s_now.artist, sizeof(s_now.artist),
                       param->meta_rsp.attr_text, param->meta_rsp.attr_length);
             break;
         case ESP_AVRC_MD_ATTR_ALBUM:
-            copy_attr(s_now.album, sizeof(s_now.album),
+            copy_meta(s_now.album, sizeof(s_now.album),
                       param->meta_rsp.attr_text, param->meta_rsp.attr_length);
             break;
         case ESP_AVRC_MD_ATTR_COVER_ART:
@@ -1087,7 +1186,8 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
 
     case ESP_AVRC_CT_PLAY_STATUS_RSP_EVT:
         s_now.total_ms      = satlink_sanitize_total_ms((int64_t)param->play_status_rsp.song_length);
-        s_now.elapsed_ms    = param->play_status_rsp.song_position;
+        s_now.elapsed_unknown = !satlink_elapsed_known(param->play_status_rsp.song_position);
+        s_now.elapsed_ms    = satlink_sanitize_elapsed_ms(param->play_status_rsp.song_position);
         s_now.elapsed_at_us = esp_timer_get_time();
         s_now.play_state    = play_state_from_avrc(param->play_status_rsp.play_status);
         send_track_pos();
@@ -1099,9 +1199,13 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             /* A new track is a new image, and its allowance is its own. Only here,
              * not in cover_new_track(): a retry goes through that function too, and
              * refilling there would make the bound mean nothing. */
-            atomic_store(&s_cover_retries, 0);
+            portENTER_CRITICAL(&s_cover_retry_mux);
+            cover_retry_track_change(&s_cover_retries);
+            portEXIT_CRITICAL(&s_cover_retry_mux);
             cover_new_track();
+            portENTER_CRITICAL(&s_meta_mux);
             s_now.title[0] = s_now.artist[0] = s_now.album[0] = 0;
+            portEXIT_CRITICAL(&s_meta_mux);
             /* Notifications fire once. Re-arm or this is the last one. */
             esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS);
             esp_avrc_ct_send_get_play_status_cmd(TL_PLAY_STATUS);
@@ -1113,6 +1217,9 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             s_now.play_state = play_state_from_avrc(param->change_ntf.event_parameter.playback);
             s_now.elapsed_at_us = esp_timer_get_time();
             send_track_pos();
+            /* A phone that plays again after the host's PAUSE was resumed by its user:
+             * suspending it when the wait runs out would leave it playing with no sound. */
+            pause_timer_apply(pause_on_play_status(s_now.play_state));
             /* Only a change, never a polled status: a phone that ignored the PAUSE answers
              * "playing" to every poll, and starting on that would undo the suspend at once. */
             if (s_now.play_state == SATLINK_PLAY_PLAYING) {
@@ -1123,7 +1230,8 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             break;
 
         case ESP_AVRC_RN_PLAY_POS_CHANGED:
-            s_now.elapsed_ms = param->change_ntf.event_parameter.play_pos;
+            s_now.elapsed_unknown = !satlink_elapsed_known(param->change_ntf.event_parameter.play_pos);
+            s_now.elapsed_ms = satlink_sanitize_elapsed_ms(param->change_ntf.event_parameter.play_pos);
             s_now.elapsed_at_us = esp_timer_get_time();
             send_track_pos();
             esp_avrc_ct_send_register_notification_cmd(TL_PLAY_POS,
@@ -1134,7 +1242,7 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         case ESP_AVRC_RN_VOLUME_CHANGE:
             /* This is the hole the host pointed out: the phone moved the slider,
              * and without VOLUME_STATE nobody downstream would ever know. */
-            s_now.volume = param->change_ntf.event_parameter.volume;
+            s_now.volume = avrc_abs_volume(param->change_ntf.event_parameter.volume);
             ESP_LOGI(TAG, "volume %u, set on the phone", s_now.volume);
             link_send_volume_state(s_now.volume, 1);
             esp_avrc_ct_send_register_notification_cmd(TL_VOLUME, ESP_AVRC_RN_VOLUME_CHANGE, 0);
@@ -1154,7 +1262,14 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS);
         } else if (!s_now.art_connected) {
             if (s_now.art_busy) ESP_LOGW(TAG, "cover art: channel closed, reason %d", param->cover_art_state.reason);
+            /* One go per failure, so a connect that fails as well ends it. cover_fetch()
+             * connects again, and OBEX connected re-reads the metadata for the GET. */
+            const bool refetch = cover_refetch_on_close(
+                s_now.art_drain_failed, s_now.art_busy,
+                s_now.art_generation != atomic_load(&s_cover_epoch), s_now.art_handle[0] != 0);
+            s_now.art_drain_failed = false;
             cover_reset();
+            if (refetch) cover_fetch();
         }
         break;
 
@@ -1163,7 +1278,7 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         break;
 
     case ESP_AVRC_CT_SET_ABSOLUTE_VOLUME_RSP_EVT:
-        s_now.volume = param->set_volume_rsp.volume;
+        s_now.volume = avrc_abs_volume(param->set_volume_rsp.volume);
         ESP_LOGI(TAG, "volume %u, set from the host", s_now.volume);
         link_send_volume_state(s_now.volume, 0);
         break;
@@ -1209,7 +1324,7 @@ static void avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *par
         break;
 
     case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:
-        s_now.volume = param->set_abs_vol.volume;
+        s_now.volume = avrc_abs_volume(param->set_abs_vol.volume);
         ESP_LOGI(TAG, "volume %u, set on the phone", s_now.volume);
         /* Source 1: the peer moved it. The host scales; we do not. */
         link_send_volume_state(s_now.volume, 1);
@@ -1254,6 +1369,7 @@ typedef enum {
     CFG_AUTH,           /* ESP_BT_GAP_AUTH_CMPL_EVT */
     CFG_NAME,           /* ESP_BT_GAP_READ_REMOTE_NAME_EVT */
     CFG_UNBONDED,       /* ESP_BT_GAP_REMOVE_BOND_DEV_COMPLETE_EVT */
+    CFG_STATE,          /* BT_STATE after a host HELLO */
 } cfg_event_t;
 
 typedef struct {
@@ -1542,6 +1658,7 @@ static void carry_out(const pair_out_t *out)
 
 static void cfg_phone_connected(const uint8_t addr[6])
 {
+    s_now.name[0] = '\0';                   /* whatever was here named another phone */
     rc_stop(&s_reconnect);                  /* a phone is here: nobody else is called */
     sync_bonds();
     int i = bond_index(&s_bonds, addr);
@@ -1549,16 +1666,16 @@ static void cfg_phone_connected(const uint8_t addr[6])
         bond_touch(&s_bonds, addr);
         s_bonds_dirty = true;
         if (s_bonds.e[i].name[0] != '\0') {
-            if (s_now.name[0] == '\0') {
-                memcpy(s_now.name, s_bonds.e[i].name, sizeof(s_bonds.e[i].name));
-            }
+            memcpy(s_now.name, s_bonds.e[i].name, sizeof(s_bonds.e[i].name));
         } else {
             /* A bond from before 1.8, or one whose name never came: ask the phone. */
             esp_bt_gap_read_remote_name((uint8_t *)addr);
         }
     }
-    if (!s_settings.radio) {
-        /* Radio switched off while this phone was on its way in. */
+    if (!s_live_radio) {
+        /* Radio switched off while this phone was on its way in, by BT_CONFIG_SET
+         * or by CMD_RADIO. The live state, not the saved one: CMD_RADIO may have
+         * switched the radio on without saving it. */
         ESP_LOGI(TAG, "radio is off: letting " BDA_FMT " go", BDA_ARGS(addr));
         esp_a2d_sink_disconnect((uint8_t *)addr);
     }
@@ -1659,6 +1776,10 @@ static void cfg_handle(const cfg_msg_t *m, uint32_t now)
         }
         break;
 
+    case CFG_STATE:
+        bt_av_report_state();
+        break;
+
     case CFG_REFRESH:
         sync_bonds();
         send_bt_config();
@@ -1723,6 +1844,10 @@ static void cfg_handle(const cfg_msg_t *m, uint32_t now)
         carry_out(&out);
         if (m->ok) {
             send_bond_list();
+            if (m->name_len != 0 && bond_names_attached(s_now.state, s_now.addr, m->addr)) {
+                memcpy(s_now.name, m->name, (size_t)m->name_len + 1);
+            }
+            bt_av_report_state();
         }
         break;
 
@@ -1735,8 +1860,7 @@ static void cfg_handle(const cfg_msg_t *m, uint32_t now)
             s_bonds_dirty = true;
             send_bond_list();
         }
-        if (s_now.state >= SATLINK_BT_CONNECTED && memcmp(s_now.addr, m->addr, 6) == 0 &&
-            s_now.name[0] == '\0') {
+        if (bond_names_attached(s_now.state, s_now.addr, m->addr) && s_now.name[0] == '\0') {
             memcpy(s_now.name, m->name, (size_t)m->name_len + 1);
             bt_av_report_state();
         }
@@ -1817,6 +1941,12 @@ void bt_av_host_hello(void)
     cfg_post(&m);
 }
 
+bool bt_av_request_state(void)
+{
+    cfg_msg_t m = { .type = CFG_STATE };
+    return cfg_post(&m);
+}
+
 void bt_av_bt_refresh(void)
 {
     cfg_msg_t m = { .type = CFG_REFRESH };
@@ -1860,10 +1990,8 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     switch (event) {
     case ESP_BT_GAP_AUTH_CMPL_EVT:
         if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
+            /* The name reaches BT_STATE from CFG_AUTH, on the bt_av task, clipped. */
             ESP_LOGI(TAG, "paired with %s", param->auth_cmpl.device_name);
-            strncpy(s_now.name, (const char *)param->auth_cmpl.device_name, sizeof(s_now.name) - 1);
-            s_now.name[sizeof(s_now.name) - 1] = '\0';
-            bt_av_report_state();
         } else {
             ESP_LOGE(TAG, "pairing failed, status %d", param->auth_cmpl.stat);
         }
@@ -1942,12 +2070,13 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 /* ------------------------------------------------------------ host commands */
 
 /* Runs PAUSE_GRACE_US after a PAUSE or STOP from the host, unless another transport
- * command came first. s_now.state is written on the BT task; a stale read costs at most
+ * command, the phone's stream stopping or the phone reporting that it plays came first
+ * (pause_policy.h). s_now.state is written on the BT task; a stale read costs at most
  * one suspend of a stream that had just stopped, which the stack answers as a no-op. */
 static void pause_check(void *arg)
 {
     (void)arg;
-    if (s_now.state != SATLINK_BT_STREAMING) {
+    if (!pause_suspends(s_now.state)) {
         return;
     }
     esp_err_t err = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
@@ -1997,13 +2126,7 @@ void bt_av_transport(uint8_t cmd)
      * a pause still waiting to be checked. A repeated PAUSE does not restart the wait: the
      * host repeats it every 3 s while the phone keeps playing, which is shorter than the
      * wait, so restarting it would mean it never ran out. */
-    if (cmd == SATLINK_XPORT_PAUSE || cmd == SATLINK_XPORT_STOP) {
-        if (!esp_timer_is_active(s_pause_timer)) {
-            esp_timer_start_once(s_pause_timer, PAUSE_GRACE_US);
-        }
-    } else {
-        esp_timer_stop(s_pause_timer);
-    }
+    pause_timer_apply(pause_on_transport(cmd, esp_timer_is_active(s_pause_timer)));
     if (cmd == SATLINK_XPORT_PLAY) {
         resume_own_suspend("PLAY from the host");
     }
@@ -2071,6 +2194,8 @@ esp_err_t bt_av_start(const char *device_name)
     ESP_RETURN_ON_FALSE(s_queue != NULL, ESP_ERR_NO_MEM, TAG, "no memory for the event queue");
     s_cfg_queue = xQueueCreate(BT_CFG_QUEUE_DEPTH, sizeof(cfg_msg_t));
     ESP_RETURN_ON_FALSE(s_cfg_queue != NULL, ESP_ERR_NO_MEM, TAG, "no memory for the settings queue");
+    s_meta_send = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_meta_send != NULL, ESP_ERR_NO_MEM, TAG, "no memory for the meta lock");
     ESP_RETURN_ON_FALSE(
         xTaskCreate(bt_av_task, "bt_av", BT_TASK_STACK, NULL, BT_TASK_PRIO, NULL) == pdPASS,
         ESP_ERR_NO_MEM, TAG, "no memory for the bt task");
