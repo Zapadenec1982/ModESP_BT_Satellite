@@ -35,9 +35,11 @@ static void on_hello(const satlink_hello_t *hello)
      * sample rate off the stream, which is exactly what happens when STREAM_FMT
      * is announced once and missed once.
      *
-     * Rate limited rather than done once, though. The host repeats its HELLO
-     * every couple of seconds, and answering every one with a full set of state
-     * put a needless message a second on a link that also carries audio
+     * Rate limited rather than done once, though. The host greets once, in
+     * answer to our own HELLO at start-up, and again after it restarts (bench,
+     * 12.10.2026: no host HELLO in 170 s of steady state); an early host repeated
+     * it every couple of seconds, and answering every one with a full set of
+     * state put a needless message a second on a link that also carries audio
      * telemetry. A limit rather than a one-shot because a host that restarts
      * greets us again and has every right to be told everything a second time.
      */
