@@ -13,7 +13,11 @@ then copy `bt_overlay/`. `tools/setup.ps1 -Clean` reproduces the local ignored
   (`CONFIG_BT_A2DP_LHDCV5_DECODER`, the pinned decoder in
   `components/lhdcv5_decoder`) and makes room for one more stream endpoint. A peer
   may announce LHDC capabilities as masks, but SET_CONFIGURATION must select exactly
-  one format; `bta_av_co.c` checks that with the LHDC validator.
+  one format; 0003 adds that check to `bta_av_co.c` with the LHDC validator. 0010
+  deletes it again: the sink's SET_CONFIGURATION check is now
+  `A2DP_IsSinkCodecSupported` for every codec, whose vendor dispatcher
+  (`A2DP_IsVendorSinkCodecSupported` in `bt_overlay`'s `a2dp_vendor.c`) calls the
+  same LHDC validator.
 - `0004-pace-cover-art-obex.patch`: cover-art downloads pull one OBEX packet at a
   time, 50 ms apart, from a BTA timer (so no Bluetooth task sleeps), and no longer
   ask for SRM, which would let the phone flood cover data alongside A2DP. The
@@ -41,6 +45,22 @@ then copy `bt_overlay/`. `tools/setup.ps1 -Clean` reproduces the local ignored
   DMA. The per-packet warnings for sequence gaps, a full codec queue and low-memory
   drops become calls to weak application hooks (`sat_audio_decode_begin`/`_end`,
   `sat_audio_encoded_event`), which `main/audio_out.c` counts and reports.
+- `0009-sink-getconfig-fail-when-no-config-builds.patch`: 0001 dropped stock's
+  SBC pre-fill of the preferred config and ignored a failed build, so when this
+  device initiates (reconnect) and the chosen source SEP passes the support check
+  but builds no config (SBC min_bitpool above 53), getconfig sent uninitialised
+  stack bytes as SET_CONFIGURATION and decoder setup. The search now skips a SEP
+  that does not build and tries the next; with none, getconfig fails and BTA
+  takes its existing next-stream / GETCAP_FAIL path.
+- `0010-strict-sink-set-configuration.patch`: 0001 validated an incoming
+  SET_CONFIGURATION with `A2DP_IsPeerSourceCodecSupported`, the discovery check,
+  which parses capability masks and only asks that they intersect the sink's. A
+  config naming 44.1|48 kHz passed a 44.1-only offer and the application, testing
+  48 first, took it for 48 kHz. The sink branch of `bta_av_co_audio_setconfig` now
+  calls `A2DP_IsSinkCodecSupported`, which, as stock's `A2D_ParsSbcInfo(..., FALSE)`
+  did, wants one value per field, each offered: SBC, AAC, aptX, aptX HD and LHDC V5
+  (whose separate check from 0003 it replaces, through the vendor dispatcher in
+  `bt_overlay`'s `a2dp_vendor.c`). Discovery keeps the liberal check.
 
 Patch paths are relative to `components/bt`; setup uses
 `git apply --directory=components/bt` and stops on a rejected hunk.

@@ -21,6 +21,21 @@ static void packet(packet_t *p, uint16_t seq, uint8_t flags, unsigned bytes) {
     p->data[2] = seq >> 8; p->data[3] = seq;
     p->data[12] = flags;
 }
+/* Mirrors btc_a2dp_sink_handle_inc_media (patches 0001/0008): a positive
+ * header length means layer_specific is the RTP sequence number, and only
+ * then is the gap since the expected number counted. */
+static unsigned sink_gaps;
+static uint16_t sink_expected = 1;
+static bool sink_accept(BT_HDR *hdr) {
+    const ssize_t hdr_len = a2dp_lhdcv5_decoder_decode_packet_header(hdr);
+    if (hdr_len < 0) return false;
+    if (hdr_len > 0) {
+        if (hdr->layer_specific != sink_expected && sink_expected != 1)
+            sink_gaps += (uint16_t)(hdr->layer_specific - sink_expected);
+        sink_expected = hdr->layer_specific + 1;
+    }
+    return true;
+}
 int main(void) {
     uint8_t caps[20], cfg[20], selected[20];
     tA2DP_LHDCV5_CIE cie;
@@ -73,7 +88,7 @@ int main(void) {
                 if (length < 13) assert(a2dp_lhdcv5_decoder_decode_packet_header(&p.hdr) < 0);
             }
             packet(&p,0,0,4);
-            assert(a2dp_lhdcv5_decoder_decode_packet_header(&p.hdr) == 0);
+            assert(a2dp_lhdcv5_decoder_decode_packet_header(&p.hdr) == 13);
             assert(!a2dp_lhdcv5_decoder_decode_packet(&p.hdr,output.pcm,sizeof(output.pcm)));
             /* RTP extension claims bytes not present. */
             packet(&p,0,0,4); p.data[0] |= 0x10; p.data[15]=255;
@@ -82,18 +97,29 @@ int main(void) {
             packet(&p,1,0xa1,5);
             assert(a2dp_lhdcv5_decoder_decode_packet_header(&p.hdr) < 0);
             packet(&p,2,0xc2,10);
-            assert(a2dp_lhdcv5_decoder_decode_packet_header(&p.hdr) == 0);
+            assert(a2dp_lhdcv5_decoder_decode_packet_header(&p.hdr) == 13);
             assert(a2dp_lhdcv5_decoder_decode_packet(&p.hdr,output.pcm,sizeof(output.pcm)));
             packet(&p,4,0xa1,10);
             assert(a2dp_lhdcv5_decoder_decode_packet_header(&p.hdr) < 0);
             /* Reassembly overflow must discard state. */
             packet(&p,5,0xc2,3070);
-            assert(a2dp_lhdcv5_decoder_decode_packet_header(&p.hdr) == 0);
+            assert(a2dp_lhdcv5_decoder_decode_packet_header(&p.hdr) == 13);
             assert(a2dp_lhdcv5_decoder_decode_packet(&p.hdr,output.pcm,sizeof(output.pcm)));
             packet(&p,6,0xa1,8);
-            assert(a2dp_lhdcv5_decoder_decode_packet_header(&p.hdr) == 0);
+            assert(a2dp_lhdcv5_decoder_decode_packet_header(&p.hdr) == 13);
             assert(!a2dp_lhdcv5_decoder_decode_packet(&p.hdr,output.pcm,sizeof(output.pcm)));
             assert(output.before == 0xdeadbeef && output.after == 0xcafebabe);
+            /* The returned length includes CSRC words. */
+            packet(&p,7,0,4); p.data[0] = 0x81; p.hdr.len += 4; p.data[16] = 0;
+            assert(a2dp_lhdcv5_decoder_decode_packet_header(&p.hdr) == 17);
+            /* Lost LHDC packets reach the sink's sequence-gap counter. */
+            sink_gaps = 0; sink_expected = 1;
+            const uint16_t seqs[] = {10, 11, 14, 15, 17};
+            for (unsigned i=0; i<sizeof(seqs)/sizeof(seqs[0]); ++i) {
+                packet(&p,seqs[i],0,4);
+                assert(sink_accept(&p.hdr));
+            }
+            assert(sink_gaps == 3);
         }
         a2dp_lhdcv5_decoder_cleanup();
         a2dp_lhdcv5_decoder_cleanup();

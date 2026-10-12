@@ -16,7 +16,8 @@ def main():
            'static size_t i2s_write_locked(', 'static void i2s_write_silence_locked(',
            'static bool pcm_send(', 'static void audio_ring_put(',
            'uint32_t audio_out_gate(', 'void audio_out_write(', 'bool audio_out_resume(',
-           'void audio_out_set_streaming(']
+           'void audio_out_set_streaming(', 'static void ctrl_take_lock(', 'static void writer_unlock(',
+           'esp_err_t audio_out_set_role(']
     out=ROOT/'build/host/audio'; out.mkdir(parents=True,exist_ok=True)
     (out/'audio_handlers.inc').write_text('\n'.join(function(source,n) for n in names))
     worker=(ROOT/'components/bt/host/bluedroid/btc/profile/std/a2dp/btc_a2dp_sink.c').read_text()

@@ -69,14 +69,17 @@ static void on_hello(const satlink_hello_t *hello)
     expander_send_map();
 
 #if !CONFIG_SAT_LINK_ONLY
+    /* Built on the Bluetooth task, behind the BT_CONFIG and BOND_LIST queued above:
+     * this task reading the phone's name while that one writes it could send half of
+     * one name and half of another. The limit only counts a request that was queued. */
     static int64_t next_announce_us;
     int64_t now = esp_timer_get_time();
     if (now < next_announce_us) {
         return;
     }
-    next_announce_us = now + (10 * 1000 * 1000);
-
-    bt_av_report_state();
+    if (bt_av_request_state()) {
+        next_announce_us = now + (10 * 1000 * 1000);
+    }
 #endif
 }
 
@@ -172,12 +175,13 @@ void app_main(void)
         .on_adc_read  = on_adc_read,
         .on_host_caps = on_host_caps,
     };
+    /* The expander's state before the link that delivers GPIO_CFG to it. */
+    ESP_ERROR_CHECK(expander_init());
     ESP_ERROR_CHECK(link_start(&handlers, own_caps()));
     ESP_ERROR_CHECK(expander_start());
 
-    /* After both peripherals have claimed their pins: the probe reads those pins'
-     * own output back in, and configuring it first would only have it overwritten
-     * by uart_set_pin. */
+    /* After both peripherals have claimed their pins. The probe only listens on
+     * the I2S clock pads and never drives them, so it is safe in either role. */
     ESP_ERROR_CHECK(clock_probe_start());
 
 #if CONFIG_SAT_LINK_ONLY

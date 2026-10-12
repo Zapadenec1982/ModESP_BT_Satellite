@@ -79,9 +79,19 @@ fi
 "$python" "$repo/tools/run_bta_reopen_tests.py" --cc "$cc"
 # A live PING/PONG link must recover a dropped startup capability greeting.
 "$python" "$repo/tools/run_hello_tests.py" --cc "$cc"
+# A UART event that announces fewer bytes than are buffered must not strand the rest.
+"$python" "$repo/tools/run_link_rx_tests.py" --cc "$cc"
 # Cover streaming must survive queue refusals and cancel delayed OBEX pulls.
 "$python" "$repo/tools/run_cover_tests.py" --cc "$cc"
 "$python" "$repo/tools/run_audio_tests.py" --cc "$cc"
 "$python" "$repo/tools/run_audio_refill_tests.py" --cc "$cc"
 "$python" "$repo/tools/run_audio_asrc_tests.py" --cc "$cc"
 "$python" "$repo/tools/run_lhdc_tests.py" --cc "$cc"
+# The Helix AAC decoder must refuse malformed frames, not overrun or spin on them.
+"$python" "$repo/tools/run_aac_tests.py" --cc "$cc"
+# The SBC sink offers stereo only and still decodes a mono stream to both channels.
+"$python" "$repo/tools/run_sbc_tests.py" --cc "$cc"
+# Reconnecting as initiator must skip a source SEP that builds no config, not send garbage.
+"$python" "$repo/tools/run_sink_getconfig_tests.py" --cc "$cc"
+# SET_CONFIGURATION must name one value per field, not pass a 44.1|48 mask for 48 kHz.
+"$python" "$repo/tools/run_sink_setconfig_tests.py" --cc "$cc"

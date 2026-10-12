@@ -1,0 +1,89 @@
+--- a/host/bluedroid/btc/profile/std/a2dp/bta_av_co.c
++++ b/host/bluedroid/btc/profile/std/a2dp/bta_av_co.c
+@@ -98,7 +98,7 @@
+ static BOOLEAN bta_av_co_cp_is_scmst(const UINT8 *p_protectinfo);
+ static BOOLEAN bta_av_co_audio_sink_has_scmst(const tBTA_AV_CO_SINK *p_sink);
+ static tBTA_AV_CO_SINK* bta_av_co_audio_find_peer_sink(tBTA_AV_CO_PEER *p_peer);
+-static tBTA_AV_CO_SINK* bta_av_co_audio_find_peer_src(tBTA_AV_CO_PEER *p_peer);
++static tBTA_AV_CO_SINK* bta_av_co_audio_find_peer_src(tBTA_AV_CO_PEER *p_peer, UINT8 *p_pref_cfg);
+ 
+ 
+ 
+@@ -344,15 +344,17 @@
+  ** Description      This function will build preferred config from src capabilities
+  **
+  **
+- ** Returns          Pass or Fail for current getconfig.
++ ** Returns          TRUE if p_pref_cfg was written, FALSE if no config builds.
+  **
+  *******************************************************************************/
+-void bta_av_build_src_cfg (UINT8 *p_pref_cfg, UINT8 *p_src_cap)
++BOOLEAN bta_av_build_src_cfg (UINT8 *p_pref_cfg, UINT8 *p_src_cap)
+ {
+     if (!A2DP_BuildCodecConfig(p_src_cap, p_pref_cfg)) {
+         APPL_TRACE_ERROR("%s: cannot build a config for codec %s", __func__,
+                          A2DP_CodecName(p_src_cap));
++        return FALSE;
+     }
++    return TRUE;
+ }
+ 
+ /*******************************************************************************
+@@ -375,7 +377,7 @@
+     UINT8 result = A2D_FAIL;
+     tBTA_AV_CO_PEER *p_peer;
+     tBTA_AV_CO_SINK *p_src;
+-    UINT8 pref_cfg[AVDT_CODEC_SIZE];
++    UINT8 pref_cfg[AVDT_CODEC_SIZE] = {0};
+ 
+     FUNC_TRACE();
+ 
+@@ -424,8 +426,8 @@
+         /* Protect access to bta_av_co_cb.codec_cfg */
+         osi_mutex_global_lock();
+ 
+-        /* Find a src that matches the codec config */
+-        p_src = bta_av_co_audio_find_peer_src(p_peer);
++        /* Find a src whose caps build a config; pref_cfg is only written then */
++        p_src = bta_av_co_audio_find_peer_src(p_peer, pref_cfg);
+         if (p_src != NULL) {
+             APPL_TRACE_DEBUG(" Codec Supported ");
+ 
+@@ -433,8 +435,6 @@
+             {
+                 /* Save the new configuration */
+                 p_peer->p_src = p_src;
+-                /* get preferred config from src_caps */
+-                bta_av_build_src_cfg(pref_cfg, p_src->codec_caps);
+                 memcpy(p_peer->codec_cfg, pref_cfg, AVDT_CODEC_SIZE);
+ 
+                 APPL_TRACE_DEBUG("bta_av_audio_sink_getconfig  p_codec_info[%x:%x:%x:%x:%x:%x]",
+@@ -1067,12 +1067,16 @@
+  **
+  ** Function         bta_av_co_audio_find_peer_src
+  **
+- ** Description      Find a peer Source SEP entry with a supported codec.
++ ** Description      Find a peer Source SEP entry with a supported codec whose
++ **                  capabilities build a configuration, and build it into
++ **                  p_pref_cfg. A source can pass the support check and still
++ **                  build nothing (an SBC min_bitpool above the 53 this sink
++ **                  takes), so such an entry is skipped, not configured.
+  **
+  ** Returns          the peer Source SEP for the codec index if found, otherwise NULL
+  **
+  *******************************************************************************/
+-static tBTA_AV_CO_SINK* bta_av_co_audio_find_peer_src(tBTA_AV_CO_PEER *p_peer)
++static tBTA_AV_CO_SINK* bta_av_co_audio_find_peer_src(tBTA_AV_CO_PEER *p_peer, UINT8 *p_pref_cfg)
+ {
+     btav_a2dp_codec_index_t codec_index;
+ 
+@@ -1081,7 +1085,8 @@
+     for (int index = p_peer->num_sup_srcs - 1; index >= 0; index--) {
+         tBTA_AV_CO_SINK* src = &p_peer->srcs[index];
+         codec_index = A2DP_SourceCodecIndex(src->codec_caps);
+-        if (codec_index != BTAV_A2DP_CODEC_INDEX_MAX)
++        if (codec_index != BTAV_A2DP_CODEC_INDEX_MAX &&
++                bta_av_build_src_cfg(p_pref_cfg, src->codec_caps))
+             return src;
+     }
+     return NULL;

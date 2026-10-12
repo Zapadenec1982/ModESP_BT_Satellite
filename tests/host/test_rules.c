@@ -1,17 +1,22 @@
 /*
  * Device-side rules of PROTOCOL.md that live in main/ as pure C, walked without a
  * board: the port expander's GPIO_CFG handling, LOG lines from the ESP log, what
- * the link lets through for a host with another proto_major, and the slots that
- * hold the messages which must not be lost.
+ * the link lets through for a host with another proto_major, the slots that
+ * hold the messages which must not be lost, the range of VOLUME_STATE, the
+ * stream suspend after a pause from the host, and when a greeting or an I2S role
+ * change starts a new format transaction.
  */
 
 #include <stdio.h>
 #include <string.h>
 
 #include "harness.h"
+#include "avrc_volume.h"
 #include "expander_policy.h"
+#include "format_policy.h"
 #include "link_policy.h"
 #include "log_line.h"
+#include "pause_policy.h"
 #include "tx_slots.h"
 
 int g_checks, g_failures;
@@ -108,6 +113,155 @@ static void test_adc_period(void)
     CHECK_EQ(at[0], 0);
 }
 
+static void test_adc_readable(void)
+{
+    /* ADC_READ samples only a line that has an ADC and is in mode 6 now. It used
+     * to read whatever channel the row held: ADC1 channel 0 (GPIO36) for a row
+     * with no ADC, or an unconfigured channel at 0 dB for a CAN_ADC line in a
+     * digital mode, with the millivolts scaled for 12 dB. */
+    CHECK(exp_adc_readable(CAN_ALL, true));
+    CHECK(exp_adc_readable(SATLINK_PIN_CAN_INPUT | SATLINK_PIN_CAN_ADC, true));
+    CHECK(!exp_adc_readable(CAN_ALL, false));
+    CHECK(!exp_adc_readable(CAN_ALL & ~SATLINK_PIN_CAN_ADC, true));
+    CHECK(!exp_adc_readable(CAN_ALL & ~SATLINK_PIN_CAN_ADC, false));
+    CHECK(!exp_adc_readable(IN_ONLY, true));
+}
+
+/*
+ * A line read every EXP_POLL_MS from `start` ms on, its level given by `input` per
+ * millisecond, settled at 0 before. Returns how many changes were reported and the
+ * time of the first one.
+ */
+typedef unsigned (*level_fn)(unsigned ms);
+
+static unsigned debounce_walk(level_fn input, unsigned start, unsigned end, unsigned *first_ms)
+{
+    const uint32_t bit = 1u << 3;
+    uint32_t candidate = 0, reported = 0;
+    uint8_t stable = EXP_STABLE_SAMPLES;
+    unsigned changes = 0;
+    *first_ms = 0;
+    for (unsigned ms = start; ms <= end; ms += EXP_POLL_MS) {
+        uint32_t level = input(ms) ? bit : 0;
+        if (exp_debounce_step(level, bit, &candidate, &stable, &reported)) {
+            if (changes++ == 0) {
+                *first_ms = ms;
+            }
+        }
+    }
+    return changes;
+}
+
+#define EDGE_MS 100u
+
+static unsigned clean_press(unsigned ms) { return ms >= EDGE_MS; }
+
+/* Contact bounce: flipping every 3 ms for 12 ms after the edge, then held. */
+static unsigned bouncy_press(unsigned ms)
+{
+    if (ms < EDGE_MS) {
+        return 0;
+    }
+    if (ms < EDGE_MS + 12) {
+        return ((ms - EDGE_MS) / 3) % 2 == 0;
+    }
+    return 1;
+}
+
+/* A 7 ms spike that is not a press at all. */
+static unsigned glitch(unsigned ms) { return ms >= EDGE_MS && ms < EDGE_MS + 7; }
+
+static void test_debounce(void)
+{
+    /* The edge-to-wire bound of PROTOCOL.md 11 is under 30 ms with 20 ms of
+     * debounce, so the poll must really be 5 ms: one change per press, no sooner
+     * than the debounce and in time, whatever the phase of the poll against the
+     * edge. */
+    for (unsigned phase = 0; phase < EXP_POLL_MS; phase++) {
+        unsigned at;
+        CHECK_EQ(debounce_walk(clean_press, phase, 400, &at), 1);
+        CHECK(at >= EDGE_MS + EXP_DEBOUNCE_MS);
+        CHECK(at - EDGE_MS < 30);
+
+        CHECK_EQ(debounce_walk(bouncy_press, phase, 400, &at), 1);
+        CHECK(at >= EDGE_MS + EXP_DEBOUNCE_MS);
+        CHECK(at - EDGE_MS < 12 + 30);
+
+        CHECK_EQ(debounce_walk(glitch, phase, 400, &at), 0);
+    }
+}
+
+/*
+ * Line 0 is an input and is pressed at `edge_ms`; GPIO_CFG makes line 1 an input
+ * at `cfg_ms`, between two polls. Returns when line 0's press was reported, 0 if
+ * it never was, and checks the configuration's own report on the way.
+ */
+static unsigned press_with_cfg(unsigned edge_ms, unsigned cfg_ms)
+{
+    const uint32_t press = 1u << 0, other = 1u << 1;
+    uint32_t candidate = 0, reported = 0, input_mask = press;
+    uint8_t stable[SATLINK_GPIO_MAX];
+    memset(stable, EXP_STABLE_SAMPLES, sizeof(stable));
+    unsigned at = 0;
+    bool configured = false;
+
+    for (unsigned ms = 0; ms <= edge_ms + 100; ms += EXP_POLL_MS) {
+        if (!configured && cfg_ms < ms) {
+            /* Line 1 reads high when it becomes an input. */
+            exp_debounce_adopt(other, other | press, &candidate, stable, &reported);
+            CHECK_EQ(reported & other, other);
+            CHECK_EQ(stable[1], EXP_STABLE_SAMPLES);
+            input_mask |= other;
+            configured = true;
+        }
+        uint32_t levels = other | (ms >= edge_ms ? press : 0);
+        for (unsigned i = 0; i < 2; i++) {
+            uint32_t bit = 1u << i;
+            if ((input_mask & bit) == 0) {
+                continue;
+            }
+            if (exp_debounce_step(levels & bit, bit, &candidate, &stable[i], &reported) &&
+                bit == press && at == 0) {
+                at = ms;
+            }
+        }
+    }
+    CHECK(configured);
+    return at;
+}
+
+static void test_debounce_cfg(void)
+{
+    /* A GPIO_CFG for another line at any moment of a press must not start the
+     * press's debounce over: still under the 30 ms of PROTOCOL.md 11. */
+    const unsigned edge = 101;          /* just after a poll, the worst phase */
+    for (unsigned cfg = edge - 10; cfg <= edge + 30; cfg++) {
+        unsigned at = press_with_cfg(edge, cfg);
+        CHECK(at != 0);
+        CHECK(at >= edge + EXP_DEBOUNCE_MS - EXP_POLL_MS);
+        CHECK(at - edge < 30);
+    }
+
+    /* Adopting leaves every other line's debounce exactly as it was, and takes
+     * only the configured lines from `levels`. */
+    uint32_t candidate = 0x5, reported = 0x1;
+    uint8_t stable[SATLINK_GPIO_MAX];
+    memset(stable, 2, sizeof(stable));
+    exp_debounce_adopt(0x30, 0xFF, &candidate, stable, &reported);
+    CHECK_EQ(candidate, 0x35);
+    CHECK_EQ(reported, 0x31);
+    CHECK_EQ(stable[0], 2);
+    CHECK_EQ(stable[2], 2);
+    CHECK_EQ(stable[3], 2);
+    CHECK_EQ(stable[4], EXP_STABLE_SAMPLES);
+    CHECK_EQ(stable[5], EXP_STABLE_SAMPLES);
+    CHECK_EQ(stable[6], 2);
+
+    exp_debounce_adopt(0x30, 0x10, &candidate, stable, &reported);
+    CHECK_EQ(candidate, 0x15);
+    CHECK_EQ(reported, 0x11);
+}
+
 /* ----------------------------------------------------------------------- LOG */
 
 /* The bridge's two steps on a copy of `in`: level first, then the tidy text. */
@@ -195,6 +349,24 @@ static void test_incompatible_host(void)
     /* And what the cover stream sends. */
     CHECK(!link_incompatible_allows(0x18));      /* COVER_DATA */
     CHECK(!link_incompatible_allows(0x19));      /* COVER_END */
+}
+
+/* -------------------------------------------------------------------- volume */
+
+static void test_abs_volume(void)
+{
+    /* PROTOCOL.md 7: VOLUME_STATE carries 0..127. AVRCP's bit 7 is reserved, and
+     * the controller path of the stack passes it through. */
+    for (unsigned raw = 0; raw <= 0xFF; raw++) {
+        CHECK(avrc_abs_volume((uint8_t)raw) <= 127);
+    }
+    CHECK_EQ(avrc_abs_volume(0x00), 0x00);
+    CHECK_EQ(avrc_abs_volume(0x40), 0x40);
+    CHECK_EQ(avrc_abs_volume(0x7F), 0x7F);
+    /* Masked like the stack's own target parser, not clamped. */
+    CHECK_EQ(avrc_abs_volume(0x80), 0x00);
+    CHECK_EQ(avrc_abs_volume(0xC0), 0x40);
+    CHECK_EQ(avrc_abs_volume(0xFF), 0x7F);
 }
 
 /* ---------------------------------------------------------------- tx slots */
@@ -411,12 +583,174 @@ static void test_slots_encode_in_place(void)
     CHECK_EQ(tx_slot_encode(t, NSLOTS, SATLINK_MSG_HELLO, enc_three, NULL, &stamp), TX_SLOT_NO_SLOT);
 }
 
+/* ------------------------------------------------------------- pause check */
+
+#define GRACE_MS 5000u
+
+/* bt_av.c's one-shot esp_timer and stream state, with time in milliseconds. */
+typedef struct {
+    bool     waiting;
+    uint32_t due_ms;
+    uint32_t now_ms;
+    uint8_t  bt_state;
+    int      suspends;
+} pause_sim_t;
+
+static void sim_apply(pause_sim_t *s, pause_timer_op_t op)
+{
+    if (op == PAUSE_TIMER_START) {
+        s->waiting = true;
+        s->due_ms = s->now_ms + GRACE_MS;
+    } else if (op == PAUSE_TIMER_STOP) {
+        s->waiting = false;
+    }
+}
+
+static void sim_until(pause_sim_t *s, uint32_t t_ms)
+{
+    if (s->waiting && s->due_ms <= t_ms) {
+        s->now_ms = s->due_ms;
+        s->waiting = false;
+        if (pause_suspends(s->bt_state)) {
+            s->suspends++;
+            s->bt_state = SATLINK_BT_CONNECTED;     /* what the stack reports back */
+            sim_apply(s, pause_on_stream(false));
+        }
+    }
+    s->now_ms = t_ms;
+}
+
+static void sim_host(pause_sim_t *s, uint32_t t_ms, uint8_t cmd)
+{
+    sim_until(s, t_ms);
+    sim_apply(s, pause_on_transport(cmd, s->waiting));
+}
+
+static void sim_stream(pause_sim_t *s, uint32_t t_ms, bool started)
+{
+    sim_until(s, t_ms);
+    s->bt_state = started ? SATLINK_BT_STREAMING : SATLINK_BT_CONNECTED;
+    sim_apply(s, pause_on_stream(started));
+}
+
+static void sim_play_status(pause_sim_t *s, uint32_t t_ms, uint8_t play_state)
+{
+    sim_until(s, t_ms);
+    sim_apply(s, pause_on_play_status(play_state));
+}
+
+static pause_sim_t sim_streaming(void)
+{
+    return (pause_sim_t){ .bt_state = SATLINK_BT_STREAMING };
+}
+
+static void test_pause_check(void)
+{
+    /* A phone that ignores the pause: its stream is suspended once the wait runs out. */
+    pause_sim_t s = sim_streaming();
+    sim_host(&s, 0, SATLINK_XPORT_PAUSE);
+    sim_until(&s, GRACE_MS - 1);
+    CHECK_EQ(s.suspends, 0);
+    sim_until(&s, GRACE_MS);
+    CHECK_EQ(s.suspends, 1);
+    sim_until(&s, 60000);
+    CHECK_EQ(s.suspends, 1);
+
+    /* STOP is a pause too, and a stream with no AVRCP status at all is still caught. */
+    s = sim_streaming();
+    sim_host(&s, 0, SATLINK_XPORT_STOP);
+    sim_until(&s, 60000);
+    CHECK_EQ(s.suspends, 1);
+
+    /* The phone pauses, holds its stream open, and its user plays again inside the wait. */
+    s = sim_streaming();
+    sim_host(&s, 0, SATLINK_XPORT_PAUSE);
+    sim_play_status(&s, 300, SATLINK_PLAY_PAUSED);
+    sim_play_status(&s, 2000, SATLINK_PLAY_PLAYING);
+    sim_until(&s, 60000);
+    CHECK_EQ(s.suspends, 0);
+    CHECK_EQ(s.bt_state, SATLINK_BT_STREAMING);
+
+    /* The phone closes its stream after the pause and its user starts it again. */
+    s = sim_streaming();
+    sim_host(&s, 0, SATLINK_XPORT_PAUSE);
+    sim_stream(&s, 3000, false);
+    sim_stream(&s, 4000, true);
+    sim_until(&s, 60000);
+    CHECK_EQ(s.suspends, 0);
+    CHECK_EQ(s.bt_state, SATLINK_BT_STREAMING);
+
+    /* A "playing" that does not stop the phone: the host's repeated PAUSE starts the
+     * wait again, and the stream is caught a wait later. */
+    s = sim_streaming();
+    sim_host(&s, 0, SATLINK_XPORT_PAUSE);
+    sim_play_status(&s, 1000, SATLINK_PLAY_PLAYING);
+    sim_host(&s, 3000, SATLINK_XPORT_PAUSE);
+    sim_until(&s, 3000 + GRACE_MS - 1);
+    CHECK_EQ(s.suspends, 0);
+    sim_until(&s, 3000 + GRACE_MS);
+    CHECK_EQ(s.suspends, 1);
+
+    /* A PAUSE repeated inside the wait does not restart it. */
+    s = sim_streaming();
+    sim_host(&s, 0, SATLINK_XPORT_PAUSE);
+    sim_host(&s, 3000, SATLINK_XPORT_PAUSE);
+    sim_play_status(&s, 3500, SATLINK_PLAY_PAUSED);
+    sim_until(&s, GRACE_MS);
+    CHECK_EQ(s.suspends, 1);
+
+    /* Any other command from the host ends the wait. */
+    for (uint8_t cmd = SATLINK_XPORT_PLAY; cmd <= SATLINK_XPORT_REW_STOP; cmd++) {
+        if (cmd == SATLINK_XPORT_PAUSE || cmd == SATLINK_XPORT_STOP) {
+            continue;
+        }
+        s = sim_streaming();
+        sim_host(&s, 0, SATLINK_XPORT_PAUSE);
+        sim_host(&s, 1000, cmd);
+        sim_until(&s, 60000);
+        CHECK_EQ(s.suspends, 0);
+    }
+
+    /* A stream that is already quiet when the wait runs out is left alone. */
+    s = (pause_sim_t){ .bt_state = SATLINK_BT_CONNECTED };
+    sim_host(&s, 0, SATLINK_XPORT_PAUSE);
+    sim_until(&s, 60000);
+    CHECK_EQ(s.suspends, 0);
+}
+
+/* ------------------------------------------------------------- format restart */
+
+static void test_format_restart(void)
+{
+    /* Nothing changed: the current transaction is only announced again. */
+    CHECK(!fmt_needs_restart(true, 16, 16, false, false, false, true));
+    CHECK(!fmt_needs_restart(true, 32, 32, true, true, false, true));
+
+    /* A new role with the same slots and acknowledgement still needs one: set_role
+     * gated PCM and voided the resume token, so a repeat would never resume. */
+    CHECK(fmt_needs_restart(true, 32, 32, false, false, true, true));
+    CHECK(fmt_needs_restart(true, 32, 32, true, true, true, true));
+    /* The slave-to-legacy-master case: 32-bit slots become 16, announced first. */
+    CHECK(fmt_needs_restart(true, 32, 16, false, false, true, true));
+
+    /* The reasons a greeting alone starts one. */
+    CHECK(fmt_needs_restart(true, 16, 32, false, false, false, true));
+    CHECK(fmt_needs_restart(true, 32, 32, false, true, false, true));
+    CHECK(fmt_needs_restart(true, 32, 32, true, false, false, true));
+    CHECK(fmt_needs_restart(false, 32, 32, false, false, false, true));
+    CHECK(fmt_needs_restart(true, 32, 32, false, false, false, false));
+}
+
 int main(void)
 {
     test_legal_mode();
     test_adc_period();
+    test_adc_readable();
+    test_debounce();
+    test_debounce_cfg();
     test_log_level();
     test_incompatible_host();
+    test_abs_volume();
     test_slots_replace_in_order();
     test_slots_never_lose_the_latest();
     test_slots_merge_gpio_in();
@@ -424,6 +758,8 @@ int main(void)
     test_slots_adc_per_line();
     test_slots_faults_and_wrap();
     test_slots_encode_in_place();
+    test_pause_check();
+    test_format_restart();
     printf("Device rules: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

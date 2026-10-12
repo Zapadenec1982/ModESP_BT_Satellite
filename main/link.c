@@ -78,6 +78,13 @@ static const char *TAG = "sat.link";
  * with no limit would greet each other until the wire melted. */
 #define LINK_HELLO_MIN_GAP_US (1000 * 1000)
 
+/* The retry timer ticks on a fixed 1 s grid (esp_timer re-arms with
+ * alarm += period), but each tick is seen a few microseconds early or late.
+ * Measured against the strict gap, every tick that came in a little earlier
+ * than the last one was refused, and the once-a-second retry became 1 s or 2 s
+ * at random. The timer path alone gets this much slack. */
+#define LINK_HELLO_RETRY_SLACK_US (50 * 1000)
+
 /*
  * How much stack a sender is allowed to take.
  *
@@ -190,8 +197,10 @@ static portMUX_TYPE s_hello_mux = portMUX_INITIALIZER_UNLOCKED;
 static esp_timer_handle_t s_ping_timer;
 
 /* Guards the log bridge against feeding on itself: a failure inside a send would
- * otherwise log, which would send, which would fail. */
-static volatile bool     s_in_log_bridge;
+ * otherwise log, which would send, which would fail. Per task: the hook runs
+ * unlocked from every task on both cores, and a shared flag dropped another
+ * task's line whenever two logged at once. */
+static __thread bool     s_in_log_bridge;
 static vprintf_like_t    s_prev_vprintf;
 
 /* ------------------------------------------------------------------ outbound */
@@ -590,24 +599,32 @@ static void send_hello(void)
     tx_push(SATLINK_MSG_HELLO, payload, len);
 }
 
-/* The reply half of the greeting. Without it a peer that started first never
- * learns our version or our capabilities, and is right to refuse to bring the
- * link up: it would be guessing at what we can do. */
-static void answer_hello(bool force)
+/* Every HELLO this device sends goes through here. RX, startup and retry timer
+ * share one reservation (the time of the last HELLO), but not one gap: the
+ * reply and startup paths ask for the full LINK_HELLO_MIN_GAP_US, the retry
+ * timer for LINK_HELLO_RETRY_SLACK_US less. */
+static void reserve_hello(bool force, int64_t min_gap_us)
 {
     int64_t now = esp_timer_get_time();
-    // RX, startup and retry timer share one reservation; do not hold the lock
-    // while encoding, logging or queueing the message.
+    // Do not hold the lock while encoding, logging or queueing the message.
     portENTER_CRITICAL(&s_hello_mux);
     // `force`: our capabilities changed, and a host that keeps the old ones would be
     // driving a line we now drive too, or not driving one we now need.
-    if (!force && s_last_hello_us != 0 && now - s_last_hello_us < LINK_HELLO_MIN_GAP_US) {
+    if (!force && s_last_hello_us != 0 && now - s_last_hello_us < min_gap_us) {
         portEXIT_CRITICAL(&s_hello_mux);
         return;
     }
     s_last_hello_us = now;
     portEXIT_CRITICAL(&s_hello_mux);
     send_hello();
+}
+
+/* The reply half of the greeting, also used for the startup HELLO. Without it a
+ * peer that started first never learns our version or our capabilities, and is
+ * right to refuse to bring the link up: it would be guessing at what we can do. */
+static void answer_hello(bool force)
+{
+    reserve_hello(force, LINK_HELLO_MIN_GAP_US);
 }
 
 /* ------------------------------------------------------------------- inbound */
@@ -652,8 +669,6 @@ static void handle_hello(const uint8_t *payload, size_t len)
         return;
     }
 
-    s_peer_incompatible = false;
-    s_host_present = true;
     uint32_t caps = fmt_ack_capable(h.minor, h.caps) ? h.caps : (h.caps & ~FMT_HOST_CAP);
     if (h.minor < 4 || !(caps & FMT_HOST_CAP) || !(caps & SATLINK_HOST_CAP_RELOCK))
         caps &= ~SATLINK_HOST_CAP_96KHZ;
@@ -666,6 +681,10 @@ static void handle_hello(const uint8_t *payload, size_t len)
     /* Minor first: a sender that sees the new caps must not see the old minor. */
     __atomic_store_n(&s_host_minor, h.minor, __ATOMIC_SEQ_CST);
     __atomic_store_n(&s_host_caps, caps, __ATOMIC_SEQ_CST);
+    /* Presence last: a reader that sees the host present (link_wait_for_host)
+     * must also see its minor and caps. */
+    s_peer_incompatible = false;
+    s_host_present = true;
     ESP_LOGI(TAG, "host %u.%u, caps 0x%08" PRIx32 ", build \"%.*s\"",
              h.major, h.minor, h.caps, (int)h.build.len, h.build.ptr);
 
@@ -839,6 +858,65 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
     }
 }
 
+/* One read's worth of bytes, into the reassembler and the counters. */
+static void rx_feed_chunk(const uint8_t *chunk, size_t n)
+{
+    if (s_stats.rx_bytes == 0) {
+        /* The first byte ever. Worth its own line: it is the difference
+         * between a wire that is not connected and a peer that is not
+         * understood. */
+        ESP_LOGI(TAG, "something is transmitting on GPIO%d", BOARD_LINK_RX_GPIO);
+    }
+    s_stats.rx_bytes += (uint32_t)n;
+
+    satlink_rx_feed(&s_rx, chunk, n, on_frame, NULL);
+    s_stats.rx_seq_gaps = s_rx.seq_gaps;
+    /* Its own field. This one used to be rx_bad, and assigning it here
+     * erased every payload that on_frame had just counted as bad. */
+    s_stats.rx_bad_frames = s_rx.err_cobs + s_rx.err_crc + s_rx.err_runt + s_rx.err_too_long;
+}
+
+/*
+ * Whatever is still buffered once no event is waiting to claim it.
+ *
+ * The driver can hold bytes that no event announces: it pushes them into the
+ * ring before it posts the event, and when the event queue is full it drops the
+ * event and keeps the bytes; the xQueueReset after an overrun flush can erase
+ * one as well. Reading only what each event announces would then leave the
+ * newest bytes of every later burst behind -- the tail of each host frame, its
+ * delimiter included, waiting for the next PING -- until the next overrun.
+ *
+ * It stops as soon as an event is queued, so an overrun still being reported
+ * gets to flush the bytes after its hole instead of having them joined to the
+ * bytes before it. A data event whose bytes were taken here reads nothing.
+ */
+static void rx_drain_residue(uint8_t *chunk, size_t cap)
+{
+    while (uxQueueMessagesWaiting(s_uart_events) == 0) {
+        int n = uart_read_bytes(BOARD_LINK_UART_NUM, chunk, cap, 0);
+        if (n <= 0) {
+            break;
+        }
+        rx_feed_chunk(chunk, (size_t)n);
+    }
+}
+
+/* One UART_DATA event. Its size is a hint, not a count of what is buffered. */
+static void rx_data_event(size_t announced, uint8_t *chunk, size_t cap)
+{
+    size_t remaining = announced;
+    while (remaining > 0) {
+        size_t want = (remaining < cap) ? remaining : cap;
+        int n = uart_read_bytes(BOARD_LINK_UART_NUM, chunk, want, 0);
+        if (n <= 0) {
+            break;
+        }
+        remaining -= (size_t)n;
+        rx_feed_chunk(chunk, (size_t)n);
+    }
+    rx_drain_residue(chunk, cap);
+}
+
 /*
  * Driven by the driver's event queue rather than by polling.
  *
@@ -864,32 +942,9 @@ static void link_rx_task(void *arg)
         }
 
         switch (event.type) {
-        case UART_DATA: {
-            size_t remaining = event.size;
-            while (remaining > 0) {
-                size_t want = (remaining < sizeof(chunk)) ? remaining : sizeof(chunk);
-                int n = uart_read_bytes(BOARD_LINK_UART_NUM, chunk, want, 0);
-                if (n <= 0) {
-                    break;
-                }
-                remaining -= (size_t)n;
-
-                if (s_stats.rx_bytes == 0) {
-                    /* The first byte ever. Worth its own line: it is the
-                     * difference between a wire that is not connected and a peer
-                     * that is not understood. */
-                    ESP_LOGI(TAG, "something is transmitting on GPIO%d", BOARD_LINK_RX_GPIO);
-                }
-                s_stats.rx_bytes += (uint32_t)n;
-
-                satlink_rx_feed(&s_rx, chunk, (size_t)n, on_frame, NULL);
-                s_stats.rx_seq_gaps = s_rx.seq_gaps;
-                /* Its own field. This one used to be rx_bad, and assigning it here
-                 * erased every payload that on_frame had just counted as bad. */
-                s_stats.rx_bad_frames = s_rx.err_cobs + s_rx.err_crc + s_rx.err_runt + s_rx.err_too_long;
-            }
+        case UART_DATA:
+            rx_data_event(event.size, chunk, sizeof(chunk));
             break;
-        }
 
         case UART_FIFO_OVF:
         case UART_BUFFER_FULL:
@@ -902,6 +957,10 @@ static void link_rx_task(void *arg)
             uart_flush_input(BOARD_LINK_UART_NUM);
             xQueueReset(s_uart_events);
             satlink_rx_discard(&s_rx);
+            /* Bytes that landed between the flush and the reset lost their
+             * event with it. They came after the hole, so they are fine to
+             * keep. */
+            rx_drain_residue(chunk, sizeof(chunk));
             /* Its own counter. This used to increment rx_bad, which the next data
              * event overwrote from the reassembler's totals -- so the one number
              * that said "we were too slow" was reliably erased by the one that
@@ -957,7 +1016,10 @@ static void ping_tick(void *arg)
 
     // PONG proves liveness, not capability negotiation. A lost startup HELLO
     // or reply must not leave a restarted satellite permanently in legacy mode.
-    if (!s_host_present && !s_peer_incompatible) answer_hello(false);
+    // Only the startup HELLO and these retries go out while no host has greeted,
+    // so the grid already keeps them a second apart; the slack absorbs jitter.
+    if (!s_host_present && !s_peer_incompatible)
+        reserve_hello(false, LINK_HELLO_MIN_GAP_US - LINK_HELLO_RETRY_SLACK_US);
 
     if (s_ping_outstanding > 0) {
         s_stats.pings_unanswered++;
