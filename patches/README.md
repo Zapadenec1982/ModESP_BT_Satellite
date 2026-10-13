@@ -61,6 +61,21 @@ then copy `bt_overlay/`. `tools/setup.ps1 -Clean` reproduces the local ignored
   did, wants one value per field, each offered: SBC, AAC, aptX, aptX HD and LHDC V5
   (whose separate check from 0003 it replaces, through the vendor dispatcher in
   `bt_overlay`'s `a2dp_vendor.c`). Discovery keeps the liberal check.
+- `0011-ignore-connection-exists-on-connected-link.patch`: a stock bug, not one of
+  ours. When both sides page at once, `l2c_link_hci_conn_req` accepts the peer's
+  page as a collision while our Create_Connection is still running; that page
+  later ends in a Connection Complete with Connection Already Exists (0x0B) for
+  a peer whose LCB is already `LST_CONNECTED`. Stock `l2c_link_hci_conn_comp`
+  treated it as a failure of the live link and ran `l2c_link_hci_disc_comp` on
+  the live handle: A2DP and AVRCP went down, the LCB was released without an
+  HCI_Disconnect, the controller kept the ACL and every packet on it hit
+  "rcvd ACL for unknown handle", and the phone could not come back until reboot
+  (bench, 12.10.2026, after a double reset while the phone was reconnecting).
+  The event is now logged and ignored, as AOSP has done since `acb6fe3b8c84`
+  (system/bt, October 2019, Android 11). ESP-IDF master still had the stock
+  code on 12.10.2026. `tools/run_l2c_collision_tests.py` replays it through the
+  generated function; `--bt-root` with the pinned stock component shows the
+  teardown.
 
 Patch paths are relative to `components/bt`; setup uses
 `git apply --directory=components/bt` and stops on a rejected hunk.
