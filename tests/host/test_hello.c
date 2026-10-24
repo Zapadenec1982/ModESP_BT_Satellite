@@ -13,6 +13,7 @@ int g_checks, g_failures;
 #define LINK_BUF_HELLO (1 + 1 + 4 + 2 + LINK_BUILD_MAX)
 #define LINK_HELLO_MIN_GAP_US (1000 * 1000)
 #define LINK_HELLO_RETRY_SLACK_US (50 * 1000)
+#define STAT_ADD(field) __atomic_fetch_add(&s_stats.field, 1u, __ATOMIC_RELAXED)
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGE(...) ((void)0)
 #define ESP_LOGW(...) ((void)0)

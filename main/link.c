@@ -215,15 +215,19 @@ static void tx_wake(void)
     }
 }
 
+/* The tx_ and hello counters are bumped by whichever task sends, on either core;
+ * a plain ++ from two at once loses one. The rx_ ones belong to the RX task alone. */
+#define STAT_ADD(field) __atomic_fetch_add(&s_stats.field, 1u, __ATOMIC_RELAXED)
+
 static void tx_slot_count(tx_slot_result_t r)
 {
     switch (r) {
     case TX_SLOT_REPLACED:
-        s_stats.tx_coalesced++;
+        STAT_ADD(tx_coalesced);
         break;
     case TX_SLOT_NO_SLOT:
     case TX_SLOT_TOO_LONG:
-        s_stats.tx_dropped_critical++;
+        STAT_ADD(tx_dropped_critical);
         break;
     case TX_SLOT_QUEUED:
         break;
@@ -241,7 +245,7 @@ static void tx_queue_telemetry(uint8_t type, const uint8_t *payload, size_t len)
 {
     uint8_t *buf = malloc(len != 0 ? len : 1);
     if (buf == NULL) {
-        s_stats.tx_dropped_bulk++;      /* counted, which it used not to be */
+        STAT_ADD(tx_dropped_bulk);      /* counted, which it used not to be */
         return;
     }
     if (len != 0) {
@@ -257,11 +261,11 @@ static void tx_queue_telemetry(uint8_t type, const uint8_t *payload, size_t len)
         tx_item_t oldest;
         if (xQueueReceive(s_q_telemetry, &oldest, 0) == pdTRUE) {
             tx_item_free(&oldest);
-            s_stats.tx_dropped_bulk++;
+            STAT_ADD(tx_dropped_bulk);
         }
     }
     tx_item_free(&item);
-    s_stats.tx_dropped_bulk++;
+    STAT_ADD(tx_dropped_bulk);
 }
 
 static void tx_push_tagged(uint8_t type, const uint8_t *payload, size_t payload_len,
@@ -556,7 +560,7 @@ static void send_hello(void)
         ESP_LOGE(TAG, "HELLO will not encode into %u bytes", (unsigned)sizeof(payload));
         return;
     }
-    s_stats.hello_sent++;
+    STAT_ADD(hello_sent);
     ESP_LOGI(TAG, "HELLO out: %u.%u, caps 0x%08" PRIx32 ", %u bytes",
              SATLINK_PROTO_MAJOR, SATLINK_PROTO_MINOR, __atomic_load_n(&s_own_caps, __ATOMIC_SEQ_CST), (unsigned)len);
     tx_push(SATLINK_MSG_HELLO, payload, len);
@@ -722,7 +726,7 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
         if (!satlink_dec_pong(payload, len, &pong)) { s_stats.rx_bad++; break; }
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
         s_stats.rtt_ms = now_ms - pong.echo_ms;   /* wraps cleanly in unsigned */
-        s_ping_outstanding = 0;
+        __atomic_store_n(&s_ping_outstanding, 0, __ATOMIC_RELAXED);
         break;
     }
 
@@ -973,7 +977,7 @@ static void ping_tick(void *arg)
     if (!s_host_present && !s_peer_incompatible)
         reserve_hello(false, LINK_HELLO_MIN_GAP_US - LINK_HELLO_RETRY_SLACK_US);
 
-    if (s_ping_outstanding > 0) {
+    if (__atomic_load_n(&s_ping_outstanding, __ATOMIC_RELAXED) > 0) {
         s_stats.pings_unanswered++;
         /* Not an error. A host that is not answering is a host that is busy or
          * absent, and this device is expected to keep playing either way. */
@@ -985,8 +989,10 @@ static void ping_tick(void *arg)
     uint8_t payload[8];
     size_t len = satlink_enc_ping(payload, sizeof(payload), &m);
     if (len != 0) {
+        /* Counted before it is queued: the sender runs on the other core, and a PONG
+         * back first would otherwise be cleared before this PING counted as out. */
+        __atomic_fetch_add(&s_ping_outstanding, 1u, __ATOMIC_RELAXED);
         tx_push(SATLINK_MSG_PING, payload, len);
-        s_ping_outstanding++;
     }
 }
 
