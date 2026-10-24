@@ -37,7 +37,7 @@ static void test_msg_hello(void)
         .major = SATLINK_PROTO_MAJOR,
         .minor = SATLINK_PROTO_MINOR,
         .caps  = SATLINK_CAP_A2DP_SINK | SATLINK_CAP_AVRCP_META |
-                 SATLINK_CAP_ABS_VOLUME | SATLINK_CAP_COVER_ART | SATLINK_CAP_EXPANDER,
+                 SATLINK_CAP_ABS_VOLUME | SATLINK_CAP_COVER_ART | SATLINK_CAP_BT_SETTINGS,
         .build = satlink_str("sat 0.1.0 deadbee"),
     };
 
@@ -366,6 +366,24 @@ static void test_proto_1_8_constants(void)
     CHECK(SATLINK_BOND_LIST_BYTES_MAX <= SATLINK_PAYLOAD_MAX);
 }
 
+/* 1.10 took the port expander out: device bits 4 and 5 and host bit 2 meant it
+ * until 1.9, and a panel of that age still reads them so. No bit of either word
+ * may land on them again. */
+static void test_proto_1_10_retired(void)
+{
+    CHECK(SATLINK_PROTO_MINOR >= 10);
+    const uint32_t device = SATLINK_CAP_A2DP_SINK | SATLINK_CAP_AVRCP_META |
+                            SATLINK_CAP_ABS_VOLUME | SATLINK_CAP_COVER_ART |
+                            SATLINK_CAP_COVER_RETRY | SATLINK_CAP_BT_SETTINGS |
+                            SATLINK_CAP_I2S_SLAVE;
+    const uint32_t host = SATLINK_HOST_CAP_RELOCK | SATLINK_HOST_CAP_COVER |
+                          SATLINK_HOST_CAP_WIDE | SATLINK_HOST_CAP_FORMAT_READY |
+                          SATLINK_HOST_CAP_96KHZ | COVER_STREAM_CAP |
+                          SATLINK_HOST_CAP_PAIR_CONFIRM | SATLINK_HOST_CAP_I2S_MASTER;
+    CHECK_EQ(device & ((1u << 4) | (1u << 5)), 0);
+    CHECK_EQ(host & (1u << 2), 0);
+}
+
 static const uint8_t k_addr[6] = { 0xDC, 0xE5, 0x5B, 0xEA, 0xC9, 0x3B };
 
 static void test_msg_pair_request_result(void)
@@ -565,112 +583,6 @@ static void test_msg_settings_commands(void)
     CHECK(!satlink_dec_bt_refresh(g_buf, 1));
 }
 
-static void test_msg_gpio_in_out(void)
-{
-    satlink_gpio_in_t in = { .values = 0x0000A5A5, .changed = 0x00000021 };
-    size_t len = satlink_enc_gpio_in(g_buf, sizeof(g_buf), &in);
-    CHECK_EQ(len, 8);
-    satlink_gpio_in_t in_out = {0};
-    CHECK(satlink_dec_gpio_in(g_buf, len, &in_out));
-    CHECK_EQ(in_out.values, in.values);
-    CHECK_EQ(in_out.changed, in.changed);
-    CHECK_STRICT_LEN(satlink_dec_gpio_in, in_out, len);
-
-    satlink_gpio_out_t out = { .values = 0xFFFFFFFF, .mask = 0x00000008 };
-    len = satlink_enc_gpio_out(g_buf, sizeof(g_buf), &out);
-    CHECK_EQ(len, 8);
-    satlink_gpio_out_t out_out = {0};
-    CHECK(satlink_dec_gpio_out(g_buf, len, &out_out));
-    CHECK_EQ(out_out.values, out.values);
-    CHECK_EQ(out_out.mask, out.mask);
-}
-
-static void test_msg_gpio_cfg(void)
-{
-    satlink_gpio_cfg_t in = { .count = 3 };
-    in.pins[0] = (satlink_pin_cfg_t){ .index = 0, .mode = SATLINK_PIN_INPUT_PU, .initial = 0 };
-    in.pins[1] = (satlink_pin_cfg_t){ .index = 1, .mode = SATLINK_PIN_OUTPUT,   .initial = 1 };
-    in.pins[2] = (satlink_pin_cfg_t){ .index = 2, .mode = SATLINK_PIN_ANALOG,   .initial = 5 };
-
-    size_t len = satlink_enc_gpio_cfg(g_buf, sizeof(g_buf), &in);
-    CHECK_EQ(len, 1 + 3 * 3);
-
-    satlink_gpio_cfg_t out = {0};
-    CHECK(satlink_dec_gpio_cfg(g_buf, len, &out));
-    CHECK_EQ(out.count, 3);
-    CHECK_EQ(out.pins[1].mode, SATLINK_PIN_OUTPUT);
-    CHECK_EQ(out.pins[1].initial, 1);
-    CHECK_EQ(out.pins[2].mode, SATLINK_PIN_ANALOG);
-    CHECK_EQ(out.pins[2].initial, 5);     /* half a second, in hundreds of ms */
-    CHECK_STRICT_LEN(satlink_dec_gpio_cfg, out, len);
-
-    /* Empty is legal. */
-    satlink_gpio_cfg_t none = { .count = 0 };
-    len = satlink_enc_gpio_cfg(g_buf, sizeof(g_buf), &none);
-    CHECK_EQ(len, 1);
-    CHECK(satlink_dec_gpio_cfg(g_buf, len, &out));
-    CHECK_EQ(out.count, 0);
-
-    /* A count past the 32-line ceiling the u32 masks impose is refused. */
-    satlink_gpio_cfg_t over = { .count = SATLINK_GPIO_MAX + 1 };
-    CHECK_EQ(satlink_enc_gpio_cfg(g_buf, sizeof(g_buf), &over), 0);
-    uint8_t forged[] = { SATLINK_GPIO_MAX + 1 };
-    CHECK(!satlink_dec_gpio_cfg(forged, sizeof(forged), &out));
-}
-
-static void test_msg_gpio_map(void)
-{
-    /* The starting configuration: the device understands the messages and has no
-     * lines to offer yet. */
-    satlink_gpio_map_t empty = { .count = 0 };
-    size_t len = satlink_enc_gpio_map(g_buf, sizeof(g_buf), &empty);
-    CHECK_EQ(len, 1);
-
-    satlink_gpio_map_t out = {0};
-    CHECK(satlink_dec_gpio_map(g_buf, len, &out));
-    CHECK_EQ(out.count, 0);
-
-    /* An input-only ESP32 pin: no output, no pull, but it can read an analogue
-     * level. Exactly the case flags bit 3 exists for. */
-    satlink_gpio_map_t in = { .count = 2 };
-    in.pins[0] = (satlink_pin_map_t){ .index = 0, .gpio = 13,
-                                      .flags = SATLINK_PIN_CAN_INPUT | SATLINK_PIN_CAN_OUTPUT |
-                                               SATLINK_PIN_CAN_ADC | SATLINK_PIN_HAS_PULL };
-    in.pins[1] = (satlink_pin_map_t){ .index = 1, .gpio = 34,
-                                      .flags = SATLINK_PIN_CAN_INPUT | SATLINK_PIN_CAN_ADC };
-
-    len = satlink_enc_gpio_map(g_buf, sizeof(g_buf), &in);
-    CHECK_EQ(len, 1 + 2 * 3);
-    CHECK(satlink_dec_gpio_map(g_buf, len, &out));
-    CHECK_EQ(out.count, 2);
-    CHECK_EQ(out.pins[1].gpio, 34);
-    CHECK(!(out.pins[1].flags & SATLINK_PIN_HAS_PULL));
-    CHECK(!(out.pins[1].flags & SATLINK_PIN_CAN_OUTPUT));
-    CHECK(out.pins[0].flags & SATLINK_PIN_HAS_PULL);
-    CHECK_STRICT_LEN(satlink_dec_gpio_map, out, len);
-}
-
-static void test_msg_adc(void)
-{
-    satlink_adc_value_t in = { .index = 2, .raw = 2048, .mv = 1650 };
-    size_t len = satlink_enc_adc_value(g_buf, sizeof(g_buf), &in);
-    CHECK_EQ(len, 5);
-
-    satlink_adc_value_t out = {0};
-    CHECK(satlink_dec_adc_value(g_buf, len, &out));
-    CHECK_EQ(out.index, 2);
-    CHECK_EQ(out.raw, 2048);
-    CHECK_EQ(out.mv, 1650);
-    CHECK_STRICT_LEN(satlink_dec_adc_value, out, len);
-
-    satlink_adc_read_t req = { .index = 7 };
-    len = satlink_enc_adc_read(g_buf, sizeof(g_buf), &req);
-    CHECK_EQ(len, 1);
-    satlink_adc_read_t req_out = {0};
-    CHECK(satlink_dec_adc_read(g_buf, len, &req_out));
-    CHECK_EQ(req_out.index, 7);
-}
-
 static void test_msg_log(void)
 {
     satlink_log_t in = { .level = SATLINK_LOG_WARN, .text = satlink_str("ring full") };
@@ -719,15 +631,6 @@ static void test_encoders_refuse_small_buffers(void)
     uint8_t art[4] = {1, 2, 3, 4};
     satlink_cover_t cover = { .len = 4, .data = art };
     CHECK_EQ(satlink_enc_cover(tiny, sizeof(tiny), &cover), 0);
-
-    satlink_gpio_in_t gin = {0};
-    CHECK_EQ(satlink_enc_gpio_in(tiny, sizeof(tiny), &gin), 0);
-
-    satlink_gpio_map_t map = { .count = 1 };
-    CHECK_EQ(satlink_enc_gpio_map(tiny, sizeof(tiny), &map), 0);
-
-    satlink_adc_value_t adc = {0};
-    CHECK_EQ(satlink_enc_adc_value(tiny, sizeof(tiny), &adc), 0);
 
     satlink_log_t log = { .text = satlink_str("hello") };
     CHECK_EQ(satlink_enc_log(tiny, sizeof(tiny), &log), 0);
@@ -842,14 +745,11 @@ const test_case_t message_tests[] = {
     { "cover retry",           test_msg_cover_retry },
     { "protocol 1.7 constants", test_proto_1_7_constants },
     { "protocol 1.8 constants", test_proto_1_8_constants },
+    { "protocol 1.10 retired",  test_proto_1_10_retired },
     { "pair request, result",  test_msg_pair_request_result },
     { "bt config",             test_msg_bt_config },
     { "bond list",             test_msg_bond_list },
     { "settings commands",     test_msg_settings_commands },
-    { "gpio in and out",       test_msg_gpio_in_out },
-    { "gpio cfg",              test_msg_gpio_cfg },
-    { "gpio map",              test_msg_gpio_map },
-    { "adc",                   test_msg_adc },
     { "log",                   test_msg_log },
     { "encoders refuse small", test_encoders_refuse_small_buffers },
     { "worst case in a frame", test_every_message_through_a_frame },

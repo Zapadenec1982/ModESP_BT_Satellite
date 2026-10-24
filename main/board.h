@@ -47,9 +47,3 @@
 #define BOARD_LINK_RX_GPIO    GPIO_NUM_16
 #endif
 #define BOARD_LINK_BAUD       460800
-
-/* Free for the port expander once there is something to connect:
- *   in or out : 13, 14, 18, 19, 21, 22, 23, 32, 33
- *   input only: 34, 35, 36, 39
- * The set the device actually exposes is declared at runtime in GPIO_MAP, so
- * adding a line later is one row in a table here and nothing on the host side. */

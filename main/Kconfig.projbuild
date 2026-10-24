@@ -40,8 +40,8 @@ config SAT_LINK_ONLY
     bool "Build the link and nothing else"
     default n
     help
-        Brings up the UART link, HELLO, GPIO_MAP, PING/PONG and LOG, and leaves
-        out Bluetooth and I2S entirely.
+        Brings up the UART link, HELLO, PING/PONG and LOG, and leaves out
+        Bluetooth and I2S entirely.
 
         It exists to make a first failure legible. With the radio in the picture
         a silent link could be the wire, the baud rate, the framing, the CRC, the

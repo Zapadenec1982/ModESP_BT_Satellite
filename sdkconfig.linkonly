@@ -3,7 +3,7 @@
 #   idf.py -B build_linkonly -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.linkonly" build
 #   idf.py -B build_linkonly -p COM13 flash monitor
 #
-# HELLO, GPIO_MAP with count = 0, PONG to every PING, one PING a second, and LOG.
+# HELLO, PONG to every PING, one PING a second, and LOG.
 # No Bluetooth and no I2S, so a failure here is the cable, the baud rate, the
 # framing or the CRC, and cannot be anything else.
 CONFIG_SAT_LINK_ONLY=y

@@ -16,8 +16,10 @@
  * Legacy STREAM_FMT layouts remain unchanged.
  * 1.7: COVER_RETRY, device capability bit 6.
  * 1.8: Bluetooth settings and host-confirmed pairing, device and host bit 7.
- * 1.9: the host may clock the I2S link; device bit 8 and host bit 8. */
-#define SATLINK_PROTO_MINOR   9
+ * 1.9: the host may clock the I2S link; device bit 8 and host bit 8.
+ * 1.10: the port expander is gone. Codes 0x30..0x35, device bits 4 and 5 and
+ * host bit 2 mean nothing and are never reused. */
+#define SATLINK_PROTO_MINOR   10
 
 /* The largest decoded frame: type | seq | payload | crc16. */
 #define SATLINK_FRAME_MAX     1040
@@ -53,12 +55,7 @@ typedef enum {
     SATLINK_MSG_BT_CONFIG_SET  = 0x26,  /* H -> D, 1.8 */
     SATLINK_MSG_BOND_REMOVE    = 0x27,  /* H -> D, 1.8 */
     SATLINK_MSG_BT_REFRESH     = 0x28,  /* H -> D, 1.8 */
-    SATLINK_MSG_GPIO_IN        = 0x30,  /* D -> H */
-    SATLINK_MSG_GPIO_OUT       = 0x31,  /* H -> D */
-    SATLINK_MSG_GPIO_CFG       = 0x32,  /* H -> D */
-    SATLINK_MSG_GPIO_MAP       = 0x33,  /* D -> H */
-    SATLINK_MSG_ADC_VALUE      = 0x34,  /* D -> H */
-    SATLINK_MSG_ADC_READ       = 0x35,  /* H -> D */
+    /* 0x30..0x35: the port expander until 1.9. Never reused. */
     SATLINK_MSG_LOG            = 0x40,  /* D -> H */
 } satlink_msg_t;
 
@@ -67,8 +64,7 @@ typedef enum {
 #define SATLINK_CAP_AVRCP_META    (1u << 1)
 #define SATLINK_CAP_ABS_VOLUME    (1u << 2)
 #define SATLINK_CAP_COVER_ART     (1u << 3)
-#define SATLINK_CAP_EXPANDER      (1u << 4)  /* understands the GPIO messages, not "has pins" */
-#define SATLINK_CAP_ADC           (1u << 5)
+/* Bits 4 and 5: EXPANDER and ADC until 1.9. Never reused. */
 /* 1.7. Says a COVER_RETRY naming the current pair is answered with a fresh
  * generation and a repeated OBEX GET. Claimed only alongside SATLINK_CAP_COVER_ART:
  * the host's own gate requires both, and claiming one without the other would
@@ -86,7 +82,7 @@ typedef enum {
 #define SATLINK_HOST_CAP_RELOCK   (1u << 0)  /* can follow STREAM_FMT mid-flight */
 #define SATLINK_HOST_CAP_96KHZ    (1u << 5)  /* protocol 1.4; requires RELOCK + FORMAT_READY */
 #define SATLINK_HOST_CAP_COVER    (1u << 1)
-#define SATLINK_HOST_CAP_EXPANDER (1u << 2)
+/* Bit 2: EXPANDER until 1.9. Ignored, never reused. */
 #define SATLINK_HOST_CAP_WIDE     (1u << 3)  /* can take 32-bit slots; STREAM_FMT.bits says which */
 /* 1.8. The host shows pairing requests and answers PAIR_REPLY. Without it the
  * device pairs the way 1.7 did: NoInputNoOutput, and nobody is asked. */
@@ -185,25 +181,6 @@ typedef enum {
     SATLINK_MIME_JPEG    = 1,
     SATLINK_MIME_PNG     = 2,
 } satlink_mime_t;
-
-/* GPIO_CFG.mode */
-typedef enum {
-    SATLINK_PIN_DISABLED    = 0,
-    SATLINK_PIN_INPUT       = 1,
-    SATLINK_PIN_INPUT_PU    = 2,
-    SATLINK_PIN_INPUT_PD    = 3,
-    SATLINK_PIN_OUTPUT      = 4,
-    SATLINK_PIN_OUTPUT_OD   = 5,
-    SATLINK_PIN_ANALOG      = 6,   /* `initial` carries the period in hundreds of ms */
-} satlink_pin_mode_t;
-
-/* GPIO_MAP.flags */
-#define SATLINK_PIN_CAN_INPUT   (1u << 0)
-#define SATLINK_PIN_CAN_OUTPUT  (1u << 1)
-#define SATLINK_PIN_CAN_ADC     (1u << 2)
-#define SATLINK_PIN_HAS_PULL    (1u << 3)
-
-#define SATLINK_GPIO_MAX        32     /* GPIO_IN and GPIO_OUT carry u32 masks */
 
 #define SATLINK_MSG_STREAM_PREPARE FMT_PREPARE
 #define SATLINK_MSG_STREAM_READY FMT_READY

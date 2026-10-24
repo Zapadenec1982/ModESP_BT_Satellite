@@ -5,8 +5,7 @@
  * A message waiting in a slot is replaced by the next one of its type, which
  * carries the newer state of the same thing; the host is told the latest and
  * never a stale one. Nothing is evicted and nothing is allocated, so a slot never
- * overflows and a full heap cannot lose a BT_STATE. GPIO_IN is merged rather than
- * replaced: the newest levels, and every line that changed in either.
+ * overflows and a full heap cannot lose a BT_STATE.
  *
  * Slots go out oldest update first. An update moves its slot behind everything
  * queued before it, so newer state never overtakes older messages of other types.
@@ -22,14 +21,8 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "satlink/proto.h"
-
 typedef struct {
     uint8_t   type;
-    uint8_t   key;          /* ADC_VALUE: the line index; 0 for every other type.
-                             * A type may have several slots: an idle one is taken
-                             * for a key that has none, which is how a few ADC slots
-                             * serve every line. */
     uint16_t  cap;          /* bytes `buf` holds: the largest payload of the type */
     uint8_t  *buf;
     bool      pending;
@@ -41,49 +34,27 @@ typedef struct {
 typedef enum {
     TX_SLOT_QUEUED = 0,     /* the slot was idle */
     TX_SLOT_REPLACED,       /* an unsent message of the type was superseded */
-    TX_SLOT_MERGED,         /* GPIO_IN folded into the unsent one */
     TX_SLOT_NO_SLOT,        /* no slot for this type: a fault in this build */
     TX_SLOT_TOO_LONG,       /* longer than the slot: a fault in this build */
 } tx_slot_result_t;
 
-/* The slot holding (type, key), or an idle slot of the type taken for the key,
- * or NULL: every slot of the type is busy with other keys. */
-static inline tx_slot_t *tx_slot_find(tx_slot_t *slots, size_t n, uint8_t type, uint8_t key)
+/* The slot of the type, or NULL: this build gave the type none. */
+static inline tx_slot_t *tx_slot_find(tx_slot_t *slots, size_t n, uint8_t type)
 {
-    tx_slot_t *idle = NULL;
     for (size_t i = 0; i < n; i++) {
-        if (slots[i].type != type) {
-            continue;
-        }
-        if (slots[i].key == key) {
+        if (slots[i].type == type) {
             return &slots[i];
         }
-        if (idle == NULL && !slots[i].pending) {
-            idle = &slots[i];
-        }
     }
-    if (idle != NULL) {
-        idle->key = key;
-    }
-    return idle;
-}
-
-static inline uint32_t tx_get32(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static inline void tx_put32(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+    return NULL;
 }
 
 /* Stores a message in its slot under `stamp`. `*stamp` is advanced. */
-static inline tx_slot_result_t tx_slot_put(tx_slot_t *slots, size_t n, uint8_t type, uint8_t key,
+static inline tx_slot_result_t tx_slot_put(tx_slot_t *slots, size_t n, uint8_t type,
                                            const uint8_t *payload, size_t len,
                                            uint32_t nonce, uint32_t generation, uint32_t *stamp)
 {
-    tx_slot_t *s = tx_slot_find(slots, n, type, key);
+    tx_slot_t *s = tx_slot_find(slots, n, type);
     if (s == NULL) {
         return TX_SLOT_NO_SLOT;
     }
@@ -92,18 +63,8 @@ static inline tx_slot_result_t tx_slot_put(tx_slot_t *slots, size_t n, uint8_t t
     }
 
     tx_slot_result_t result = s->pending ? TX_SLOT_REPLACED : TX_SLOT_QUEUED;
-    uint32_t changed_before = 0;
-    /* GPIO_IN: values u32, changed u32. A line that changed in the unsent one
-     * still changed, whatever it did since. */
-    if (type == SATLINK_MSG_GPIO_IN && s->pending && s->len == 8 && len == 8) {
-        changed_before = tx_get32(s->buf + 4);
-        result = TX_SLOT_MERGED;
-    }
     if (len != 0) {
         memcpy(s->buf, payload, len);
-    }
-    if (result == TX_SLOT_MERGED) {
-        tx_put32(s->buf + 4, tx_get32(s->buf + 4) | changed_before);
     }
     s->len = (uint16_t)len;
     s->fmt_nonce = nonce;
@@ -122,7 +83,7 @@ static inline tx_slot_result_t tx_slot_encode(tx_slot_t *slots, size_t n, uint8_
                                               tx_encoder_t encode, const void *msg,
                                               uint32_t *stamp)
 {
-    tx_slot_t *s = tx_slot_find(slots, n, type, 0);
+    tx_slot_t *s = tx_slot_find(slots, n, type);
     if (s == NULL) {
         return TX_SLOT_NO_SLOT;
     }
