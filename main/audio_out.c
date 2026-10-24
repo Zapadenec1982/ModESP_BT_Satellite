@@ -1230,6 +1230,9 @@ static esp_err_t i2s_open(bool slave)
     esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx, NULL);
     if (err != ESP_OK) { s_tx = NULL; return err; }
 
+    /* Put back if this fails: the width is what the host was told, and no channel came up
+     * to carry another. */
+    const uint8_t bits_before = s_slot_bits;
     if (slave) s_slot_bits = 32;
     /* A variable, not an expression: the IDF macro pastes its argument unparenthesised. */
     const i2s_data_bit_width_t width = s_slot_bits == 32 ? I2S_DATA_BIT_WIDTH_32BIT
@@ -1265,6 +1268,7 @@ static esp_err_t i2s_open(bool slave)
         i2s_del_channel(s_tx);
         s_tx = NULL;
         s_running = false;
+        s_slot_bits = bits_before;
         return err;
     }
     s_slave = slave;
