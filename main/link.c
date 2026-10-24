@@ -11,6 +11,7 @@
 
 #include "board.h"
 
+#include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_app_desc.h"
 #include "esp_check.h"
@@ -1070,6 +1071,14 @@ esp_err_t link_start(const link_handlers_t *handlers, uint32_t caps)
     ESP_RETURN_ON_ERROR(uart_param_config(BOARD_LINK_UART_NUM, &cfg), TAG, "uart_param_config");
     ESP_RETURN_ON_ERROR(uart_set_pin(BOARD_LINK_UART_NUM, BOARD_LINK_TX_GPIO, BOARD_LINK_RX_GPIO,
                                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE), TAG, "uart_set_pin");
+    /* Nothing else holds this input while the host's TX is not driven -- a host
+     * held in reset or in its ROM downloader is the likely case -- and the receiver
+     * turns whatever reaches the wire into bytes. The internal pull-up keeps it at
+     * idle. Set after uart_set_pin, which configures the pad but sets no pull. */
+    esp_err_t pull = gpio_pullup_en(BOARD_LINK_RX_GPIO);
+    if (pull != ESP_OK) {
+        ESP_LOGW(TAG, "no pull-up on GPIO%d: %s", BOARD_LINK_RX_GPIO, esp_err_to_name(pull));
+    }
     ESP_RETURN_ON_ERROR(uart_set_rx_timeout(BOARD_LINK_UART_NUM, LINK_RX_TIMEOUT_SYM),
                         TAG, "uart_set_rx_timeout");
 
