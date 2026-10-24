@@ -5,13 +5,11 @@ idf_component_register(
         "audio_out.c"
         "audio_asrc.c"
         "link.c"
-        "expander.c"
         "clock_probe.c"
     INCLUDE_DIRS "."
     REQUIRES
         bt
         esp_app_format
-        esp_adc
         esp_driver_gpio
         esp_driver_i2s
         esp_driver_pcnt

@@ -23,9 +23,6 @@ typedef struct {
     void (*on_transport)(uint8_t cmd);
     void (*on_volume)(uint8_t volume);
     void (*on_radio)(bool on, bool discoverable, bool disconnect);
-    void (*on_gpio_cfg)(const satlink_gpio_cfg_t *cfg);
-    void (*on_gpio_out)(uint32_t values, uint32_t mask);
-    void (*on_adc_read)(uint8_t index);
     /* Protocol 1.7. The host's transfer of this pair produced no usable image and
      * it wants the picture sent again. A hint, not a request: nothing answers it,
      * nothing waits for it, and ignoring it leaves the host exactly where 1.6
@@ -82,9 +79,6 @@ void link_send_stream_fmt(uint32_t rate_hz, uint8_t bits, uint8_t channels);
 void link_send_format(const fmt_request_t *request, bool acknowledged);
 bool link_format_sent(const fmt_request_t *request, uint32_t *when_ms);
 void link_send_volume_state(uint8_t volume, uint8_t source);
-void link_send_gpio_in(uint32_t values, uint32_t changed);
-void link_send_gpio_map(const satlink_gpio_map_t *map);
-void link_send_adc_value(uint8_t index, uint16_t raw, uint16_t mv);
 void link_send_log(uint8_t level, const char *text);
 
 /* Protocol 1.8. Silent for a host below minor 8, which would not know the types.

@@ -36,8 +36,8 @@ static const char *TAG = "sat.link";
 #define LINK_EVENT_QUEUE     16
 
 /* Symbol periods of idle before the hardware calls a burst finished. Ten of them
- * at 460800 is about 217 us, which is far inside the 30 ms the spec allows a GPIO
- * edge to reach the wire, and long enough not to split a frame in two. */
+ * at 460800 is about 217 us: no delay a host command would notice, and long
+ * enough not to split a frame in two. */
 #define LINK_RX_TIMEOUT_SYM  10
 
 /* PROTOCOL.md 13 divides the device's messages into those that may be thrown away
@@ -46,7 +46,6 @@ static const char *TAG = "sat.link";
  * is what keeps BT_STATE ahead of a backlog of TRACK_POS. */
 #define LINK_Q_TELEMETRY     10      /* TRACK_POS and LOG: when full, the oldest goes */
 #define LINK_Q_COVER          6      /* cover parts: when full, the new one is refused */
-#define LINK_ADC_SLOTS        8      /* expander lines with an ADC_VALUE in flight at once */
 /* With nothing to send the sender sleeps until a producer wakes it; this only
  * bounds the sleep, in case a wake-up is ever missed. */
 #define LINK_TX_IDLE_MS     100
@@ -106,9 +105,8 @@ static const char *TAG = "sat.link";
 #define LINK_BUF_HELLO     (1 + 1 + 4 + 2 + LINK_BUILD_MAX)
 #define LINK_BUF_PAIR_REQ  (6 + 1 + 4 + 2 + SATLINK_BT_NAME_MAX)
 #define LINK_BUF_BT_CONFIG (5 + 2 + SATLINK_BT_NAME_MAX)
-#define LINK_BUF_GPIO_MAP  (1 + SATLINK_GPIO_MAX * 3)
-/* PING, PONG, STREAM_FMT, STREAM_PREPARE, VOLUME_STATE, COVER_RESET, PAIR_RESULT,
- * GPIO_IN and ADC_VALUE: 14 bytes at most, STREAM_PREPARE. */
+/* PING, PONG, STREAM_FMT, STREAM_PREPARE, VOLUME_STATE, COVER_RESET and
+ * PAIR_RESULT: 14 bytes at most, STREAM_PREPARE. */
 #define LINK_BUF_SMALL     16
 /* The largest slot, which is what the sender copies a slot out into. */
 #define LINK_SLOT_MAX      SATLINK_BOND_LIST_BYTES_MAX
@@ -126,10 +124,9 @@ typedef struct {
 } tx_item_t;
 
 /*
- * The slots: one per message type that must not be lost, and a few for ADC_VALUE,
- * which is per line. Static, so no state of the heap can lose a BT_STATE: under
- * three kilobytes with the sender's copy buffer, the price of PROTOCOL.md 13's
- * "the rest is not dropped".
+ * The slots: one per message type that must not be lost. Static, so no state of
+ * the heap can lose a BT_STATE: under three kilobytes with the sender's copy
+ * buffer, the price of PROTOCOL.md 13's "the rest is not dropped".
  */
 static uint8_t s_buf_hello[LINK_BUF_HELLO];
 static uint8_t s_buf_bt_state[LINK_BUF_BT_STATE];
@@ -137,8 +134,7 @@ static uint8_t s_buf_meta[LINK_BUF_META];
 static uint8_t s_buf_pair_req[LINK_BUF_PAIR_REQ];
 static uint8_t s_buf_bt_config[LINK_BUF_BT_CONFIG];
 static uint8_t s_buf_bond_list[SATLINK_BOND_LIST_BYTES_MAX];
-static uint8_t s_buf_gpio_map[LINK_BUF_GPIO_MAP];
-static uint8_t s_buf_small[8 + LINK_ADC_SLOTS][LINK_BUF_SMALL];
+static uint8_t s_buf_small[7][LINK_BUF_SMALL];
 
 #define SLOT(t, b)  { .type = (t), .cap = (uint16_t)sizeof(b), .buf = (b) }
 static tx_slot_t s_slots[] = {
@@ -148,7 +144,6 @@ static tx_slot_t s_slots[] = {
     SLOT(SATLINK_MSG_PAIR_REQUEST, s_buf_pair_req),
     SLOT(SATLINK_MSG_BT_CONFIG,    s_buf_bt_config),
     SLOT(SATLINK_MSG_BOND_LIST,    s_buf_bond_list),
-    SLOT(SATLINK_MSG_GPIO_MAP,     s_buf_gpio_map),
     SLOT(SATLINK_MSG_PING,         s_buf_small[0]),
     SLOT(SATLINK_MSG_PONG,         s_buf_small[1]),
     SLOT(SATLINK_MSG_STREAM_FMT,   s_buf_small[2]),
@@ -156,22 +151,13 @@ static tx_slot_t s_slots[] = {
     SLOT(SATLINK_MSG_VOLUME_STATE, s_buf_small[4]),
     SLOT(COVER_RESET,              s_buf_small[5]),
     SLOT(SATLINK_MSG_PAIR_RESULT,  s_buf_small[6]),
-    SLOT(SATLINK_MSG_GPIO_IN,      s_buf_small[7]),
-    SLOT(SATLINK_MSG_ADC_VALUE,    s_buf_small[8]),
-    SLOT(SATLINK_MSG_ADC_VALUE,    s_buf_small[9]),
-    SLOT(SATLINK_MSG_ADC_VALUE,    s_buf_small[10]),
-    SLOT(SATLINK_MSG_ADC_VALUE,    s_buf_small[11]),
-    SLOT(SATLINK_MSG_ADC_VALUE,    s_buf_small[12]),
-    SLOT(SATLINK_MSG_ADC_VALUE,    s_buf_small[13]),
-    SLOT(SATLINK_MSG_ADC_VALUE,    s_buf_small[14]),
-    SLOT(SATLINK_MSG_ADC_VALUE,    s_buf_small[15]),
 };
 #undef SLOT
 #define LINK_SLOTS (sizeof(s_slots) / sizeof(s_slots[0]))
-_Static_assert(LINK_ADC_SLOTS == 8 && LINK_SLOTS == 7 + 8 + LINK_ADC_SLOTS,
+_Static_assert(LINK_SLOTS == 6 + sizeof(s_buf_small) / sizeof(s_buf_small[0]),
                "the slot table and its storage disagree");
-_Static_assert(LINK_SLOT_MAX >= LINK_BUF_META && LINK_SLOT_MAX >= LINK_BUF_GPIO_MAP &&
-               LINK_SLOT_MAX >= LINK_BUF_HELLO, "LINK_SLOT_MAX is not the largest slot");
+_Static_assert(LINK_SLOT_MAX >= LINK_BUF_META && LINK_SLOT_MAX >= LINK_BUF_HELLO,
+               "LINK_SLOT_MAX is not the largest slot");
 
 static portMUX_TYPE      s_slot_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t          s_slot_stamp;
@@ -449,30 +435,6 @@ void link_send_volume_state(uint8_t volume, uint8_t source)
     uint8_t payload[8];
     size_t len = satlink_enc_volume_state(payload, sizeof(payload), &m);
     if (len != 0) { tx_push(SATLINK_MSG_VOLUME_STATE, payload, len); }
-}
-
-void link_send_gpio_in(uint32_t values, uint32_t changed)
-{
-    satlink_gpio_in_t m = { .values = values, .changed = changed };
-    uint8_t payload[16];
-    size_t len = satlink_enc_gpio_in(payload, sizeof(payload), &m);
-    if (len != 0) { tx_push(SATLINK_MSG_GPIO_IN, payload, len); }
-}
-
-void link_send_gpio_map(const satlink_gpio_map_t *map)
-{
-    uint8_t payload[1 + SATLINK_GPIO_MAX * 3];
-    size_t len = satlink_enc_gpio_map(payload, sizeof(payload), map);
-    if (len != 0) { tx_push(SATLINK_MSG_GPIO_MAP, payload, len); }
-}
-
-void link_send_adc_value(uint8_t index, uint16_t raw, uint16_t mv)
-{
-    satlink_adc_value_t m = { .index = index, .raw = raw, .mv = mv };
-    uint8_t payload[8];
-    size_t len = satlink_enc_adc_value(payload, sizeof(payload), &m);
-    /* One slot per line, so one line's value never replaces another's. */
-    if (len != 0) { tx_send(SATLINK_MSG_ADC_VALUE, index, payload, len, 0, 0); }
 }
 
 void link_send_cover_reset(uint32_t nonce, uint32_t generation)
@@ -782,20 +744,6 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
         break;
     }
 
-    case SATLINK_MSG_GPIO_CFG: {
-        static satlink_gpio_cfg_t cfg;      /* 97 bytes; not worth a task stack */
-        if (!satlink_dec_gpio_cfg(payload, len, &cfg)) { s_stats.rx_bad++; break; }
-        if (s_handlers.on_gpio_cfg != NULL) { s_handlers.on_gpio_cfg(&cfg); }
-        break;
-    }
-
-    case SATLINK_MSG_GPIO_OUT: {
-        satlink_gpio_out_t m = {0};
-        if (!satlink_dec_gpio_out(payload, len, &m)) { s_stats.rx_bad++; break; }
-        if (s_handlers.on_gpio_out != NULL) { s_handlers.on_gpio_out(m.values, m.mask); }
-        break;
-    }
-
     case SATLINK_MSG_COVER_RETRY: {
         satlink_cover_retry_t m = {0};
         if (!satlink_dec_cover_retry(payload, len, &m)) { s_stats.rx_bad++; break; }
@@ -805,13 +753,6 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
          * cost the phone an OBEX round trip for an image nobody will receive. */
         if ((link_host_caps() & COVER_STREAM_CAP) && s_handlers.on_cover_retry)
             s_handlers.on_cover_retry(m.boot_nonce, m.track_generation);
-        break;
-    }
-
-    case SATLINK_MSG_ADC_READ: {
-        satlink_adc_read_t m = {0};
-        if (!satlink_dec_adc_read(payload, len, &m)) { s_stats.rx_bad++; break; }
-        if (s_handlers.on_adc_read != NULL) { s_handlers.on_adc_read(m.index); }
         break;
     }
 
@@ -924,8 +865,7 @@ static void rx_data_event(size_t announced, uint8_t *chunk, size_t cap)
  * that is a trap: it returns when the buffer fills OR the timeout expires, and
  * our frames are a dozen bytes, so it waits out the whole timeout every single
  * time. Measured on the bench, that put 100 ms of latency on every message in
- * this direction — survivable for PING, fatal for GPIO_IN, which the spec gives
- * 30 ms from edge to wire.
+ * this direction — survivable for PING, a tenth of a second on every command.
  *
  * The event queue wakes us when the hardware says a burst has ended, which at
  * this baud rate is a few hundred microseconds after the last byte.
@@ -1164,9 +1104,6 @@ esp_err_t link_start(const link_handlers_t *handlers, uint32_t caps)
     ESP_RETURN_ON_ERROR(esp_timer_start_periodic(s_ping_timer, LINK_PING_PERIOD_US),
                         TAG, "timer_start");
 
-    /* HELLO first, then GPIO_MAP, always and in that order — the host reads the
-     * map as the answer to "what lines does this thing have", and an empty one is
-     * a legitimate answer. */
     answer_hello(false);
 
     ESP_LOGI(TAG, "UART%d at %d baud, TX %d, RX %d",

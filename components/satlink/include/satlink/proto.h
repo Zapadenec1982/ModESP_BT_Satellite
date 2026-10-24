@@ -16,8 +16,10 @@
  * Legacy STREAM_FMT layouts remain unchanged.
  * 1.7: COVER_RETRY, device capability bit 6.
  * 1.8: Bluetooth settings and host-confirmed pairing, device and host bit 7.
- * 1.9: the host may clock the I2S link; device bit 8 and host bit 8. */
-#define SATLINK_PROTO_MINOR   9
+ * 1.9: the host may clock the I2S link; device bit 8 and host bit 8.
+ * 1.10: the port expander is gone. Codes 0x30..0x35, device bits 4 and 5 and
+ * host bit 2 mean nothing and are never reused. */
+#define SATLINK_PROTO_MINOR   10
 
 /* The largest decoded frame: type | seq | payload | crc16. */
 #define SATLINK_FRAME_MAX     1040
