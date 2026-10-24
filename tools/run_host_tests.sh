@@ -95,3 +95,5 @@ fi
 "$python" "$repo/tools/run_sink_getconfig_tests.py" --cc "$cc"
 # SET_CONFIGURATION must name one value per field, not pass a 44.1|48 mask for 48 kHz.
 "$python" "$repo/tools/run_sink_setconfig_tests.py" --cc "$cc"
+# A late Connection Already Exists for a connected phone must not tear its live link down.
+"$python" "$repo/tools/run_l2c_collision_tests.py" --cc "$cc"

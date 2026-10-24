@@ -1,0 +1,21 @@
+--- a/host/bluedroid/stack/l2cap/l2c_link.c
++++ b/host/bluedroid/stack/l2cap/l2c_link.c
+@@ -175,6 +175,18 @@
+         return (FALSE);
+     }
+ 
++    /* Connection Already Exists for a peer whose link is up ends a second
++     * attempt at the same peer, typically our page after both sides paged at
++     * once and l2c_link_hci_conn_req accepted the peer's as a collision. It is
++     * not the live link's failure. Tearing down p_lcb->handle below would
++     * release the live LCB without an HCI_Disconnect and strand the ACL in the
++     * controller. AOSP acb6fe3b8c84 ignores it the same way. */
++    if ((p_lcb->link_state == LST_CONNECTED) && (status == HCI_ERR_CONNECTION_EXISTS)) {
++        L2CAP_TRACE_WARNING ("L2CAP got conn_comp status 0x%02x for a connected link (handle 0x%x), ignored\n",
++                             status, handle);
++        return (FALSE);
++    }
++
+     if (p_lcb->link_state != LST_CONNECTING) {
+         L2CAP_TRACE_ERROR ("L2CAP got conn_comp in bad state: %d  status: 0x%d\n", p_lcb->link_state, status);
+ 
