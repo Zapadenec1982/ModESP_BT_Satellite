@@ -196,6 +196,26 @@ typedef struct {
 } bt_a2d_msg_t;
 
 static QueueHandle_t s_queue;
+
+/*
+ * The task sleeps until there is something to do: every producer below queues or
+ * raises its flag and then wakes it. It used to wake every 10 ms whatever happened,
+ * a hundred times a second for the device's whole life, mostly for nothing. Only a
+ * format transaction under way still wants 10 ms (its 50 ms of silence and its
+ * FMT_RETRY_MS repeats); everything else waits on deadlines of seconds.
+ */
+#define BT_POLL_BUSY_MS     10
+#define BT_POLL_IDLE_MS     100
+static TaskHandle_t s_bt_task;
+
+/* Any task, never an ISR. A wake-up that finds nothing new costs one pass. */
+static void bt_av_wake(void)
+{
+    if (s_bt_task != NULL) {
+        xTaskNotifyGive(s_bt_task);
+    }
+}
+
 #define BT_EVENT_FORMAT_READY         0xff00
 #define BT_EVENT_ENDPOINTS_REGISTERED 0xff01
 static ep_fsm_t s_endpoints;            /* bt_av task only */
@@ -210,6 +230,11 @@ static ep_fsm_t s_endpoints;            /* bt_av task only */
 #define BT_AV_HELLO_WAIT_MS 10000
 static atomic_bool s_caps_pending;
 static bool s_fmt_slave;                /* the I2S role the current transaction was begun in */
+/* Protocol 1.9: the I2S role a host's HELLO asked for, -1 while none waits, and whom to
+ * tell once it is in place (bt_av_request_role). */
+typedef void (*bt_av_done_t)(void);
+static atomic_int s_role_wanted = -1;
+static _Atomic(bt_av_done_t) s_role_done;
 static atomic_bool s_cover_refresh;
 static atomic_bool s_cover_query;
 static atomic_uint s_cover_epoch;
@@ -293,6 +318,12 @@ static struct {
 } s_now;
 
 static esp_timer_handle_t s_meta_timer;
+
+/* The position: play_state, elapsed_ms, elapsed_at_us, elapsed_unknown and total_ms are
+ * written on the BTC task and read there and by pos_tick on the esp_timer task, often on
+ * the other core. elapsed_at_us is 64 bits and means something only with elapsed_ms, so
+ * they are written and read together, under this. */
+static portMUX_TYPE s_pos_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* Title, artist and album are written on the BTC task, read by the meta timer on the
  * esp_timer task and cleared by the bt_av task. s_meta_mux guards the three strings and
@@ -455,6 +486,7 @@ void bt_av_apply_host_caps(void)
     atomic_store(&s_cover_refresh, true);
     atomic_store(&s_cover_query, true);
     atomic_store(&s_caps_pending, true);
+    bt_av_wake();
 }
 
 void bt_av_cover_retry(uint32_t boot_nonce, uint32_t track_generation)
@@ -480,6 +512,7 @@ void bt_av_cover_retry(uint32_t boot_nonce, uint32_t track_generation)
      * needs -- a repeated RESET pair is idempotent and would clear nothing. */
     atomic_store(&s_cover_refresh, true);
     atomic_store(&s_cover_query, true);
+    bt_av_wake();
     ESP_LOGI(TAG, "cover art: host asked for generation %" PRIu32 " again", track_generation);
 }
 
@@ -489,6 +522,7 @@ void bt_av_format_ready(const fmt_ready_t *ready)
     bt_a2d_msg_t msg = { .event = BT_EVENT_FORMAT_READY, .ready = *ready };
     // Losing an ACK is safe: PREPARE retries and the host repeats READY.
     xQueueSend(s_queue, &msg, 0);
+    bt_av_wake();
 }
 
 /* Sets the stack's switches from the host's HELLO and the codecs the settings
@@ -587,7 +621,7 @@ static void poll_format(void)
         if (esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS) != ESP_OK)
             atomic_store(&s_cover_refresh, false);
     }
-    /* audio_out_set_role runs on the link task and gates PCM; the new role is followed
+    /* audio_out_set_role gates PCM (poll_role, just before this); the new role is followed
      * here with a new transaction, even when the host's greeting has not been seen yet. */
     const bool caps_pending = atomic_exchange(&s_caps_pending, false);
     const bool slave = audio_out_is_slave();
@@ -632,13 +666,6 @@ static void bt_av_report_state(void)
     link_send_bt_state(s_now.state, s_now.codec, s_now.addr, s_now.name);
 }
 
-void bt_av_report_stream_fmt(void)
-{
-    atomic_store(&s_cover_refresh, true);
-    atomic_store(&s_cover_query, true);
-    atomic_store(&s_caps_pending, true);
-}
-
 static void send_track_meta(void *arg)
 {
     (void)arg;
@@ -672,15 +699,20 @@ static void meta_settle_restart(void)
 
 static void send_track_pos(void)
 {
+    portENTER_CRITICAL(&s_pos_mux);
+    const uint8_t state = s_now.play_state;
     uint32_t elapsed = s_now.elapsed_ms;
-    if (s_now.play_state == SATLINK_PLAY_PLAYING && s_now.elapsed_at_us != 0
-        && !s_now.elapsed_unknown) {
-        int64_t since_ms = (esp_timer_get_time() - s_now.elapsed_at_us) / 1000;
+    const uint32_t total = s_now.total_ms;
+    const int64_t at_us = s_now.elapsed_at_us;
+    const bool unknown = s_now.elapsed_unknown;
+    portEXIT_CRITICAL(&s_pos_mux);
+    if (state == SATLINK_PLAY_PLAYING && at_us != 0 && !unknown) {
+        int64_t since_ms = (esp_timer_get_time() - at_us) / 1000;
         if (since_ms > 0) {
             elapsed += (uint32_t)since_ms;
         }
     }
-    link_send_track_pos(s_now.play_state, elapsed, s_now.total_ms);
+    link_send_track_pos(state, elapsed, total);
 }
 
 static void pos_tick(void *arg)
@@ -869,7 +901,9 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
             audio_out_begin_format(&ignored_token);
             audio_out_set_streaming(false);
             s_now.state = idle_state();
+            portENTER_CRITICAL(&s_pos_mux);
             s_now.play_state = SATLINK_PLAY_STOPPED;
+            portEXIT_CRITICAL(&s_pos_mux);
             /* Nothing non-empty may follow the empty TRACK_META: not a settle already
              * pending, nor one armed by an attribute that arrives after this. */
             esp_timer_stop(s_meta_timer);
@@ -1001,15 +1035,49 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
 
 static void cfg_poll(void);
 
+void bt_av_request_role(bool slave, void (*done)(void))
+{
+    atomic_store(&s_role_done, done);
+    atomic_store(&s_role_wanted, slave ? 1 : 0);
+    bt_av_wake();
+}
+
+/* Before poll_format, so that the HELLO answering the host goes out ahead of the
+ * format transaction this role change starts. */
+static void poll_role(void)
+{
+    const int want = atomic_exchange(&s_role_wanted, -1);
+    if (want < 0) {
+        return;
+    }
+    if (audio_out_set_role(want != 0) != ESP_OK) {
+        ESP_LOGE(TAG, "I2S could not become the %s", want ? "slave" : "master");
+    }
+    const bt_av_done_t done = atomic_load(&s_role_done);
+    if (done != NULL) {
+        done();
+    }
+}
+
 static void bt_av_task(void *arg)
 {
     (void)arg;
 
     bt_a2d_msg_t msg;
     for (;;) {
-        if (xQueueReceive(s_queue, &msg, pdMS_TO_TICKS(10)) == pdTRUE) {
+        /* One event a pass, as before. A producer queues first and wakes second, so a
+         * wake-up given between the empty look and the wait is not lost: the
+         * notification is kept until taken. */
+        bool got = xQueueReceive(s_queue, &msg, 0) == pdTRUE;
+        if (!got) {
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(s_format_pending ? BT_POLL_BUSY_MS
+                                                                    : BT_POLL_IDLE_MS));
+            got = xQueueReceive(s_queue, &msg, 0) == pdTRUE;
+        }
+        if (got) {
             handle_a2d_event(&msg);
         }
+        poll_role();
         poll_format();
         if (atomic_load(&s_stack_up)) {
             cfg_poll();
@@ -1037,6 +1105,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     if (xQueueSend(s_queue, &msg, 0) != pdTRUE) {
         ESP_LOGW(TAG, "event queue full, dropped a2dp event %d", event);
     }
+    bt_av_wake();
 }
 
 /* PCM straight from the stack's SBC decoder. Runs on the A2DP sink task, so it
@@ -1093,7 +1162,9 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             esp_avrc_ct_send_get_rn_capabilities_cmd(TL_RN_CAPS);
         } else {
             s_now.has_play_pos = false;
+            portENTER_CRITICAL(&s_pos_mux);
             s_now.play_state = SATLINK_PLAY_STOPPED;
+            portEXIT_CRITICAL(&s_pos_mux);
             s_now.art_connected = false;
             s_now.art_connecting = false;
             s_now.art_supported = false;
@@ -1175,7 +1246,10 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             char buf[24];
             copy_attr(buf, sizeof(buf), param->meta_rsp.attr_text, param->meta_rsp.attr_length);
             /* strtoll, not atoi: this is the field that came back as -1000. */
-            s_now.total_ms = satlink_sanitize_total_ms(strtoll(buf, NULL, 10));
+            const uint32_t total = satlink_sanitize_total_ms(strtoll(buf, NULL, 10));
+            portENTER_CRITICAL(&s_pos_mux);
+            s_now.total_ms = total;
+            portEXIT_CRITICAL(&s_pos_mux);
             break;
         }
         default:
@@ -1184,14 +1258,18 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         meta_settle_restart();
         break;
 
-    case ESP_AVRC_CT_PLAY_STATUS_RSP_EVT:
+    case ESP_AVRC_CT_PLAY_STATUS_RSP_EVT: {
+        const int64_t now_us = esp_timer_get_time();
+        portENTER_CRITICAL(&s_pos_mux);
         s_now.total_ms      = satlink_sanitize_total_ms((int64_t)param->play_status_rsp.song_length);
         s_now.elapsed_unknown = !satlink_elapsed_known(param->play_status_rsp.song_position);
         s_now.elapsed_ms    = satlink_sanitize_elapsed_ms(param->play_status_rsp.song_position);
-        s_now.elapsed_at_us = esp_timer_get_time();
+        s_now.elapsed_at_us = now_us;
         s_now.play_state    = play_state_from_avrc(param->play_status_rsp.play_status);
+        portEXIT_CRITICAL(&s_pos_mux);
         send_track_pos();
         break;
+    }
 
     case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
         switch (param->change_ntf.event_id) {
@@ -1213,9 +1291,12 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
                                                        ESP_AVRC_RN_TRACK_CHANGE, 0);
             break;
 
-        case ESP_AVRC_RN_PLAY_STATUS_CHANGE:
+        case ESP_AVRC_RN_PLAY_STATUS_CHANGE: {
+            const int64_t now_us = esp_timer_get_time();
+            portENTER_CRITICAL(&s_pos_mux);
             s_now.play_state = play_state_from_avrc(param->change_ntf.event_parameter.playback);
-            s_now.elapsed_at_us = esp_timer_get_time();
+            s_now.elapsed_at_us = now_us;
+            portEXIT_CRITICAL(&s_pos_mux);
             send_track_pos();
             /* A phone that plays again after the host's PAUSE was resumed by its user:
              * suspending it when the wait runs out would leave it playing with no sound. */
@@ -1228,16 +1309,21 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             esp_avrc_ct_send_register_notification_cmd(TL_PLAY_STATE,
                                                        ESP_AVRC_RN_PLAY_STATUS_CHANGE, 0);
             break;
+        }
 
-        case ESP_AVRC_RN_PLAY_POS_CHANGED:
+        case ESP_AVRC_RN_PLAY_POS_CHANGED: {
+            const int64_t now_us = esp_timer_get_time();
+            portENTER_CRITICAL(&s_pos_mux);
             s_now.elapsed_unknown = !satlink_elapsed_known(param->change_ntf.event_parameter.play_pos);
             s_now.elapsed_ms = satlink_sanitize_elapsed_ms(param->change_ntf.event_parameter.play_pos);
-            s_now.elapsed_at_us = esp_timer_get_time();
+            s_now.elapsed_at_us = now_us;
+            portEXIT_CRITICAL(&s_pos_mux);
             send_track_pos();
             esp_avrc_ct_send_register_notification_cmd(TL_PLAY_POS,
                                                        ESP_AVRC_RN_PLAY_POS_CHANGED,
                                                        POS_NOTIFY_INTERVAL_S);
             break;
+        }
 
         case ESP_AVRC_RN_VOLUME_CHANGE:
             /* This is the hole the host pointed out: the phone moved the slider,
@@ -1393,6 +1479,7 @@ static bool cfg_post(const cfg_msg_t *m)
         return false;
     }
     if (xQueueSend(s_cfg_queue, m, 0) == pdTRUE) {
+        bt_av_wake();
         return true;
     }
     ESP_LOGW(TAG, "bt settings: queue full, dropped event %u", m->type);
@@ -2197,7 +2284,7 @@ esp_err_t bt_av_start(const char *device_name)
     s_meta_send = xSemaphoreCreateMutex();
     ESP_RETURN_ON_FALSE(s_meta_send != NULL, ESP_ERR_NO_MEM, TAG, "no memory for the meta lock");
     ESP_RETURN_ON_FALSE(
-        xTaskCreate(bt_av_task, "bt_av", BT_TASK_STACK, NULL, BT_TASK_PRIO, NULL) == pdPASS,
+        xTaskCreate(bt_av_task, "bt_av", BT_TASK_STACK, NULL, BT_TASK_PRIO, &s_bt_task) == pdPASS,
         ESP_ERR_NO_MEM, TAG, "no memory for the bt task");
 
     const esp_timer_create_args_t meta_args = {
@@ -2281,6 +2368,7 @@ esp_err_t bt_av_start(const char *device_name)
                                 .codecs = codecs };
     ESP_RETURN_ON_FALSE(xQueueSend(s_queue, &registered, pdMS_TO_TICKS(100)) == pdTRUE,
                         ESP_ERR_NO_MEM, TAG, "event queue full at start");
+    bt_av_wake();
 
     /* Scan mode and pairing as the saved settings say: factory state is
      * connectable, discoverable and pairable, as before protocol 1.8. */
@@ -2294,5 +2382,6 @@ esp_err_t bt_av_start(const char *device_name)
 
     /* The settings, the bonds and the pairing are the task's from here. */
     atomic_store(&s_stack_up, true);
+    bt_av_wake();
     return ESP_OK;
 }

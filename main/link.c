@@ -215,15 +215,19 @@ static void tx_wake(void)
     }
 }
 
+/* The tx_ and hello counters are bumped by whichever task sends, on either core;
+ * a plain ++ from two at once loses one. The rx_ ones belong to the RX task alone. */
+#define STAT_ADD(field) __atomic_fetch_add(&s_stats.field, 1u, __ATOMIC_RELAXED)
+
 static void tx_slot_count(tx_slot_result_t r)
 {
     switch (r) {
     case TX_SLOT_REPLACED:
-        s_stats.tx_coalesced++;
+        STAT_ADD(tx_coalesced);
         break;
     case TX_SLOT_NO_SLOT:
     case TX_SLOT_TOO_LONG:
-        s_stats.tx_dropped_critical++;
+        STAT_ADD(tx_dropped_critical);
         break;
     case TX_SLOT_QUEUED:
         break;
@@ -241,7 +245,7 @@ static void tx_queue_telemetry(uint8_t type, const uint8_t *payload, size_t len)
 {
     uint8_t *buf = malloc(len != 0 ? len : 1);
     if (buf == NULL) {
-        s_stats.tx_dropped_bulk++;      /* counted, which it used not to be */
+        STAT_ADD(tx_dropped_bulk);      /* counted, which it used not to be */
         return;
     }
     if (len != 0) {
@@ -257,11 +261,11 @@ static void tx_queue_telemetry(uint8_t type, const uint8_t *payload, size_t len)
         tx_item_t oldest;
         if (xQueueReceive(s_q_telemetry, &oldest, 0) == pdTRUE) {
             tx_item_free(&oldest);
-            s_stats.tx_dropped_bulk++;
+            STAT_ADD(tx_dropped_bulk);
         }
     }
     tx_item_free(&item);
-    s_stats.tx_dropped_bulk++;
+    STAT_ADD(tx_dropped_bulk);
 }
 
 static void tx_push_tagged(uint8_t type, const uint8_t *payload, size_t payload_len,
@@ -518,22 +522,30 @@ void link_send_bond_list(const satlink_bond_list_t *m)
     tx_wake();
 }
 
+/* Both fields are 32 bytes in the descriptor, so this is sized to hold them whole
+ * rather than to hold what they usually happen to contain. */
+#define LINK_OWN_BUILD_BUF (4 + sizeof(((esp_app_desc_t *)0)->version) + 1 + \
+                            sizeof(((esp_app_desc_t *)0)->idf_ver))
+
+/* "sat <version> <idf>", exactly as our HELLO carries it; points into `buf`. */
+static satlink_str_t own_build(char *buf, size_t cap)
+{
+    const esp_app_desc_t *app = esp_app_get_description();
+    snprintf(buf, cap, "sat %.*s %.*s",
+             (int)sizeof(app->version), app->version,
+             (int)sizeof(app->idf_ver), app->idf_ver);
+    return satlink_str_clip(buf, LINK_BUILD_MAX);
+}
+
 /* Our greeting, byte for byte as it goes on the wire. 0 if it will not fit. */
 static size_t encode_own_hello(uint8_t *payload, size_t cap)
 {
-    const esp_app_desc_t *app = esp_app_get_description();
-    /* Both fields are 32 bytes in the descriptor, so this is sized to hold them
-     * whole rather than to hold what they usually happen to contain. */
-    char build[4 + sizeof(app->version) + 1 + sizeof(app->idf_ver)];
-    snprintf(build, sizeof(build), "sat %.*s %.*s",
-             (int)sizeof(app->version), app->version,
-             (int)sizeof(app->idf_ver), app->idf_ver);
-
+    char build[LINK_OWN_BUILD_BUF];
     satlink_hello_t m = {
         .major = SATLINK_PROTO_MAJOR,
         .minor = SATLINK_PROTO_MINOR,
         .caps  = __atomic_load_n(&s_own_caps, __ATOMIC_SEQ_CST),
-        .build = satlink_str_clip(build, LINK_BUILD_MAX),
+        .build = own_build(build, sizeof(build)),
     };
     return satlink_enc_hello(payload, cap, &m);
 }
@@ -548,7 +560,7 @@ static void send_hello(void)
         ESP_LOGE(TAG, "HELLO will not encode into %u bytes", (unsigned)sizeof(payload));
         return;
     }
-    s_stats.hello_sent++;
+    STAT_ADD(hello_sent);
     ESP_LOGI(TAG, "HELLO out: %u.%u, caps 0x%08" PRIx32 ", %u bytes",
              SATLINK_PROTO_MAJOR, SATLINK_PROTO_MINOR, __atomic_load_n(&s_own_caps, __ATOMIC_SEQ_CST), (unsigned)len);
     tx_push(SATLINK_MSG_HELLO, payload, len);
@@ -582,6 +594,12 @@ static void answer_hello(bool force)
     reserve_hello(force, LINK_HELLO_MIN_GAP_US);
 }
 
+void link_answer_host(uint32_t caps)
+{
+    const bool changed = caps != __atomic_exchange_n(&s_own_caps, caps, __ATOMIC_SEQ_CST);
+    answer_hello(changed);
+}
+
 /* ------------------------------------------------------------------- inbound */
 
 static void handle_hello(const uint8_t *payload, size_t len)
@@ -593,20 +611,22 @@ static void handle_hello(const uint8_t *payload, size_t len)
      * the host's, it had this device trusting its own capabilities as the
      * host's -- and our BT_SETTINGS is the host's PAIR_CONFIRM, bit for bit, so
      * pairing went to a confirmer that was not there. A host never sends our
-     * build string, so a payload identical to ours is ours.
+     * build string, so a HELLO of our version with our build is ours, whatever
+     * caps it carries. It used to have to match the HELLO we would send now, and
+     * one sent before a role change moved bit 8 then passed for the host's.
      */
-    uint8_t own[LINK_BUF_HELLO];
-    size_t own_len = encode_own_hello(own, sizeof(own));
-    if (own_len != 0 && own_len == len && memcmp(own, payload, len) == 0) {
-        if (s_stats.rx_echoes++ == 0) {
-            ESP_LOGW(TAG, "our own HELLO came back: the receive line hears the transmit line");
-        }
-        return;
-    }
-
     satlink_hello_t h = {0};
     if (!satlink_dec_hello(payload, len, &h)) {
         s_stats.rx_bad++;
+        return;
+    }
+    char build[LINK_OWN_BUILD_BUF];
+    const satlink_str_t own = own_build(build, sizeof(build));
+    if (h.major == SATLINK_PROTO_MAJOR && h.minor == SATLINK_PROTO_MINOR &&
+        h.build.len == own.len && memcmp(h.build.ptr, own.ptr, own.len) == 0) {
+        if (s_stats.rx_echoes++ == 0) {
+            ESP_LOGW(TAG, "our own HELLO came back: the receive line hears the transmit line");
+        }
         return;
     }
 
@@ -648,17 +668,20 @@ static void handle_hello(const uint8_t *payload, size_t len)
     }
 
     /* 1.9: whatever the host's caps change about us (the I2S role) is made true
-     * before we answer, and a change goes out now rather than after the rate limit. */
-    bool changed = false;
+     * before we answer, and a change goes out now rather than after the rate limit.
+     * A role change waits on the audio path, so it is done elsewhere and the answer
+     * goes from there (link_answer_host). */
+    bool later = false;
+    uint32_t reply_caps = __atomic_load_n(&s_own_caps, __ATOMIC_SEQ_CST);
     if (s_handlers.on_host_caps != NULL) {
-        const uint32_t own = s_handlers.on_host_caps(caps);
-        changed = own != __atomic_load_n(&s_own_caps, __ATOMIC_SEQ_CST);
-        __atomic_store_n(&s_own_caps, own, __ATOMIC_SEQ_CST);
+        reply_caps = s_handlers.on_host_caps(caps, &later);
     }
 
     /* The spec asks for a HELLO after start and in answer to one. Only the first
      * half was here, so a host that came up second waited for ever. */
-    answer_hello(changed);
+    if (!later) {
+        link_answer_host(reply_caps);
+    }
 
     if (s_handlers.on_hello != NULL) {
         s_handlers.on_hello(&h);
@@ -703,7 +726,7 @@ static void on_frame(void *ctx, uint8_t type, uint8_t seq,
         if (!satlink_dec_pong(payload, len, &pong)) { s_stats.rx_bad++; break; }
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
         s_stats.rtt_ms = now_ms - pong.echo_ms;   /* wraps cleanly in unsigned */
-        s_ping_outstanding = 0;
+        __atomic_store_n(&s_ping_outstanding, 0, __ATOMIC_RELAXED);
         break;
     }
 
@@ -954,7 +977,7 @@ static void ping_tick(void *arg)
     if (!s_host_present && !s_peer_incompatible)
         reserve_hello(false, LINK_HELLO_MIN_GAP_US - LINK_HELLO_RETRY_SLACK_US);
 
-    if (s_ping_outstanding > 0) {
+    if (__atomic_load_n(&s_ping_outstanding, __ATOMIC_RELAXED) > 0) {
         s_stats.pings_unanswered++;
         /* Not an error. A host that is not answering is a host that is busy or
          * absent, and this device is expected to keep playing either way. */
@@ -966,8 +989,10 @@ static void ping_tick(void *arg)
     uint8_t payload[8];
     size_t len = satlink_enc_ping(payload, sizeof(payload), &m);
     if (len != 0) {
+        /* Counted before it is queued: the sender runs on the other core, and a PONG
+         * back first would otherwise be cleared before this PING counted as out. */
+        __atomic_fetch_add(&s_ping_outstanding, 1u, __ATOMIC_RELAXED);
         tx_push(SATLINK_MSG_PING, payload, len);
-        s_ping_outstanding++;
     }
 }
 
