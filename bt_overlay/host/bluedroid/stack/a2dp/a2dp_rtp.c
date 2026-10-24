@@ -1,4 +1,5 @@
 /*
+ * SPDX-FileCopyrightText: 2026 Zapadenec1982
  * SPDX-License-Identifier: Apache-2.0
  *
  * One checked RTP media header stripper, shared by every decoder.

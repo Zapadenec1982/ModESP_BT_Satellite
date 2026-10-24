@@ -16,8 +16,8 @@
 --- a/Kconfig
 +++ b/Kconfig
 @@ -82,6 +82,15 @@
-                 with libfreeaptx. The wrapper is public domain or CC0; the decoder
-                 core is LGPL-2.1.
+                 with libfreeaptx, which is LGPL-2.1-or-later; the wrapper
+                 around it is Apache-2.0.
  
 +        config BT_A2DP_LHDCV5_DECODER
 +            bool "LHDC V5 (44.1/48/96 kHz)"

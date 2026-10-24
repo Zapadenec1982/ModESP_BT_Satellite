@@ -1,3 +1,10 @@
+/*
+ * SPDX-FileContributor: 2026 Zapadenec1982
+ *
+ * From WillyBilly06/ESP32-A2DP-SINK-WITH-CODECS-UPDATED, where this file carries
+ * no notice; that repository's README says "MIT License" and ships no licence
+ * file. Changed in this project (THIRD_PARTY_NOTICES.md).
+ */
 /* Note: the per-packet progress logging in this file is at ESP_LOGD.
  * Same reason as a2dp_aac_decoder_custom.c: per-packet progress belongs at debug level, not in the log of a device that is simply playing music.
  */

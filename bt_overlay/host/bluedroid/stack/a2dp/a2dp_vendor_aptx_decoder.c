@@ -1,4 +1,5 @@
 /*
+ * SPDX-FileContributor: 2026 Zapadenec1982
  * SPDX-License-Identifier: Apache-2.0
  */
 

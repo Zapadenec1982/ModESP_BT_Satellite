@@ -3,6 +3,7 @@
  */
 /*
  * SPDX-FileCopyrightText: 2024 ESP32 A2DP Project
+ * SPDX-FileContributor: 2026 Zapadenec1982
  * SPDX-License-Identifier: Apache-2.0
  *
  * A2DP AAC Decoder - Custom Implementation
