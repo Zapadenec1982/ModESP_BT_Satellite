@@ -3,8 +3,8 @@
 **English** · [Українська](README.uk.md)
 
 Firmware for an original ESP32 that receives Bluetooth audio from a phone and hands it to a
-**host** microcontroller: the audio over I2S, everything else over a UART. On the side it lends
-the host a few of its own GPIO.
+**host** microcontroller: the audio over I2S, everything else over a UART. Audio and its control,
+nothing more: the port expander that lent the host spare GPIO was removed on 24.10.2026.
 
 What the host is changes no requirement here, so this project neither knows nor cares. Its
 other end is a second, independent implementation of the same protocol.
@@ -21,17 +21,14 @@ other end is a second, independent implementation of the same protocol.
 - **Control link**: UART 460800 8N1 with COBS framing and CRC-16. The host learns the stream
   format before the first sample, and Bluetooth settings, pairing confirmation and the list of
   paired phones are the host's to show and change.
-- **Port expander**: the host addresses this board's spare GPIO by index. The table is empty
-  today, which is a valid configuration.
-
-No Wi-Fi, no network, no screen, no files, no OTA.
+No Wi-Fi, no network, no screen, no files, no OTA, no GPIO for the host.
 
 ## Documents
 
 | | |
 |---|---|
 | [`docs/DEVICE_SPEC.md`](docs/DEVICE_SPEC.md) | the device: hardware, pins, codecs, I2S, behaviour, customer decisions |
-| [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | the link to the host, byte by byte, version 1.9 |
+| [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | the link to the host, byte by byte, version 1.10 |
 | [`docs/BASE.md`](docs/BASE.md) | why the Bluetooth stack is patched and how the patches are carried |
 | [`patches/README.md`](patches/README.md) | what each stack patch does |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | third-party code in the image and its terms, as found |
@@ -102,7 +99,7 @@ Other builds are overlays, each a `sdkconfig.*` file named on the command line:
 | Overlay | What it builds |
 |---|---|
 | `sdkconfig.bare` | the bare module: the link on UART0 (GPIO1/3), console off |
-| `sdkconfig.linkonly` | the link and nothing else: HELLO, an empty GPIO_MAP, PING/PONG, LOG |
+| `sdkconfig.linkonly` | the link and nothing else: HELLO, PING/PONG, LOG |
 | `sdkconfig.loopback` | the full firmware with the UART looped back inside the chip |
 | `sdkconfig.clockprobe` | measures the I2S bit clock on the board itself and logs it |
 
@@ -133,7 +130,6 @@ components/lhdcv5_decoder/ the pinned LHDC V5 decoder
 main/link.c                the UART transport, the send queues and the drop policy
 main/bt_av.c               A2DP sink, AVRCP controller, pairing and settings, and what the host is told
 main/audio_out.c           I2S out, the PCM ring, the clock servo
-main/expander.c            the GPIO this board lends out
 main/board.h               every pin number in the project, and nowhere else
 bt_overlay/                stack files that are entirely ours: codec framework, decoders
 patches/                   the Bluetooth stack delta, one diff per logical change
