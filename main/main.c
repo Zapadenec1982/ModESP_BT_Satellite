@@ -126,8 +126,6 @@ static uint32_t own_caps(void)
 #if !CONFIG_SAT_LINK_ONLY
     /* 1.9: claimed only while true, because the host drives BCLK and WS on it. */
     if (audio_out_is_slave()) caps |= SATLINK_CAP_I2S_SLAVE;
-#endif
-#if !CONFIG_SAT_LINK_ONLY
     caps |= SATLINK_CAP_A2DP_SINK | SATLINK_CAP_AVRCP_META |
             SATLINK_CAP_ABS_VOLUME | SATLINK_CAP_COVER_ART |
             /* Alongside COVER_ART and never without it: the host's gate requires

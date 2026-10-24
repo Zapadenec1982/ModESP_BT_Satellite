@@ -137,7 +137,7 @@ esp_err_t clock_probe_start(void)
         xTaskCreate(probe_task, "clk_probe", 3072, NULL, 2, NULL) == pdPASS,
         ESP_ERR_NO_MEM, TAG, "no memory for the probe task");
 
-    ESP_LOGW(TAG, "counting edges on four pins; this is a diagnostic build");
+    ESP_LOGW(TAG, "counting edges on %u pins; this is a diagnostic build", (unsigned)PROBE_COUNT);
     return ESP_OK;
 }
 

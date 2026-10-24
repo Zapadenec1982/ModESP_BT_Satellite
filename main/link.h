@@ -1,5 +1,6 @@
 /*
- * The control link to the host: UART2, 460800 8N1, framed per docs/PROTOCOL.md.
+ * The control link to the host: UART2 on the DevKitC, UART0 on the bare module
+ * (main/board.h), 460800 8N1, framed per docs/PROTOCOL.md.
  *
  * Nothing here ever blocks a caller. A host that has stopped reading is not an
  * emergency — the device keeps playing, drops what the spec says is droppable,

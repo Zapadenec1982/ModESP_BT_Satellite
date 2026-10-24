@@ -2,9 +2,10 @@
  * A2DP sink and AVRCP controller, and the bridge between what the phone does and
  * what the host is told about it.
  *
- * SBC, AAC, aptX and aptX HD. Stock Bluedroid registers an SBC endpoint and
- * nothing else; the rest arrive with patches/ and bt_overlay/ — see docs/BASE.md.
- * Whichever the phone picks, the host is handed 16-bit slots.
+ * SBC, AAC, aptX, aptX HD and LHDC V5. Stock Bluedroid registers an SBC endpoint
+ * and nothing else; the rest arrive with patches/ and bt_overlay/ — see
+ * docs/BASE.md. The slots the host is handed are 16 or 32 bits, as its HELLO allows,
+ * and always 32 while it clocks the link (PROTOCOL.md 6.2 and 3.5).
  */
 
 #pragma once
