@@ -11,3 +11,5 @@ __pycache__/
 
 # Rebuilt from the pinned IDF by tools/setup.ps1 — 71 MB, never committed (docs/BASE.md).
 components/bt/
+# Fetched by tools/setup.sh --with-lhdc at the commit in lhdc.pin, never committed.
+components/lhdcv5_decoder/

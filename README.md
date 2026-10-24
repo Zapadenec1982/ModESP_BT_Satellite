@@ -11,9 +11,9 @@ other end is a second, independent implementation of the same protocol.
 
 ## What it does
 
-- **A2DP sink** with SBC, AAC, aptX, aptX HD and LHDC V5. 44.1 and 48 kHz, and 96 kHz for LHDC V5
-  when the host says it can take it. LDAC is deliberately absent: the only decoder in
-  circulation has no licence.
+- **A2DP sink** with SBC, AAC, aptX and aptX HD, and LHDC V5 when its decoder is fetched (see
+  [Building](#building)). 44.1 and 48 kHz, and 96 kHz for LHDC V5 when the host says it can take
+  it. LDAC is deliberately absent: the only decoder in circulation has no licence.
 - **AVRCP controller**: title, artist, album, position, play state, absolute volume, transport
   commands, and the album cover as a JPEG thumbnail.
 - **I2S out**, 16- or 32-bit slots, Philips format, no MCLK. The device is the clock master, or,
@@ -94,6 +94,12 @@ idf.py build
 builds it again from scratch. Flashing and logs on this bench are on **COM13**. COM12 is the
 host, not this board.
 
+LHDC V5 needs a decoder this repository does not carry; [`lhdc.pin`](lhdc.pin) says why.
+`tools/setup.sh --with-lhdc` (`-WithLhdc` on Windows) fetches it at the pinned commit into
+`components/lhdcv5_decoder`, also ignored by git, and the `sdkconfig.lhdc` overlay below switches
+it on. Without the overlay the decoder is not built; with the overlay and no decoder the build
+stops and says so.
+
 Other builds are overlays, each a `sdkconfig.*` file named on the command line:
 
 | Overlay | What it builds |
@@ -102,6 +108,7 @@ Other builds are overlays, each a `sdkconfig.*` file named on the command line:
 | `sdkconfig.linkonly` | the link and nothing else: HELLO, PING/PONG, LOG |
 | `sdkconfig.loopback` | the full firmware with the UART looped back inside the chip |
 | `sdkconfig.clockprobe` | measures the I2S bit clock on the board itself and logs it |
+| `sdkconfig.lhdc` | LHDC V5, with the decoder from `--with-lhdc`; goes with any of the above |
 
 ```bash
 idf.py -B build_bare -D SDKCONFIG=build_bare/sdkconfig -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.bare" build
@@ -116,17 +123,17 @@ CC=gcc PYTHON=python3 tools/run_host_tests.sh      # Windows: .\tools\run_host_t
 The suites build with a host compiler and need no board: framing, CRC and every message layout
 with golden vectors from the host side, the endpoint re-registration and Bluetooth settings
 rules, and replays of real stack, link, cover, audio and LHDC code against stubs. Some of them
-need `components/bt`, so run `tools/setup.*` first. A passing replay is not a phone or bench
-result.
+need `components/bt`, so run `tools/setup.*` first; the LHDC replay also needs `--with-lhdc` and
+is skipped without it. A passing replay is not a phone or bench result.
 
 `.github/workflows/build.yml` runs setup, the build and the host tests in the official
-`espressif/idf:v5.5.5` container on every push.
+`espressif/idf:v5.5.5` container on every push, once as is and once with LHDC V5.
 
 ## Layout
 
 ```
 components/satlink/        the protocol: COBS, CRC-16, framing, every message. No IDF, host-testable
-components/lhdcv5_decoder/ the pinned LHDC V5 decoder
+components/lhdcv5_decoder/ the LHDC V5 decoder: fetched by setup --with-lhdc, never committed
 main/link.c                the UART transport, the send queues and the drop policy
 main/bt_av.c               A2DP sink, AVRCP controller, pairing and settings, and what the host is told
 main/audio_out.c           I2S out, the PCM ring, the clock servo

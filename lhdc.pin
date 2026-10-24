@@ -1,0 +1,15 @@
+# The LHDC V5 decoder this project builds against. It is fetched, not carried.
+#
+# Upstream ships no licence file, names no author, and says its tables were
+# extracted from Savitech's proprietary encoder (docs/LHDC_UPSTREAM.md), so this
+# repository does not distribute it. tools/setup.sh --with-lhdc (setup.ps1
+# -WithLhdc) fetches exactly this commit into components/lhdcv5_decoder/, which
+# git ignores, and the build adds it only with sdkconfig.lhdc.
+#
+# Upstream rewrote its history after 2026-09-21. The commit pinned until then,
+# 676af03d2b7a2ed5c1f9bdca7bf8938cc85f704b, is on neither of its branches any
+# more; the one below carries the same decoder/, CMakeLists.txt and README.md,
+# blob for blob.
+
+url=https://github.com/WillyBilly06/LHDC-V5-Decoder.git
+commit=cf857ce1a1429965e161e54adbc3f293fd9ce273

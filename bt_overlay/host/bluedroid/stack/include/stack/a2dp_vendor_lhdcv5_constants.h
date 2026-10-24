@@ -1,3 +1,12 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileContributor: 2026 Zapadenec1982
+ *
+ * Adapted from a2dp_integration/a2dp_vendor_lhdcv5_constants.h in WillyBilly06/LHDC-V5-Decoder,
+ * at the commit in lhdc.pin. Upstream names no author; its README releases the
+ * repository under the Apache License 2.0 (docs/LHDC_UPSTREAM.md).
+ */
+
 #ifndef A2DP_VENDOR_LHDCV5_CONSTANTS_H
 #define A2DP_VENDOR_LHDCV5_CONSTANTS_H
 

@@ -1,0 +1,8 @@
+# LHDC V5, on top of sdkconfig.defaults:
+#
+#   tools/setup.sh --clean --with-lhdc      (setup.ps1 -Clean -WithLhdc)
+#   idf.py -B build_lhdc -D SDKCONFIG=build_lhdc/sdkconfig -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.lhdc" build
+#
+# The decoder is not in this repository; setup fetches it at the commit in
+# lhdc.pin, which also says why. Without it the build stops and says so.
+CONFIG_BT_A2DP_LHDCV5_DECODER=y

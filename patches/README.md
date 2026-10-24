@@ -10,8 +10,10 @@ then copy `bt_overlay/`. `tools/setup.ps1 -Clean` reproduces the local ignored
   configuration notification when CONFIG is dispatched from INIT after a queued
   CLOSE. This prevents BTC remaining IDLE during a peer codec switch.
 - `0003-add-lhdcv5-decoder.patch`: builds the LHDC V5 endpoint and decoder
-  (`CONFIG_BT_A2DP_LHDCV5_DECODER`, the pinned decoder in
-  `components/lhdcv5_decoder`) and makes room for one more stream endpoint. A peer
+  (`CONFIG_BT_A2DP_LHDCV5_DECODER`) and makes room for one more stream endpoint.
+  The decoder is not in this repository: `tools/setup.sh --with-lhdc` fetches it
+  into `components/lhdcv5_decoder` at the commit in `lhdc.pin`, and `bt` links it
+  as an optional requirement, so a build without it still configures. A peer
   may announce LHDC capabilities as masks, but SET_CONFIGURATION must select exactly
   one format; 0003 adds that check to `bta_av_co.c` with the LHDC validator. 0010
   deletes it again: the sink's SET_CONFIGURATION check is now

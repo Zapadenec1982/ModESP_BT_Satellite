@@ -1,3 +1,12 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * SPDX-FileContributor: 2026 Zapadenec1982
+ *
+ * Adapted from a2dp_integration/a2dp_vendor_lhdcv5.c in WillyBilly06/LHDC-V5-Decoder,
+ * at the commit in lhdc.pin. Upstream names no author; its README releases the
+ * repository under the Apache License 2.0 (docs/LHDC_UPSTREAM.md).
+ */
+
 #include <string.h>
 
 #include "a2d_int.h"

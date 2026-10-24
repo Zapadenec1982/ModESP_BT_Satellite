@@ -22,7 +22,8 @@ CONFIG_BT_A2DP_USE_EXTERNAL_CODEC=n
 # licence at all, and Sony publishes an encoder only.
 CONFIG_BT_A2DP_APTX_DECODER=y
 CONFIG_BT_A2DP_AAC_DECODER=y
-CONFIG_BT_A2DP_LHDCV5_DECODER=y
+# LHDC V5 is off here and on with sdkconfig.lhdc: its decoder is not in this
+# repository, tools/setup.sh --with-lhdc fetches it (lhdc.pin).
 
 # Not used: no serial port profile, no BLE host.
 CONFIG_BT_SPP_ENABLED=n

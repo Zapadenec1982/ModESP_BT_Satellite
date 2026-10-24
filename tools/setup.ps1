@@ -20,6 +20,11 @@
     Discard an existing components/bt and copy it again. Without this the script
     refuses to touch a copy that is already there, because patches are not idempotent.
 
+.PARAMETER WithLhdc
+    Also fetch the LHDC V5 decoder named in lhdc.pin into components/lhdcv5_decoder.
+    It is not carried in this repository; lhdc.pin says why. The build uses it only
+    with sdkconfig.lhdc.
+
 .EXAMPLE
     . C:\Espressif\tools\Microsoft.v5.5.5.PowerShell_profile.ps1
     .\tools\setup.ps1
@@ -27,7 +32,8 @@
 
 [CmdletBinding()]
 param(
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$WithLhdc
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,6 +42,8 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $btLocal  = Join-Path $repoRoot 'components\bt'
 $patchDir = Join-Path $repoRoot 'patches'
 $pinFile  = Join-Path $repoRoot 'idf.pin'
+$lhdcLocal = Join-Path $repoRoot 'components\lhdcv5_decoder'
+$lhdcPin   = Join-Path $repoRoot 'lhdc.pin'
 
 function Fail($message) {
     Write-Host ''
@@ -155,9 +163,62 @@ if (Test-Path $overlay) {
     Write-Host 'setup: no bt_overlay - only the patches were applied.' -ForegroundColor Yellow
 }
 
-# --- 5. Say what to do next ----------------------------------------------------
+# --- 5. The LHDC V5 decoder, only when asked for --------------------------------
+
+# Not carried in this repository; lhdc.pin says why. A shallow, blobless fetch of
+# the pinned commit brings its trees and no file contents, and the checkout of the
+# three paths that are built then downloads only theirs: about 2 MB of a 110 MB
+# repository. Fetching by full commit id is itself the check that it is the pin.
+if ($WithLhdc) {
+    if (-not (Test-Path $lhdcPin)) {
+        Fail "lhdc.pin not found at $lhdcPin"
+    }
+    $lpin = @{}
+    foreach ($line in Get-Content $lhdcPin) {
+        if ($line -match '^\s*([a-z]+)\s*=\s*(\S+)\s*$') { $lpin[$Matches[1]] = $Matches[2] }
+    }
+    if (-not $lpin.url -or -not $lpin.commit) {
+        Fail 'lhdc.pin must define both url= and commit=.'
+    }
+
+    $fetchDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString())
+    New-Item -ItemType Directory -Force -Path $fetchDir | Out-Null
+    try {
+        Write-Host "setup: fetching the LHDC V5 decoder at $($lpin.commit.Substring(0, 12)) from $($lpin.url) ..."
+        & git -C $fetchDir init -q
+        & git -C $fetchDir remote add origin $lpin.url
+        & git -C $fetchDir fetch -q --depth 1 --filter=blob:none origin $lpin.commit
+        if ($LASTEXITCODE -ne 0) {
+            Fail "could not fetch $($lpin.commit) from $($lpin.url)."
+        }
+        & git -C $fetchDir checkout -q FETCH_HEAD -- CMakeLists.txt README.md decoder
+        if ($LASTEXITCODE -ne 0) {
+            Fail 'the pinned commit has no CMakeLists.txt, README.md and decoder/.'
+        }
+
+        if (Test-Path $lhdcLocal) {
+            Remove-Item -Recurse -Force $lhdcLocal
+        }
+        New-Item -ItemType Directory -Force -Path $lhdcLocal | Out-Null
+        foreach ($name in 'CMakeLists.txt', 'README.md', 'decoder') {
+            Copy-Item -Recurse -Force (Join-Path $fetchDir $name) $lhdcLocal
+        }
+        $count = @(Get-ChildItem -Path $lhdcLocal -Recurse -File).Count
+        Write-Host "setup: $count file(s) of the LHDC V5 decoder in components/lhdcv5_decoder." -ForegroundColor Green
+    } finally {
+        Remove-Item -Recurse -Force $fetchDir -ErrorAction SilentlyContinue
+    }
+} elseif (Test-Path $lhdcLocal) {
+    Write-Host 'setup: components/lhdcv5_decoder, from an earlier -WithLhdc, left as it is.'
+}
+
+# --- 6. Say what to do next ----------------------------------------------------
 
 Write-Host ''
 Write-Host 'setup: done. Next:' -ForegroundColor Green
 Write-Host '    idf.py set-target esp32'
 Write-Host '    idf.py build'
+if ($WithLhdc) {
+    Write-Host 'setup: LHDC V5 is built only with sdkconfig.lhdc, from a fresh sdkconfig:' -ForegroundColor Green
+    Write-Host '    idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.lhdc" set-target esp32'
+}

@@ -11,6 +11,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cc', default='C:/msys64/ucrt64/bin/gcc.exe')
     args = parser.parse_args()
+    dec = ROOT / 'components/lhdcv5_decoder/decoder'
+    if not (dec / 'lhdc_dec.c').is_file():
+        # Fetched, not carried (lhdc.pin): without it there is nothing to replay.
+        print('LHDC: skipped, the decoder is not fetched (tools/setup.sh --with-lhdc)')
+        return 0
     out = ROOT / 'build/host/lhdc'
     out.mkdir(parents=True, exist_ok=True)
     stubs = {
@@ -43,7 +48,6 @@ typedef struct { uint16_t event, len, offset, layer_specific; } BT_HDR;
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
     ov = ROOT / 'bt_overlay/host/bluedroid/stack'
-    dec = ROOT / 'components/lhdcv5_decoder/decoder'
     env = dict(os.environ)
     env['PATH'] = str(Path(args.cc).parent) + os.pathsep + env.get('PATH', '')
     exe = out / 'test_lhdc.exe'

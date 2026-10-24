@@ -1,5 +1,9 @@
 /* SPDX-License-Identifier: Apache-2.0
- * Adapted from WillyBilly06/LHDC-V5-Decoder at 676af03d2b7a2ed5c1f9bdca7bf8938cc85f704b.
+ * SPDX-FileContributor: 2026 Zapadenec1982
+ *
+ * Adapted from a2dp_integration/a2dp_vendor_lhdcv5_decoder.c in WillyBilly06/LHDC-V5-Decoder,
+ * at the commit in lhdc.pin. Upstream names no author; its README releases the
+ * repository under the Apache License 2.0 (docs/LHDC_UPSTREAM.md).
  * Bounded RTP/reassembly, native PCM widths and explicit decoder lifetime.
  */
 #include <errno.h>
