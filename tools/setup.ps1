@@ -166,9 +166,11 @@ if (Test-Path $overlay) {
 # --- 5. The LHDC V5 decoder, only when asked for --------------------------------
 
 # Not carried in this repository; lhdc.pin says why. A shallow, blobless fetch of
-# the pinned commit brings its trees and no file contents, and the checkout of the
-# three paths that are built then downloads only theirs: about 2 MB of a 110 MB
-# repository. Fetching by full commit id is itself the check that it is the pin.
+# the pinned commit brings its trees and no file contents, and a sparse checkout of
+# the three paths that are built then downloads only theirs, in one request: a few
+# MB of a 110 MB repository. (A pathspec checkout asks for each file on its own and
+# prints a page of progress for it.) Fetching by full commit id is itself the
+# check that it is the pin.
 if ($WithLhdc) {
     if (-not (Test-Path $lhdcPin)) {
         Fail "lhdc.pin not found at $lhdcPin"
@@ -191,9 +193,26 @@ if ($WithLhdc) {
         if ($LASTEXITCODE -ne 0) {
             Fail "could not fetch $($lpin.commit) from $($lpin.url)."
         }
-        & git -C $fetchDir checkout -q FETCH_HEAD -- CMakeLists.txt README.md decoder
-        if ($LASTEXITCODE -ne 0) {
-            Fail 'the pinned commit has no CMakeLists.txt, README.md and decoder/.'
+        & git -C $fetchDir config core.sparseCheckout true
+        # LF, not the CRLF Set-Content would write: git reads these as patterns.
+        $sparseFile = Join-Path $fetchDir '.git\info\sparse-checkout'
+        [System.IO.File]::WriteAllText($sparseFile, "/CMakeLists.txt`n/README.md`n/decoder/`n")
+        # git's output is kept for a failure and dropped otherwise. Stop would turn
+        # its first line on stderr into a terminating error under Windows PowerShell
+        # 5.1, so the preference is relaxed for this one call.
+        $prevPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $out = & git -C $fetchDir -c advice.detachedHead=false checkout -q FETCH_HEAD 2>&1
+        $checkoutExit = $LASTEXITCODE
+        $ErrorActionPreference = $prevPreference
+        if ($checkoutExit -ne 0) {
+            $out | ForEach-Object { Write-Host "$_" }
+            Fail "could not check out the LHDC V5 decoder at $($lpin.commit)."
+        }
+        foreach ($name in 'CMakeLists.txt', 'README.md', 'decoder') {
+            if (-not (Test-Path (Join-Path $fetchDir $name))) {
+                Fail "the pinned commit has no $name."
+            }
         }
 
         if (Test-Path $lhdcLocal) {
