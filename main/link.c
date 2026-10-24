@@ -518,22 +518,30 @@ void link_send_bond_list(const satlink_bond_list_t *m)
     tx_wake();
 }
 
+/* Both fields are 32 bytes in the descriptor, so this is sized to hold them whole
+ * rather than to hold what they usually happen to contain. */
+#define LINK_OWN_BUILD_BUF (4 + sizeof(((esp_app_desc_t *)0)->version) + 1 + \
+                            sizeof(((esp_app_desc_t *)0)->idf_ver))
+
+/* "sat <version> <idf>", exactly as our HELLO carries it; points into `buf`. */
+static satlink_str_t own_build(char *buf, size_t cap)
+{
+    const esp_app_desc_t *app = esp_app_get_description();
+    snprintf(buf, cap, "sat %.*s %.*s",
+             (int)sizeof(app->version), app->version,
+             (int)sizeof(app->idf_ver), app->idf_ver);
+    return satlink_str_clip(buf, LINK_BUILD_MAX);
+}
+
 /* Our greeting, byte for byte as it goes on the wire. 0 if it will not fit. */
 static size_t encode_own_hello(uint8_t *payload, size_t cap)
 {
-    const esp_app_desc_t *app = esp_app_get_description();
-    /* Both fields are 32 bytes in the descriptor, so this is sized to hold them
-     * whole rather than to hold what they usually happen to contain. */
-    char build[4 + sizeof(app->version) + 1 + sizeof(app->idf_ver)];
-    snprintf(build, sizeof(build), "sat %.*s %.*s",
-             (int)sizeof(app->version), app->version,
-             (int)sizeof(app->idf_ver), app->idf_ver);
-
+    char build[LINK_OWN_BUILD_BUF];
     satlink_hello_t m = {
         .major = SATLINK_PROTO_MAJOR,
         .minor = SATLINK_PROTO_MINOR,
         .caps  = __atomic_load_n(&s_own_caps, __ATOMIC_SEQ_CST),
-        .build = satlink_str_clip(build, LINK_BUILD_MAX),
+        .build = own_build(build, sizeof(build)),
     };
     return satlink_enc_hello(payload, cap, &m);
 }
@@ -599,20 +607,22 @@ static void handle_hello(const uint8_t *payload, size_t len)
      * the host's, it had this device trusting its own capabilities as the
      * host's -- and our BT_SETTINGS is the host's PAIR_CONFIRM, bit for bit, so
      * pairing went to a confirmer that was not there. A host never sends our
-     * build string, so a payload identical to ours is ours.
+     * build string, so a HELLO of our version with our build is ours, whatever
+     * caps it carries. It used to have to match the HELLO we would send now, and
+     * one sent before a role change moved bit 8 then passed for the host's.
      */
-    uint8_t own[LINK_BUF_HELLO];
-    size_t own_len = encode_own_hello(own, sizeof(own));
-    if (own_len != 0 && own_len == len && memcmp(own, payload, len) == 0) {
-        if (s_stats.rx_echoes++ == 0) {
-            ESP_LOGW(TAG, "our own HELLO came back: the receive line hears the transmit line");
-        }
-        return;
-    }
-
     satlink_hello_t h = {0};
     if (!satlink_dec_hello(payload, len, &h)) {
         s_stats.rx_bad++;
+        return;
+    }
+    char build[LINK_OWN_BUILD_BUF];
+    const satlink_str_t own = own_build(build, sizeof(build));
+    if (h.major == SATLINK_PROTO_MAJOR && h.minor == SATLINK_PROTO_MINOR &&
+        h.build.len == own.len && memcmp(h.build.ptr, own.ptr, own.len) == 0) {
+        if (s_stats.rx_echoes++ == 0) {
+            ESP_LOGW(TAG, "our own HELLO came back: the receive line hears the transmit line");
+        }
         return;
     }
 

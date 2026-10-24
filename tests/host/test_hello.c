@@ -29,6 +29,8 @@ static struct {
     uint32_t (*on_host_caps)(uint32_t, bool *);
 } s_handlers;
 typedef struct { char version[32], idf_ver[32]; } esp_app_desc_t;
+#define LINK_OWN_BUILD_BUF (4 + sizeof(((esp_app_desc_t *)0)->version) + 1 + \
+                            sizeof(((esp_app_desc_t *)0)->idf_ver))
 static const esp_app_desc_t *esp_app_get_description(void) {
     static const esp_app_desc_t app = {"test", "5.5.5"}; return &app;
 }
@@ -133,6 +135,11 @@ int main(void) {
     CHECK(!s_host_present); CHECK(s_host_caps == 0); CHECK(s_host_minor == 0);
     CHECK(callbacks == 0); CHECK(s_stats.rx_echoes == 1); CHECK(s_stats.rx_bad == 0);
     beat(); CHECK(hellos == 2);                 // still greeting: no host has answered
+    // One sent before our caps changed (a role change moves bit 8) is ours as well.
+    s_own_caps = 0x1df;
+    handle_hello(own, own_len);
+    CHECK(!s_host_present); CHECK(s_host_caps == 0); CHECK(s_stats.rx_echoes == 2);
+    s_own_caps = 0xdf;
     // A real host with the very same caps but its own build is still a host.
     receive_hello(1, 8, 0xdf); CHECK(s_host_present); CHECK(s_host_caps == 0xdf);
     s_own_caps = 0;
