@@ -196,6 +196,26 @@ typedef struct {
 } bt_a2d_msg_t;
 
 static QueueHandle_t s_queue;
+
+/*
+ * The task sleeps until there is something to do: every producer below queues or
+ * raises its flag and then wakes it. It used to wake every 10 ms whatever happened,
+ * a hundred times a second for the device's whole life, mostly for nothing. Only a
+ * format transaction under way still wants 10 ms (its 50 ms of silence and its
+ * FMT_RETRY_MS repeats); everything else waits on deadlines of seconds.
+ */
+#define BT_POLL_BUSY_MS     10
+#define BT_POLL_IDLE_MS     100
+static TaskHandle_t s_bt_task;
+
+/* Any task, never an ISR. A wake-up that finds nothing new costs one pass. */
+static void bt_av_wake(void)
+{
+    if (s_bt_task != NULL) {
+        xTaskNotifyGive(s_bt_task);
+    }
+}
+
 #define BT_EVENT_FORMAT_READY         0xff00
 #define BT_EVENT_ENDPOINTS_REGISTERED 0xff01
 static ep_fsm_t s_endpoints;            /* bt_av task only */
@@ -460,6 +480,7 @@ void bt_av_apply_host_caps(void)
     atomic_store(&s_cover_refresh, true);
     atomic_store(&s_cover_query, true);
     atomic_store(&s_caps_pending, true);
+    bt_av_wake();
 }
 
 void bt_av_cover_retry(uint32_t boot_nonce, uint32_t track_generation)
@@ -485,6 +506,7 @@ void bt_av_cover_retry(uint32_t boot_nonce, uint32_t track_generation)
      * needs -- a repeated RESET pair is idempotent and would clear nothing. */
     atomic_store(&s_cover_refresh, true);
     atomic_store(&s_cover_query, true);
+    bt_av_wake();
     ESP_LOGI(TAG, "cover art: host asked for generation %" PRIu32 " again", track_generation);
 }
 
@@ -494,6 +516,7 @@ void bt_av_format_ready(const fmt_ready_t *ready)
     bt_a2d_msg_t msg = { .event = BT_EVENT_FORMAT_READY, .ready = *ready };
     // Losing an ACK is safe: PREPARE retries and the host repeats READY.
     xQueueSend(s_queue, &msg, 0);
+    bt_av_wake();
 }
 
 /* Sets the stack's switches from the host's HELLO and the codecs the settings
@@ -1003,6 +1026,7 @@ void bt_av_request_role(bool slave, void (*done)(void))
 {
     atomic_store(&s_role_done, done);
     atomic_store(&s_role_wanted, slave ? 1 : 0);
+    bt_av_wake();
 }
 
 /* Before poll_format, so that the HELLO answering the host goes out ahead of the
@@ -1028,7 +1052,16 @@ static void bt_av_task(void *arg)
 
     bt_a2d_msg_t msg;
     for (;;) {
-        if (xQueueReceive(s_queue, &msg, pdMS_TO_TICKS(10)) == pdTRUE) {
+        /* One event a pass, as before. A producer queues first and wakes second, so a
+         * wake-up given between the empty look and the wait is not lost: the
+         * notification is kept until taken. */
+        bool got = xQueueReceive(s_queue, &msg, 0) == pdTRUE;
+        if (!got) {
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(s_format_pending ? BT_POLL_BUSY_MS
+                                                                    : BT_POLL_IDLE_MS));
+            got = xQueueReceive(s_queue, &msg, 0) == pdTRUE;
+        }
+        if (got) {
             handle_a2d_event(&msg);
         }
         poll_role();
@@ -1059,6 +1092,7 @@ static void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     if (xQueueSend(s_queue, &msg, 0) != pdTRUE) {
         ESP_LOGW(TAG, "event queue full, dropped a2dp event %d", event);
     }
+    bt_av_wake();
 }
 
 /* PCM straight from the stack's SBC decoder. Runs on the A2DP sink task, so it
@@ -1415,6 +1449,7 @@ static bool cfg_post(const cfg_msg_t *m)
         return false;
     }
     if (xQueueSend(s_cfg_queue, m, 0) == pdTRUE) {
+        bt_av_wake();
         return true;
     }
     ESP_LOGW(TAG, "bt settings: queue full, dropped event %u", m->type);
@@ -2219,7 +2254,7 @@ esp_err_t bt_av_start(const char *device_name)
     s_meta_send = xSemaphoreCreateMutex();
     ESP_RETURN_ON_FALSE(s_meta_send != NULL, ESP_ERR_NO_MEM, TAG, "no memory for the meta lock");
     ESP_RETURN_ON_FALSE(
-        xTaskCreate(bt_av_task, "bt_av", BT_TASK_STACK, NULL, BT_TASK_PRIO, NULL) == pdPASS,
+        xTaskCreate(bt_av_task, "bt_av", BT_TASK_STACK, NULL, BT_TASK_PRIO, &s_bt_task) == pdPASS,
         ESP_ERR_NO_MEM, TAG, "no memory for the bt task");
 
     const esp_timer_create_args_t meta_args = {
@@ -2303,6 +2338,7 @@ esp_err_t bt_av_start(const char *device_name)
                                 .codecs = codecs };
     ESP_RETURN_ON_FALSE(xQueueSend(s_queue, &registered, pdMS_TO_TICKS(100)) == pdTRUE,
                         ESP_ERR_NO_MEM, TAG, "event queue full at start");
+    bt_av_wake();
 
     /* Scan mode and pairing as the saved settings say: factory state is
      * connectable, discoverable and pairable, as before protocol 1.8. */
@@ -2316,5 +2352,6 @@ esp_err_t bt_av_start(const char *device_name)
 
     /* The settings, the bonds and the pairing are the task's from here. */
     atomic_store(&s_stack_up, true);
+    bt_av_wake();
     return ESP_OK;
 }
