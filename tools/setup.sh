@@ -107,9 +107,11 @@ fi
 # --- 5. The LHDC V5 decoder, only when asked for ---------------------------------
 
 # Not carried in this repository; lhdc.pin says why. A shallow, blobless fetch of
-# the pinned commit brings its trees and no file contents, and the checkout of the
-# three paths that are built then downloads only theirs: about 2 MB of a 110 MB
-# repository. Fetching by full commit id is itself the check that it is the pin.
+# the pinned commit brings its trees and no file contents, and a sparse checkout of
+# the three paths that are built then downloads only theirs, in one request: a few
+# MB of a 110 MB repository. (A pathspec checkout asks for each file on its own and
+# prints a page of progress for it.) Fetching by full commit id is itself the
+# check that it is the pin.
 if (( with_lhdc )); then
     [[ -f "$lhdc_pin" ]] || fail "lhdc.pin not found at $lhdc_pin"
     lhdc_url=$(sed -n 's/^[[:space:]]*url[[:space:]]*=[[:space:]]*\([^[:space:]]*\).*$/\1/p' "$lhdc_pin" | tr -d '\r' | head -n1)
@@ -123,8 +125,16 @@ if (( with_lhdc )); then
     git -C "$fetch_dir" remote add origin "$lhdc_url"
     git -C "$fetch_dir" fetch -q --depth 1 --filter=blob:none origin "$lhdc_commit" || \
         fail "could not fetch $lhdc_commit from $lhdc_url."
-    git -C "$fetch_dir" checkout -q FETCH_HEAD -- CMakeLists.txt README.md decoder || \
-        fail "the pinned commit has no CMakeLists.txt, README.md and decoder/."
+    git -C "$fetch_dir" config core.sparseCheckout true
+    printf '/CMakeLists.txt\n/README.md\n/decoder/\n' > "$fetch_dir/.git/info/sparse-checkout"
+    # git's output is kept for a failure and dropped otherwise.
+    if ! out=$(git -C "$fetch_dir" -c advice.detachedHead=false checkout -q FETCH_HEAD 2>&1); then
+        printf '%s\n' "$out" >&2
+        fail "could not check out the LHDC V5 decoder at $lhdc_commit."
+    fi
+    for path in CMakeLists.txt README.md decoder; do
+        [[ -e "$fetch_dir/$path" ]] || fail "the pinned commit has no $path."
+    done
 
     rm -rf "$lhdc_local"
     mkdir -p "$lhdc_local"
