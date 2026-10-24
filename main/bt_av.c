@@ -319,6 +319,12 @@ static struct {
 
 static esp_timer_handle_t s_meta_timer;
 
+/* The position: play_state, elapsed_ms, elapsed_at_us, elapsed_unknown and total_ms are
+ * written on the BTC task and read there and by pos_tick on the esp_timer task, often on
+ * the other core. elapsed_at_us is 64 bits and means something only with elapsed_ms, so
+ * they are written and read together, under this. */
+static portMUX_TYPE s_pos_mux = portMUX_INITIALIZER_UNLOCKED;
+
 /* Title, artist and album are written on the BTC task, read by the meta timer on the
  * esp_timer task and cleared by the bt_av task. s_meta_mux guards the three strings and
  * s_meta_live (A2DP is up, so TRACK_META may go out): a spinlock, because a Bluetooth
@@ -693,15 +699,20 @@ static void meta_settle_restart(void)
 
 static void send_track_pos(void)
 {
+    portENTER_CRITICAL(&s_pos_mux);
+    const uint8_t state = s_now.play_state;
     uint32_t elapsed = s_now.elapsed_ms;
-    if (s_now.play_state == SATLINK_PLAY_PLAYING && s_now.elapsed_at_us != 0
-        && !s_now.elapsed_unknown) {
-        int64_t since_ms = (esp_timer_get_time() - s_now.elapsed_at_us) / 1000;
+    const uint32_t total = s_now.total_ms;
+    const int64_t at_us = s_now.elapsed_at_us;
+    const bool unknown = s_now.elapsed_unknown;
+    portEXIT_CRITICAL(&s_pos_mux);
+    if (state == SATLINK_PLAY_PLAYING && at_us != 0 && !unknown) {
+        int64_t since_ms = (esp_timer_get_time() - at_us) / 1000;
         if (since_ms > 0) {
             elapsed += (uint32_t)since_ms;
         }
     }
-    link_send_track_pos(s_now.play_state, elapsed, s_now.total_ms);
+    link_send_track_pos(state, elapsed, total);
 }
 
 static void pos_tick(void *arg)
@@ -890,7 +901,9 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
             audio_out_begin_format(&ignored_token);
             audio_out_set_streaming(false);
             s_now.state = idle_state();
+            portENTER_CRITICAL(&s_pos_mux);
             s_now.play_state = SATLINK_PLAY_STOPPED;
+            portEXIT_CRITICAL(&s_pos_mux);
             /* Nothing non-empty may follow the empty TRACK_META: not a settle already
              * pending, nor one armed by an attribute that arrives after this. */
             esp_timer_stop(s_meta_timer);
@@ -1149,7 +1162,9 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             esp_avrc_ct_send_get_rn_capabilities_cmd(TL_RN_CAPS);
         } else {
             s_now.has_play_pos = false;
+            portENTER_CRITICAL(&s_pos_mux);
             s_now.play_state = SATLINK_PLAY_STOPPED;
+            portEXIT_CRITICAL(&s_pos_mux);
             s_now.art_connected = false;
             s_now.art_connecting = false;
             s_now.art_supported = false;
@@ -1231,7 +1246,10 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             char buf[24];
             copy_attr(buf, sizeof(buf), param->meta_rsp.attr_text, param->meta_rsp.attr_length);
             /* strtoll, not atoi: this is the field that came back as -1000. */
-            s_now.total_ms = satlink_sanitize_total_ms(strtoll(buf, NULL, 10));
+            const uint32_t total = satlink_sanitize_total_ms(strtoll(buf, NULL, 10));
+            portENTER_CRITICAL(&s_pos_mux);
+            s_now.total_ms = total;
+            portEXIT_CRITICAL(&s_pos_mux);
             break;
         }
         default:
@@ -1240,14 +1258,18 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
         meta_settle_restart();
         break;
 
-    case ESP_AVRC_CT_PLAY_STATUS_RSP_EVT:
+    case ESP_AVRC_CT_PLAY_STATUS_RSP_EVT: {
+        const int64_t now_us = esp_timer_get_time();
+        portENTER_CRITICAL(&s_pos_mux);
         s_now.total_ms      = satlink_sanitize_total_ms((int64_t)param->play_status_rsp.song_length);
         s_now.elapsed_unknown = !satlink_elapsed_known(param->play_status_rsp.song_position);
         s_now.elapsed_ms    = satlink_sanitize_elapsed_ms(param->play_status_rsp.song_position);
-        s_now.elapsed_at_us = esp_timer_get_time();
+        s_now.elapsed_at_us = now_us;
         s_now.play_state    = play_state_from_avrc(param->play_status_rsp.play_status);
+        portEXIT_CRITICAL(&s_pos_mux);
         send_track_pos();
         break;
+    }
 
     case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
         switch (param->change_ntf.event_id) {
@@ -1269,9 +1291,12 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
                                                        ESP_AVRC_RN_TRACK_CHANGE, 0);
             break;
 
-        case ESP_AVRC_RN_PLAY_STATUS_CHANGE:
+        case ESP_AVRC_RN_PLAY_STATUS_CHANGE: {
+            const int64_t now_us = esp_timer_get_time();
+            portENTER_CRITICAL(&s_pos_mux);
             s_now.play_state = play_state_from_avrc(param->change_ntf.event_parameter.playback);
-            s_now.elapsed_at_us = esp_timer_get_time();
+            s_now.elapsed_at_us = now_us;
+            portEXIT_CRITICAL(&s_pos_mux);
             send_track_pos();
             /* A phone that plays again after the host's PAUSE was resumed by its user:
              * suspending it when the wait runs out would leave it playing with no sound. */
@@ -1284,16 +1309,21 @@ static void avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *par
             esp_avrc_ct_send_register_notification_cmd(TL_PLAY_STATE,
                                                        ESP_AVRC_RN_PLAY_STATUS_CHANGE, 0);
             break;
+        }
 
-        case ESP_AVRC_RN_PLAY_POS_CHANGED:
+        case ESP_AVRC_RN_PLAY_POS_CHANGED: {
+            const int64_t now_us = esp_timer_get_time();
+            portENTER_CRITICAL(&s_pos_mux);
             s_now.elapsed_unknown = !satlink_elapsed_known(param->change_ntf.event_parameter.play_pos);
             s_now.elapsed_ms = satlink_sanitize_elapsed_ms(param->change_ntf.event_parameter.play_pos);
-            s_now.elapsed_at_us = esp_timer_get_time();
+            s_now.elapsed_at_us = now_us;
+            portEXIT_CRITICAL(&s_pos_mux);
             send_track_pos();
             esp_avrc_ct_send_register_notification_cmd(TL_PLAY_POS,
                                                        ESP_AVRC_RN_PLAY_POS_CHANGED,
                                                        POS_NOTIFY_INTERVAL_S);
             break;
+        }
 
         case ESP_AVRC_RN_VOLUME_CHANGE:
             /* This is the hole the host pointed out: the phone moved the slider,
