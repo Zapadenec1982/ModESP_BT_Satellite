@@ -11,9 +11,10 @@
 # by hand in the build step; IDF_PATH itself is set by the image (/opt/esp/idf).
 #
 # Two builds: the default one, and one with the LHDC V5 decoder fetched at the
-# commit in lhdc.pin and switched on by sdkconfig.lhdc. Only the default build
-# keeps its image: this repository does not distribute the LHDC decoder, and a
-# workflow artifact is a download.
+# commit in lhdc.pin and switched on by sdkconfig.lhdc. Neither keeps its image.
+# A workflow artifact of a public repository is a download anyone can take, and
+# an image handed out owes what THIRD_PARTY_NOTICES.md lists under "A binary
+# release"; the image does not carry the RPSL notice that list asks for.
 
 name: build
 
@@ -55,17 +56,3 @@ jobs:
 
       - name: Host tests
         run: CC=gcc PYTHON=python3 tools/run_host_tests.sh
-
-      - name: Keep the image
-        if: ${{ !matrix.lhdc }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: modesp-bt-satellite-${{ github.sha }}
-          path: |
-            build/*.bin
-            build/*.elf
-            build/*.map
-            build/bootloader/bootloader.bin
-            build/partition_table/partition-table.bin
-            build/flasher_args.json
-          if-no-files-found: error
