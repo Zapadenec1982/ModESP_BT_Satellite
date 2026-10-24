@@ -582,6 +582,12 @@ static void answer_hello(bool force)
     reserve_hello(force, LINK_HELLO_MIN_GAP_US);
 }
 
+void link_answer_host(uint32_t caps)
+{
+    const bool changed = caps != __atomic_exchange_n(&s_own_caps, caps, __ATOMIC_SEQ_CST);
+    answer_hello(changed);
+}
+
 /* ------------------------------------------------------------------- inbound */
 
 static void handle_hello(const uint8_t *payload, size_t len)
@@ -648,17 +654,20 @@ static void handle_hello(const uint8_t *payload, size_t len)
     }
 
     /* 1.9: whatever the host's caps change about us (the I2S role) is made true
-     * before we answer, and a change goes out now rather than after the rate limit. */
-    bool changed = false;
+     * before we answer, and a change goes out now rather than after the rate limit.
+     * A role change waits on the audio path, so it is done elsewhere and the answer
+     * goes from there (link_answer_host). */
+    bool later = false;
+    uint32_t reply_caps = __atomic_load_n(&s_own_caps, __ATOMIC_SEQ_CST);
     if (s_handlers.on_host_caps != NULL) {
-        const uint32_t own = s_handlers.on_host_caps(caps);
-        changed = own != __atomic_load_n(&s_own_caps, __ATOMIC_SEQ_CST);
-        __atomic_store_n(&s_own_caps, own, __ATOMIC_SEQ_CST);
+        reply_caps = s_handlers.on_host_caps(caps, &later);
     }
 
     /* The spec asks for a HELLO after start and in answer to one. Only the first
      * half was here, so a host that came up second waited for ever. */
-    answer_hello(changed);
+    if (!later) {
+        link_answer_host(reply_caps);
+    }
 
     if (s_handlers.on_hello != NULL) {
         s_handlers.on_hello(&h);

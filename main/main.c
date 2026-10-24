@@ -92,16 +92,28 @@ static void on_radio(bool on, bool discoverable, bool disconnect)
 
 static uint32_t own_caps(void);
 
+#if !CONFIG_SAT_LINK_ONLY
+/* The role is in place: the HELLO that asked for it is answered with what it left. */
+static void on_role_done(void)
+{
+    link_answer_host(own_caps());
+}
+#endif
+
 /* Protocol 1.9, before our answering HELLO goes out: a host that clocks the link gets a
- * slave, any other host gets the master it has always had. Then the answer says which. */
-static uint32_t on_host_caps(uint32_t host_caps)
+ * slave, any other host gets the master it has always had. Then the answer says which.
+ * A change waits on the decoder and the writer, so it runs on the bt_av task, and the
+ * answer with it; this one drains the UART. Every greeting goes that way, a change or
+ * not: requests are then taken in the order the HELLOs came, and no answer overtakes a
+ * change still under way for an earlier one. */
+static uint32_t on_host_caps(uint32_t host_caps, bool *later)
 {
 #if !CONFIG_SAT_LINK_ONLY
-    const bool slave = (host_caps & SATLINK_HOST_CAP_I2S_MASTER) != 0;
-    if (audio_out_set_role(slave) != ESP_OK)
-        ESP_LOGE(TAG, "I2S could not become the %s", slave ? "slave" : "master");
+    bt_av_request_role((host_caps & SATLINK_HOST_CAP_I2S_MASTER) != 0, on_role_done);
+    *later = true;
 #else
     (void)host_caps;
+    (void)later;
 #endif
     return own_caps();
 }

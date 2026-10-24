@@ -221,7 +221,7 @@ int main(void) {
     reset();audio_out_set_streaming(false);audio_out_set_streaming(true);
     audio_out_write(data,512);assert(!sent_len); /* old packet after resume */
     reset();task_id=2;audio_out_write(data,512);assert(!sent_len && !sends); /* control nonblocking */
-    /* A role change on the link task reopens I2S, maybe at another slot width, and plays
+    /* A role change on the bt_av task reopens I2S, maybe at another slot width, and plays
      * nothing on it unannounced (PROTOCOL.md 6.1): the gate closes, the token dies. */
     reset();s_slave=true;role_reopens=0;token=audio_out_gate();assert(audio_out_resume(token));
     uint32_t open_gate=s_gate;

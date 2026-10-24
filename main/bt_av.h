@@ -67,6 +67,13 @@ void bt_av_bt_refresh(void);
  */
 void bt_av_apply_host_caps(void);
 
+/* Protocol 1.9, from the link's task: become the I2S slave or the master on this
+ * task (nothing to do when it already is), then call `done`. The link's task drains
+ * the UART and must not wait on the audio path; this one already does for every
+ * format change. A request still waiting is replaced, and `done` runs once for the
+ * last. */
+void bt_av_request_role(bool slave, void (*done)(void));
+
 /* From the link's task: queue a BT_STATE for the Bluetooth task, which owns the
  * phone's state, address and name, so the message is never built from a half-written
  * name. False when it could not be queued, so the caller can ask again later. */

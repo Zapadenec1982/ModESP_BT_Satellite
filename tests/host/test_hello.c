@@ -26,7 +26,7 @@ static int64_t s_last_hello_us, clock_us;
 static struct { unsigned rx_bad, hello_sent, rx_echoes, pings_unanswered; } s_stats;
 static struct {
     void (*on_hello)(const satlink_hello_t *);
-    uint32_t (*on_host_caps)(uint32_t);
+    uint32_t (*on_host_caps)(uint32_t, bool *);
 } s_handlers;
 typedef struct { char version[32], idf_ver[32]; } esp_app_desc_t;
 static const esp_app_desc_t *esp_app_get_description(void) {
@@ -44,7 +44,15 @@ static void tx_push(uint8_t type, const uint8_t *payload, size_t len) {
 }
 static void on_hello(const satlink_hello_t *h) { (void)h; callbacks++; }
 // Stands in for the I2S role switch: device bit 8 follows host bit 8.
-static uint32_t own_caps_for(uint32_t host_caps) { return host_caps & SATLINK_HOST_CAP_I2S_MASTER; }
+static uint32_t own_caps_for(uint32_t host_caps, bool *later) {
+    (void)later; return host_caps & SATLINK_HOST_CAP_I2S_MASTER;
+}
+// The same switch done on another task: nothing is answered until it reports back.
+static uint32_t deferred_caps;
+static uint32_t own_caps_later(uint32_t host_caps, bool *later) {
+    deferred_caps = host_caps & SATLINK_HOST_CAP_I2S_MASTER; *later = true; return 0;
+}
+void link_answer_host(uint32_t caps);
 // Records whether the host was already published as present when its caps were
 // stored: link_wait_for_host reads the caps as soon as it sees the flag.
 static bool present_at_caps_store;
@@ -139,6 +147,15 @@ int main(void) {
     receive_hello(1, 9, 0x1fb); CHECK(hellos == 2);  // unchanged: rate limited
     receive_hello(1, 8, 0x1fb); CHECK(s_host_caps == 0xfb); CHECK(s_own_caps == 0);
     CHECK(hellos == 3);
+    // A switch done elsewhere: no answer from this task, the host still counts as
+    // greeted, and the answer comes when the switch reports, past the rate limit.
+    reset_case(); s_own_caps = 0; s_handlers.on_host_caps = own_caps_later; answer_hello(false);
+    receive_hello(1, 9, 0x1fb); CHECK(hellos == 1); CHECK(s_host_present); CHECK(callbacks == 1);
+    CHECK(s_own_caps == 0);
+    link_answer_host(deferred_caps); CHECK(s_own_caps == 0x100); CHECK(hellos == 2);
+    // Reported unchanged inside the second: rate limited, like any reply.
+    link_answer_host(0x100); CHECK(hellos == 2);
+    s_own_caps = 0;
     // No host: one retry per tick, even when a tick is seen a little early.
     reset_case(); answer_hello(false);
     for (int i=0; i<10; i++) beat();

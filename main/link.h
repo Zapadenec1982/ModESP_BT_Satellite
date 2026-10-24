@@ -36,14 +36,21 @@ typedef struct {
     void (*on_bt_refresh)(void);
     /* Protocol 1.9. Called with the host's normalised caps BEFORE the answering
      * HELLO goes out, so whatever it changes (the I2S role) is already true when
-     * the host reads our reply. Returns the caps that reply must carry. */
-    uint32_t (*on_host_caps)(uint32_t host_caps);
+     * the host reads our reply. Returns the caps that reply must carry -- unless
+     * making them true is work this task must not wait for: then it sets *later,
+     * nothing is answered now, and whoever does the work calls link_answer_host()
+     * once it is done. */
+    uint32_t (*on_host_caps)(uint32_t host_caps, bool *later);
 } link_handlers_t;
 
 /* `caps` is what this build can actually do, not what the protocol defines. The
  * host believes it: declaring A2DP in a build without A2DP would have it waiting
  * for a stream that is never coming. */
 esp_err_t link_start(const link_handlers_t *handlers, uint32_t caps);
+
+/* The answer to a host HELLO whose on_host_caps said *later, with the caps it left.
+ * Goes out past the rate limit when they changed (PROTOCOL.md 3.4). Any task. */
+void link_answer_host(uint32_t caps);
 
 /* True once a HELLO with a matching major version has arrived. Until then the
  * host is assumed absent, which is a normal state and not a fault. */

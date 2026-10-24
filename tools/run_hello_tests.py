@@ -18,7 +18,8 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     signatures = ['static size_t encode_own_hello(', 'static void send_hello(void)',
                   'static void reserve_hello(', 'static void answer_hello(bool force)',
-                  'static void handle_hello(', 'static void ping_tick(void *arg)']
+                  'void link_answer_host(', 'static void handle_hello(',
+                  'static void ping_tick(void *arg)']
     (out / 'hello_handlers.inc').write_text(
         '\n'.join(function(source, signature) for signature in signatures), encoding='utf-8')
     exe = out / 'test_hello.exe'

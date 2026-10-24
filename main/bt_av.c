@@ -210,6 +210,11 @@ static ep_fsm_t s_endpoints;            /* bt_av task only */
 #define BT_AV_HELLO_WAIT_MS 10000
 static atomic_bool s_caps_pending;
 static bool s_fmt_slave;                /* the I2S role the current transaction was begun in */
+/* Protocol 1.9: the I2S role a host's HELLO asked for, -1 while none waits, and whom to
+ * tell once it is in place (bt_av_request_role). */
+typedef void (*bt_av_done_t)(void);
+static atomic_int s_role_wanted = -1;
+static _Atomic(bt_av_done_t) s_role_done;
 static atomic_bool s_cover_refresh;
 static atomic_bool s_cover_query;
 static atomic_uint s_cover_epoch;
@@ -587,7 +592,7 @@ static void poll_format(void)
         if (esp_avrc_ct_send_metadata_cmd(TL_META, BT_META_ATTRS) != ESP_OK)
             atomic_store(&s_cover_refresh, false);
     }
-    /* audio_out_set_role runs on the link task and gates PCM; the new role is followed
+    /* audio_out_set_role gates PCM (poll_role, just before this); the new role is followed
      * here with a new transaction, even when the host's greeting has not been seen yet. */
     const bool caps_pending = atomic_exchange(&s_caps_pending, false);
     const bool slave = audio_out_is_slave();
@@ -994,6 +999,29 @@ static void handle_a2d_event(const bt_a2d_msg_t *msg)
 
 static void cfg_poll(void);
 
+void bt_av_request_role(bool slave, void (*done)(void))
+{
+    atomic_store(&s_role_done, done);
+    atomic_store(&s_role_wanted, slave ? 1 : 0);
+}
+
+/* Before poll_format, so that the HELLO answering the host goes out ahead of the
+ * format transaction this role change starts. */
+static void poll_role(void)
+{
+    const int want = atomic_exchange(&s_role_wanted, -1);
+    if (want < 0) {
+        return;
+    }
+    if (audio_out_set_role(want != 0) != ESP_OK) {
+        ESP_LOGE(TAG, "I2S could not become the %s", want ? "slave" : "master");
+    }
+    const bt_av_done_t done = atomic_load(&s_role_done);
+    if (done != NULL) {
+        done();
+    }
+}
+
 static void bt_av_task(void *arg)
 {
     (void)arg;
@@ -1003,6 +1031,7 @@ static void bt_av_task(void *arg)
         if (xQueueReceive(s_queue, &msg, pdMS_TO_TICKS(10)) == pdTRUE) {
             handle_a2d_event(&msg);
         }
+        poll_role();
         poll_format();
         if (atomic_load(&s_stack_up)) {
             cfg_poll();
