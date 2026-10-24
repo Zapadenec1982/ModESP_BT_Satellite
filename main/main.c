@@ -4,14 +4,12 @@
  *
  * Order matters here. The output comes up first because samples can start
  * arriving the moment a phone connects; the link comes up before the radio so
- * that the first BT_STATE has somewhere to go; the expander comes up last
- * because its GPIO_MAP must follow the HELLO.
+ * that the first BT_STATE has somewhere to go.
  */
 
 #include "audio_out.h"
 #include "bt_av.h"
 #include "clock_probe.h"
-#include "expander.h"
 #include "link.h"
 
 #include "esp_err.h"
@@ -60,15 +58,7 @@ static void on_hello(const satlink_hello_t *hello)
     /* Protocol 1.8 asks for BT_CONFIG and BOND_LIST after every greeting, and the
      * pairing mode follows the host that greeted last: not rate limited. */
     bt_av_host_hello();
-#endif
 
-    /* PROTOCOL.md 3.4: GPIO_MAP after every host HELLO, always, in a link-only
-     * build too. It went out once at boot, which a host that greeted later never
-     * saw. Not rate limited: it is 1 + 3n bytes and the host reads it as the
-     * answer to "what lines does this thing have". */
-    expander_send_map();
-
-#if !CONFIG_SAT_LINK_ONLY
     /* Built on the Bluetooth task, behind the BT_CONFIG and BOND_LIST queued above:
      * this task reading the phone's name while that one writes it could send half of
      * one name and half of another. The limit only counts a request that was queued. */
@@ -117,15 +107,11 @@ static uint32_t on_host_caps(uint32_t host_caps)
     return own_caps();
 }
 
-static void on_gpio_cfg(const satlink_gpio_cfg_t *cfg) { expander_apply_cfg(cfg); }
-static void on_gpio_out(uint32_t values, uint32_t mask) { expander_set_outputs(values, mask); }
-static void on_adc_read(uint8_t index)     { expander_read_adc(index); }
-
 /* What this build can actually do. The host believes the HELLO, so a bit claimed
  * here has to be a bit honoured later. */
 static uint32_t own_caps(void)
 {
-    uint32_t caps = expander_caps();
+    uint32_t caps = 0;
 #if !CONFIG_SAT_LINK_ONLY
     /* 1.9: claimed only while true, because the host drives BCLK and WS on it. */
     if (audio_out_is_slave()) caps |= SATLINK_CAP_I2S_SLAVE;
@@ -170,15 +156,9 @@ void app_main(void)
         .on_transport = on_transport,
         .on_volume    = on_volume,
         .on_radio     = on_radio,
-        .on_gpio_cfg  = on_gpio_cfg,
-        .on_gpio_out  = on_gpio_out,
-        .on_adc_read  = on_adc_read,
         .on_host_caps = on_host_caps,
     };
-    /* The expander's state before the link that delivers GPIO_CFG to it. */
-    ESP_ERROR_CHECK(expander_init());
     ESP_ERROR_CHECK(link_start(&handlers, own_caps()));
-    ESP_ERROR_CHECK(expander_start());
 
     /* After both peripherals have claimed their pins. The probe only listens on
      * the I2S clock pads and never drives them, so it is safe in either role. */

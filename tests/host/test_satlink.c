@@ -526,7 +526,7 @@ static void test_hello_roundtrip(void)
     satlink_wr_init(&w, payload, sizeof(payload));
     satlink_wr_u8(&w, SATLINK_PROTO_MAJOR);
     satlink_wr_u8(&w, SATLINK_PROTO_MINOR);
-    satlink_wr_u32(&w, SATLINK_CAP_A2DP_SINK | SATLINK_CAP_AVRCP_META | SATLINK_CAP_EXPANDER);
+    satlink_wr_u32(&w, SATLINK_CAP_A2DP_SINK | SATLINK_CAP_AVRCP_META | SATLINK_CAP_COVER_ART);
     satlink_wr_str(&w, "sat 0.1.0 a1b2c3d");
     CHECK(w.ok);
 
@@ -546,7 +546,7 @@ static void test_hello_roundtrip(void)
     CHECK_EQ(satlink_rd_u8(&r), SATLINK_PROTO_MAJOR);
     CHECK_EQ(satlink_rd_u8(&r), SATLINK_PROTO_MINOR);
     CHECK_EQ(satlink_rd_u32(&r),
-             SATLINK_CAP_A2DP_SINK | SATLINK_CAP_AVRCP_META | SATLINK_CAP_EXPANDER);
+             SATLINK_CAP_A2DP_SINK | SATLINK_CAP_AVRCP_META | SATLINK_CAP_COVER_ART);
     const char *build = NULL;
     uint16_t build_len = 0;
     CHECK(satlink_rd_str(&r, &build, &build_len));
