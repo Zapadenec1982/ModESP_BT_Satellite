@@ -43,7 +43,7 @@ static atomic_uint s_tx_events, s_tx_noclock, s_tx_noclock_us;
 static bool s_slave;
 static int s_decoder_task, task_id=1, s_ring, s_lock_obj, s_tx_obj;
 static void *s_producer_lock=&s_lock_obj, *s_lock=&s_lock_obj, *s_tx=&s_tx_obj;
-static bool s_dma_primed, s_streaming, s_running=true, s_tx_recover, s_fault;
+static bool s_dma_primed, s_streaming, s_running=true, s_tx_recover, s_fault, s_open_fault;
 static unsigned role_reopens;
 static unsigned s_slot_bits=32, s_src_bits=32;
 static uint32_t now_ms;
@@ -113,8 +113,11 @@ static void audio_ring_put(const void *,size_t);
 static void flush_ring(void) {ring_fill=0;}
 static esp_err_t i2s_channel_disable(void *tx) {(void)tx;return ESP_OK;}
 static esp_err_t i2s_del_channel(void *tx) {(void)tx;return ESP_OK;}
+static bool open_fail;
 static esp_err_t i2s_open(bool slave) {
-    role_reopens++;s_tx=&s_tx_obj;s_slave=slave;if(slave)s_slot_bits=32;
+    role_reopens++;
+    if(open_fail){s_tx=NULL;s_running=false;return ESP_FAIL;}
+    s_tx=&s_tx_obj;s_slave=slave;if(slave)s_slot_bits=32;
     s_running=true;return ESP_OK;
 }
 static void audio_servo_reset(void) {}
@@ -231,6 +234,15 @@ int main(void) {
     sat_audio_decode_begin(1);audio_out_write(data,512);sat_audio_decode_end();
     assert(!sent_len); /* and so is the next, until bt_av starts a new transaction */
     assert(waiting_at_take==1 && !s_ctrl_waiting); /* it took s_lock as a control caller */
+    /* A role that will not open leaves the device silent; the next channel that opens ends
+     * that, because the fault was the missing channel. Any other fault outlives a reopen. */
+    reset();s_fault=false;s_open_fault=false;open_fail=true;
+    assert(audio_out_set_role(true)!=ESP_OK && s_fault && !s_tx && !s_running);
+    open_fail=false;
+    assert(audio_out_set_role(true)==ESP_OK && !s_fault && s_tx && s_slave);
+    s_fault=true;
+    assert(audio_out_set_role(false)==ESP_OK && s_fault && !s_slave);
+    s_fault=false;
     /* The writer gives s_lock and takes it straight back; a lower-priority control
      * caller only woken by the give would lose that race. With nobody waiting the
      * writer goes on at once; with a waiter it stays off the lock until it got in. */
