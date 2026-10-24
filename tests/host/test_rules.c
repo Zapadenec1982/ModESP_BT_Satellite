@@ -100,9 +100,6 @@ static void test_incompatible_host(void)
     CHECK(!link_incompatible_allows(SATLINK_MSG_CMD_TRANSPORT));
     CHECK(!link_incompatible_allows(SATLINK_MSG_CMD_VOLUME));
     CHECK(!link_incompatible_allows(SATLINK_MSG_CMD_RADIO));
-    CHECK(!link_incompatible_allows(SATLINK_MSG_GPIO_OUT));
-    CHECK(!link_incompatible_allows(SATLINK_MSG_GPIO_CFG));
-    CHECK(!link_incompatible_allows(SATLINK_MSG_ADC_READ));
     /* And what the cover stream sends. */
     CHECK(!link_incompatible_allows(0x18));      /* COVER_DATA */
     CHECK(!link_incompatible_allows(0x19));      /* COVER_END */

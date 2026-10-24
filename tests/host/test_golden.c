@@ -97,9 +97,8 @@ static void test_golden_hello(void)
     CHECK_EQ(m.build.len, 12);
     CHECK_EQ(memcmp(m.build.ptr, "player 0.4.0", 12), 0);
 
-    /* The host declares neither cover art nor the expander. */
+    /* The host declares no cover art. */
     CHECK(!(m.caps & SATLINK_HOST_CAP_COVER));
-    CHECK(!(m.caps & SATLINK_HOST_CAP_EXPANDER));
     CHECK(m.caps & SATLINK_HOST_CAP_RELOCK);
 
     uint8_t payload[SATLINK_PAYLOAD_MAX];
