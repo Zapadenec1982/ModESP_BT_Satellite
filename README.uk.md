@@ -142,6 +142,11 @@ tests/host/, tools/        хост-тести і скрипти, що їх за
 
 ## Ліцензія
 
-Власного файлу ліцензії в репозиторії немає. Сторонній код в образі та умови, знайдені в ньому,
-перелічені в [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md); libfreeaptx — LGPL-2.1, і
-`tools/relink_kit.ps1` готує набір для перелінковки до релізу.
+Власний код проекту — під [ліцензією MIT](LICENSE): `main/`, `components/satlink/`, `patches/`,
+`tests/`, `tools/` і документація. Файл із власним ліцензійним заголовком лишається під ним,
+разом зі змінами, зробленими тут: у `bt_overlay/` це Apache-2.0 для каркаса кодеків, RealNetworks
+Public Source License для Helix AAC (`RPSL.txt` поруч) і LGPL-2.1-or-later для libfreeaptx. Патчі
+змінюють Bluedroid, і він лишається під Apache-2.0. Усе це перелічено в
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) разом з тим, чого кожна частина вимагає від
+зібраного образу; `tools/relink_kit.ps1` готує набір для перелінковки LGPL до релізу. Декодера
+LHDC V5 у репозиторії немає зовсім ([`lhdc.pin`](lhdc.pin)).

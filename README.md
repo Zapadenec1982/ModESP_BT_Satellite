@@ -145,6 +145,11 @@ tests/host/, tools/        host tests and the scripts that run them; setup scrip
 
 ## Licence
 
-This repository has no licence file of its own. The third-party code linked into the image and
-the terms found in it are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md); libfreeaptx
-is LGPL-2.1, and `tools/relink_kit.ps1` produces the relink kit for a release.
+This project's own code is under the [MIT License](LICENSE): `main/`, `components/satlink/`,
+`patches/`, `tests/`, `tools/` and the docs. A file with a licence notice of its own keeps it,
+changes made here included: in `bt_overlay/` that is Apache-2.0 for the codec framework, the
+RealNetworks Public Source License for Helix AAC (`RPSL.txt` beside it) and LGPL-2.1-or-later for
+libfreeaptx. The patches change Bluedroid, which stays Apache-2.0.
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) lists all of it, and what a built image owes
+each piece; `tools/relink_kit.ps1` produces the LGPL relink kit for a release. The LHDC V5 decoder
+is not in this repository at all ([`lhdc.pin`](lhdc.pin)).
