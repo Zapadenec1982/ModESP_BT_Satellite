@@ -54,7 +54,6 @@ static void on_hello(const satlink_hello_t *hello)
      * 1.2 allows the width to change whenever, so long as it is announced, so a
      * late greeting is now enough to widen. Does nothing when already correct. */
     bt_av_apply_host_caps();
-    bt_av_report_stream_fmt();
     /* Protocol 1.8 asks for BT_CONFIG and BOND_LIST after every greeting, and the
      * pairing mode follows the host that greeted last: not rate limited. */
     bt_av_host_hello();

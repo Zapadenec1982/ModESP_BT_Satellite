@@ -632,13 +632,6 @@ static void bt_av_report_state(void)
     link_send_bt_state(s_now.state, s_now.codec, s_now.addr, s_now.name);
 }
 
-void bt_av_report_stream_fmt(void)
-{
-    atomic_store(&s_cover_refresh, true);
-    atomic_store(&s_cover_query, true);
-    atomic_store(&s_caps_pending, true);
-}
-
 static void send_track_meta(void *arg)
 {
     (void)arg;

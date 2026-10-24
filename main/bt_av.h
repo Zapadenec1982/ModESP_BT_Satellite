@@ -44,24 +44,23 @@ void bt_av_config_set(const satlink_bt_config_set_t *set);
 void bt_av_bond_remove(const uint8_t addr[6]);
 void bt_av_bt_refresh(void);
 
-/* Pushes everything the host needs in order to stop guessing, and is safe to call
- * at any time.
- *
- * This exists because both of these are otherwise announced exactly once, when
- * the phone connects — and a host that comes up after the phone would never hear
- * them. STREAM_FMT in particular is the one the specification says must arrive
- * before the first sample, precisely so that nobody has to measure the rate off
- * the stream. */
 /*
- * Takes the slot width the host asked for, announcing it first.
+ * Tells a host that greeted everything it needs in order to stop guessing, and
+ * takes the slot width it asked for. Safe to call at any time.
+ *
+ * The format and the cover are otherwise announced exactly once, when the phone
+ * connects -- and a host that comes up after the phone would never hear them.
+ * STREAM_FMT in particular is the one the specification says must arrive before
+ * the first sample, precisely so that nobody has to measure the rate off the
+ * stream. The width is announced before it is taken.
  *
  * Called at startup and again whenever a greeting arrives, because a host that
  * was slow to say hello used to leave the device narrow until someone power
  * cycled it. Contract 1.2 permits the change at any time provided it is
  * announced, so there is no longer a reason to wait for a reboot.
  *
- * Does nothing when the width already matches, so calling it on every HELLO is
- * free. The sample rates the stream endpoints advertise are not in its gift:
+ * When the width already matches it only repeats the announcement, so calling it
+ * on every HELLO is cheap. The sample rates the stream endpoints advertise are not in its gift:
  * those are fixed when the endpoints are registered, and a greeting that would
  * change them has the sink de-initialised and initialised again once no phone
  * is attached (main/endpoint_policy.h).
@@ -72,7 +71,6 @@ void bt_av_apply_host_caps(void);
  * phone's state, address and name, so the message is never built from a half-written
  * name. False when it could not be queued, so the caller can ask again later. */
 bool bt_av_request_state(void);
-void bt_av_report_stream_fmt(void);
 
 /*
  * Protocol 1.7. The host received this pair's cover broken and wants it again.
