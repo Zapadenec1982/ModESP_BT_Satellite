@@ -107,8 +107,8 @@ typedef struct {
      * does not allow it, so it is a fault in this build. */
     uint32_t tx_dropped_critical;
     /* Messages that must not be lost replaced, unsent, by a newer one of the same
-     * type (GPIO_IN: merged into it). Not a loss -- the host gets the newer state --
-     * but a count that climbs says the wire is behind. */
+     * type. Not a loss -- the host gets the newer state -- but a count that climbs
+     * says the wire is behind. */
     uint32_t tx_coalesced;
     uint32_t rx_bytes;             /* raw, before framing: tells a dead wire from a noisy one */
     uint32_t rx_frames;

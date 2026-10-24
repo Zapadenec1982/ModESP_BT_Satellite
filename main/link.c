@@ -218,7 +218,6 @@ static void tx_slot_count(tx_slot_result_t r)
 {
     switch (r) {
     case TX_SLOT_REPLACED:
-    case TX_SLOT_MERGED:
         s_stats.tx_coalesced++;
         break;
     case TX_SLOT_NO_SLOT:
@@ -264,9 +263,8 @@ static void tx_queue_telemetry(uint8_t type, const uint8_t *payload, size_t len)
     s_stats.tx_dropped_bulk++;
 }
 
-/* `key` matters only for ADC_VALUE: the line. */
-static void tx_send(uint8_t type, uint8_t key, const uint8_t *payload, size_t payload_len,
-                    uint32_t nonce, uint32_t generation)
+static void tx_push_tagged(uint8_t type, const uint8_t *payload, size_t payload_len,
+                           uint32_t nonce, uint32_t generation)
 {
     if (s_q_telemetry == NULL) {
         return;
@@ -290,17 +288,11 @@ static void tx_send(uint8_t type, uint8_t key, const uint8_t *payload, size_t pa
      * be any task at all. A spinlock rather than a mutex: the copy is a few hundred
      * bytes at worst, and Bluetooth callbacks must not wait. */
     portENTER_CRITICAL(&s_slot_mux);
-    tx_slot_result_t r = tx_slot_put(s_slots, LINK_SLOTS, type, key, payload, payload_len,
+    tx_slot_result_t r = tx_slot_put(s_slots, LINK_SLOTS, type, payload, payload_len,
                                      nonce, generation, &s_slot_stamp);
     portEXIT_CRITICAL(&s_slot_mux);
     tx_slot_count(r);
     tx_wake();
-}
-
-static void tx_push_tagged(uint8_t type, const uint8_t *payload, size_t payload_len,
-                           uint32_t nonce, uint32_t generation)
-{
-    tx_send(type, 0, payload, payload_len, nonce, generation);
 }
 
 static void tx_push(uint8_t type, const uint8_t *payload, size_t len)

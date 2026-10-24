@@ -128,21 +128,18 @@ static void test_abs_volume(void)
 
 /* ---------------------------------------------------------------- tx slots */
 
-static uint8_t b_state[16], b_meta[32], b_gpio[16], b_fmt[16], b_adc[2][16];
+static uint8_t b_state[16], b_meta[32], b_fmt[16];
 
 static void slots_init(tx_slot_t *t)
 {
     const tx_slot_t init[] = {
         { .type = SATLINK_MSG_BT_STATE,     .cap = sizeof b_state, .buf = b_state },
         { .type = SATLINK_MSG_TRACK_META,   .cap = sizeof b_meta,  .buf = b_meta },
-        { .type = SATLINK_MSG_GPIO_IN,      .cap = sizeof b_gpio,  .buf = b_gpio },
         { .type = SATLINK_MSG_STREAM_PREPARE, .cap = sizeof b_fmt, .buf = b_fmt },
-        { .type = SATLINK_MSG_ADC_VALUE,    .cap = sizeof b_adc[0], .buf = b_adc[0] },
-        { .type = SATLINK_MSG_ADC_VALUE,    .cap = sizeof b_adc[1], .buf = b_adc[1] },
     };
     memcpy(t, init, sizeof init);
 }
-#define NSLOTS 6
+#define NSLOTS 3
 
 typedef struct { uint8_t type; uint16_t len; uint8_t buf[64]; uint32_t nonce, gen; } taken_t;
 
@@ -160,11 +157,11 @@ static void test_slots_replace_in_order(void)
     taken_t got;
 
     const uint8_t a[] = { 'A' }, m[] = { 'M' }, b[] = { 'B', 'B' };
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_BT_STATE, 0, a, 1, 0, 0, &stamp), TX_SLOT_QUEUED);
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_TRACK_META, 0, m, 1, 0, 0, &stamp), TX_SLOT_QUEUED);
+    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_BT_STATE, a, 1, 0, 0, &stamp), TX_SLOT_QUEUED);
+    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_TRACK_META, m, 1, 0, 0, &stamp), TX_SLOT_QUEUED);
     /* The unsent BT_STATE is replaced by the newer one, which now waits behind the
      * TRACK_META queued before it. */
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_BT_STATE, 0, b, 2, 0, 0, &stamp), TX_SLOT_REPLACED);
+    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_BT_STATE, b, 2, 0, 0, &stamp), TX_SLOT_REPLACED);
 
     CHECK(take(t, &got));
     CHECK_EQ(got.type, SATLINK_MSG_TRACK_META);
@@ -175,7 +172,7 @@ static void test_slots_replace_in_order(void)
     CHECK(!take(t, &got));
 
     /* Once sent, the next one is new, not a replacement. */
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_BT_STATE, 0, a, 1, 0, 0, &stamp), TX_SLOT_QUEUED);
+    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_BT_STATE, a, 1, 0, 0, &stamp), TX_SLOT_QUEUED);
 }
 
 static void test_slots_never_lose_the_latest(void)
@@ -188,8 +185,8 @@ static void test_slots_never_lose_the_latest(void)
     unsigned replaced = 0;
     for (unsigned i = 0; i < 1000; i++) {
         uint8_t v[2] = { (uint8_t)i, (uint8_t)(i >> 8) };
-        replaced += tx_slot_put(t, NSLOTS, SATLINK_MSG_BT_STATE, 0, v, 2, 0, 0, &stamp) == TX_SLOT_REPLACED;
-        replaced += tx_slot_put(t, NSLOTS, SATLINK_MSG_TRACK_META, 0, v, 2, 0, 0, &stamp) == TX_SLOT_REPLACED;
+        replaced += tx_slot_put(t, NSLOTS, SATLINK_MSG_BT_STATE, v, 2, 0, 0, &stamp) == TX_SLOT_REPLACED;
+        replaced += tx_slot_put(t, NSLOTS, SATLINK_MSG_TRACK_META, v, 2, 0, 0, &stamp) == TX_SLOT_REPLACED;
     }
     CHECK_EQ(replaced, 2 * 999);
 
@@ -202,44 +199,6 @@ static void test_slots_never_lose_the_latest(void)
     CHECK_EQ(n, 2);
 }
 
-static void put_gpio(tx_slot_t *t, uint32_t *stamp, uint32_t values, uint32_t changed,
-                     tx_slot_result_t want)
-{
-    uint8_t p[8];
-    tx_put32(p, values);
-    tx_put32(p + 4, changed);
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_GPIO_IN, 0, p, 8, 0, 0, stamp), want);
-}
-
-static void test_slots_merge_gpio_in(void)
-{
-    tx_slot_t t[NSLOTS];
-    slots_init(t);
-    uint32_t stamp = 0;
-    taken_t got;
-
-    /* Line 0 pressed, then line 1 pressed before the first went out: the newest
-     * levels, and both lines marked changed. */
-    put_gpio(t, &stamp, 0x1, 0x1, TX_SLOT_QUEUED);
-    put_gpio(t, &stamp, 0x3, 0x2, TX_SLOT_MERGED);
-    CHECK(take(t, &got));
-    CHECK_EQ(tx_get32(got.buf), 0x3);
-    CHECK_EQ(tx_get32(got.buf + 4), 0x3);
-
-    /* Pressed and released before either went out: the level is back, and the
-     * line still says it changed. */
-    put_gpio(t, &stamp, 0x7, 0x4, TX_SLOT_QUEUED);
-    put_gpio(t, &stamp, 0x3, 0x4, TX_SLOT_MERGED);
-    CHECK(take(t, &got));
-    CHECK_EQ(tx_get32(got.buf), 0x3);
-    CHECK_EQ(tx_get32(got.buf + 4), 0x4);
-
-    /* After it went out, the next starts afresh. */
-    put_gpio(t, &stamp, 0x2, 0x1, TX_SLOT_QUEUED);
-    CHECK(take(t, &got));
-    CHECK_EQ(tx_get32(got.buf + 4), 0x1);
-}
-
 static void test_slots_format_tags(void)
 {
     tx_slot_t t[NSLOTS];
@@ -248,36 +207,14 @@ static void test_slots_format_tags(void)
     taken_t got;
     const uint8_t p[14] = { 1 };
 
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_STREAM_PREPARE, 0, p, 14, 7, 1, &stamp), TX_SLOT_QUEUED);
+    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_STREAM_PREPARE, p, 14, 7, 1, &stamp), TX_SLOT_QUEUED);
     /* A retry of a newer transaction before the first went out: its tags win, so
      * the completion recorded on the wire is the one the format machine waits for. */
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_STREAM_PREPARE, 0, p, 14, 7, 2, &stamp), TX_SLOT_REPLACED);
+    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_STREAM_PREPARE, p, 14, 7, 2, &stamp), TX_SLOT_REPLACED);
     CHECK(take(t, &got));
     CHECK_EQ(got.nonce, 7);
     CHECK_EQ(got.gen, 2);
     CHECK_EQ(got.len, 14);
-}
-
-static void test_slots_adc_per_line(void)
-{
-    tx_slot_t t[NSLOTS];
-    slots_init(t);
-    uint32_t stamp = 0;
-    taken_t got;
-    const uint8_t p[5] = { 0 };
-
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_ADC_VALUE, 3, p, 5, 0, 0, &stamp), TX_SLOT_QUEUED);
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_ADC_VALUE, 5, p, 5, 0, 0, &stamp), TX_SLOT_QUEUED);
-    /* The same line replaces its own value, never another line's. */
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_ADC_VALUE, 3, p, 5, 0, 0, &stamp), TX_SLOT_REPLACED);
-    /* Both slots busy with other lines: a fault, counted by the caller. */
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_ADC_VALUE, 7, p, 5, 0, 0, &stamp), TX_SLOT_NO_SLOT);
-    CHECK(take(t, &got));
-    CHECK(take(t, &got));
-    CHECK(!take(t, &got));
-    /* Idle again, so any line can have one. */
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_ADC_VALUE, 7, p, 5, 0, 0, &stamp), TX_SLOT_QUEUED);
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_ADC_VALUE, 3, p, 5, 0, 0, &stamp), TX_SLOT_QUEUED);
 }
 
 static void test_slots_faults_and_wrap(void)
@@ -289,19 +226,19 @@ static void test_slots_faults_and_wrap(void)
 
     /* Stamps wrap; the order does not. */
     uint32_t stamp = 0xFFFFFFFEu;
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_BT_STATE, 0, big, 1, 0, 0, &stamp), TX_SLOT_QUEUED);
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_TRACK_META, 0, big, 1, 0, 0, &stamp), TX_SLOT_QUEUED);
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_GPIO_IN, 0, big, 8, 0, 0, &stamp), TX_SLOT_QUEUED);
+    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_BT_STATE, big, 1, 0, 0, &stamp), TX_SLOT_QUEUED);
+    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_TRACK_META, big, 1, 0, 0, &stamp), TX_SLOT_QUEUED);
+    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_STREAM_PREPARE, big, 8, 0, 0, &stamp), TX_SLOT_QUEUED);
     CHECK_EQ(stamp, 1);
     CHECK(take(t, &got)); CHECK_EQ(got.type, SATLINK_MSG_BT_STATE);
     CHECK(take(t, &got)); CHECK_EQ(got.type, SATLINK_MSG_TRACK_META);
-    CHECK(take(t, &got)); CHECK_EQ(got.type, SATLINK_MSG_GPIO_IN);
+    CHECK(take(t, &got)); CHECK_EQ(got.type, SATLINK_MSG_STREAM_PREPARE);
 
     /* No slot, or too long for one: refused, and what was waiting is untouched. */
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_HELLO, 0, big, 1, 0, 0, &stamp), TX_SLOT_NO_SLOT);
+    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_HELLO, big, 1, 0, 0, &stamp), TX_SLOT_NO_SLOT);
     const uint8_t a[] = { 'A' };
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_BT_STATE, 0, a, 1, 0, 0, &stamp), TX_SLOT_QUEUED);
-    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_BT_STATE, 0, big, sizeof big, 0, 0, &stamp), TX_SLOT_TOO_LONG);
+    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_BT_STATE, a, 1, 0, 0, &stamp), TX_SLOT_QUEUED);
+    CHECK_EQ(tx_slot_put(t, NSLOTS, SATLINK_MSG_BT_STATE, big, sizeof big, 0, 0, &stamp), TX_SLOT_TOO_LONG);
     CHECK(take(t, &got));
     CHECK_EQ(got.len, 1);
     CHECK_EQ(got.buf[0], 'A');
@@ -505,9 +442,7 @@ int main(void)
     test_abs_volume();
     test_slots_replace_in_order();
     test_slots_never_lose_the_latest();
-    test_slots_merge_gpio_in();
     test_slots_format_tags();
-    test_slots_adc_per_line();
     test_slots_faults_and_wrap();
     test_slots_encode_in_place();
     test_pause_check();
