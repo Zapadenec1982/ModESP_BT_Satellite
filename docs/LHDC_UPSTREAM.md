@@ -1,3 +1,5 @@
+**English** · [Українська](LHDC_UPSTREAM.uk.md)
+
 # LHDC V5 decoder provenance
 
 Facts as found on 2026-09-21, brought up to date on 2026-10-24. This file records
@@ -6,12 +8,14 @@ legal conclusion.
 
 - Source: https://github.com/WillyBilly06/LHDC-V5-Decoder
 - Pinned commit: the one in `lhdc.pin`, `cf857ce1a1429965e161e54adbc3f293fd9ce273`.
-- **Fetched, not carried.** From 2026-09-19 to 2026-10-24 this repository held a
-  copy of `decoder/`, the component `CMakeLists.txt` and `README.md`, byte for
-  byte. Since 2026-10-24 it holds none of them: `tools/setup.sh --with-lhdc`
-  (`setup.ps1 -WithLhdc`) fetches those three paths at the pinned commit into
-  `components/lhdcv5_decoder/`, which git ignores, and the firmware builds the
-  codec only with `sdkconfig.lhdc`. The reason is the licence section below.
+- **Fetched, not carried.** From 2026-09-19 to 2026-10-24 the private repository
+  this one was opened from held a copy of `decoder/`, the component
+  `CMakeLists.txt` and `README.md`, byte for byte. Its history was rewritten
+  before it was opened, so no commit here contains them:
+  `tools/setup.sh --with-lhdc` (`setup.ps1 -WithLhdc`) fetches those three paths
+  at the pinned commit into `components/lhdcv5_decoder/`, which git ignores, and
+  the firmware builds the codec only with `sdkconfig.lhdc`. The reason is the
+  licence section below.
 - Never imported: the bundled IDF tree, applications, the proprietary encoder,
   binaries, the LDAC decoder.
 - The A2DP glue was adapted from upstream's `a2dp_integration/` into
@@ -28,7 +32,7 @@ reaches can be garbage-collected by GitHub at any time. `cf857ce1`, the head of
 `main` on 2026-10-24, has the same date and message, and its `decoder/`,
 `CMakeLists.txt`, `README.md` and `a2dp_integration/` are identical to
 `676af03d`'s blob for blob (the git object ids of all 24 files match). The copy
-this repository used to carry matched both.
+the private repository carried matched both.
 
 ## Licence: what the upstream repository actually contains
 
@@ -54,10 +58,10 @@ this repository used to carry matched both.
   library, not derived from a specification. The upstream README's grant cannot
   speak for Savitech's rights in them.
 
-## What this repository used to say, and why it no longer does
+## What the private repository used to say, and why it no longer does
 
-Until 2026-09-21 the decoder directory carried a `LICENSE` file with the Apache-2.0
-text. It was not from upstream: `vendor-review/integrate_lhdc.py` copied ESP-IDF's
+Until 2026-09-21 the decoder directory there carried a `LICENSE` file with the
+Apache-2.0 text. It was not from upstream: `vendor-review/integrate_lhdc.py` copied ESP-IDF's
 own `LICENSE` into place, and the copy still had the template's
 `Copyright [yyyy] [name of copyright owner]` line unfilled. A licence text that the
 upstream author never shipped, attributed to nobody, documents nothing, so it was
