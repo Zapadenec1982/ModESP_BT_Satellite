@@ -76,7 +76,6 @@ Windows, PowerShell:
 
 ```powershell
 . C:\Espressif\tools\Microsoft.v5.5.5.PowerShell_profile.ps1
-$env:IDF_COMPONENT_CACHE_PATH = "D:\P4_DSP\.idf_cache"
 .\tools\setup.ps1
 idf.py set-target esp32
 idf.py build
