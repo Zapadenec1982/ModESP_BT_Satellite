@@ -1,206 +1,210 @@
-# База: як нести патчі Bluetooth-стека
+**English** · [Українська](BASE.uk.md)
 
-Стоковий Bluedroid у режимі A2DP sink уміє **тільки SBC**. Усе інше — AAC, aptX, aptX HD —
-вимагає правок у самому стеку. Цей документ про те, як їх тримати.
+# The base: how the Bluetooth stack patches are carried
+
+Stock Bluedroid in A2DP sink mode can do **SBC only**. Everything else — AAC, aptX, aptX HD —
+needs changes in the stack itself. This document is about how to keep them.
 
 ---
 
-## Рішення
+## The decision
 
-**Прибитий стоковий IDF 5.5.5 + серія патчів у цьому репозиторії + скрипт, який робить
-локальний `components/bt/`.** Спільний IDF на диску не чіпається ніколи.
+**Pinned stock IDF 5.5.5 + a patch series in this repository + a script that makes a local
+`components/bt/`.** The shared IDF on disk is never touched.
 
 ```
 repo/
-  idf.pin            # v5.5.5 і хеш тега
-  patches/*.patch    # справжні unified diff, тільки правки наявних файлів
-  bt_overlay/        # цілком наші файли: каркас кодеків, декодери, libfreeaptx, Helix
-  tools/setup.ps1    # Windows; tools/setup.sh — те саме для Linux і CI
-  components/bt/     # у .gitignore, створюється скриптом
+  idf.pin            # v5.5.5 and the tag's hash
+  patches/*.patch    # real unified diffs, changes to existing files only
+  bt_overlay/        # files that are entirely ours: codec framework, decoders, libfreeaptx, Helix
+  tools/setup.ps1    # Windows; tools/setup.sh is the same for Linux and CI
+  components/bt/     # in .gitignore, made by the script
 ```
 
-Свіжий клон:
+A fresh clone:
 
-1. Активувати стоковий ESP-IDF 5.5.5. Скрипт звіряє версію з `idf.pin` і падає, якщо не та.
-2. Скопіювати `$IDF_PATH/components/bt` → `./components/bt`.
-3. `git apply patches/*.patch` по `./components/bt`. **Падати гучно** на будь-якому
-   відхиленні. (`--3way` не працює: `components/bt` у `.gitignore`, його блобів немає в
-   базі об'єктів, зливати немає з чим.)
-4. Скопіювати `bt_overlay/` поверх `./components/bt/`.
+1. Activate stock ESP-IDF 5.5.5. The script checks the version against `idf.pin` and fails if it is
+   not that one.
+2. Copy `$IDF_PATH/components/bt` → `./components/bt`.
+3. `git apply patches/*.patch` onto `./components/bt`. **Fail loudly** on any mismatch. (`--3way`
+   does not work: `components/bt` is in `.gitignore`, its blobs are not in the object database,
+   and there is nothing to merge with.)
+4. Copy `bt_overlay/` over `./components/bt/`.
 5. `idf.py set-target esp32 && idf.py build`.
 
-**Чому нові файли не в патчах.** Патч, який додає 15 000 рядків чужого кодека, не читається,
-і ховає ліцензійні заголовки — саме те, заради чого ми взагалі дивимось, звідки який кодек.
-Як файли їх можна прочитати, оцінити і звірити з апстрімом. У `patches/` іде тільки те, що
-змінює наявний код Bluedroid.
+**Why new files are not in the patches.** A patch that adds 15,000 lines of someone else's codec
+cannot be read, and it hides the licence headers — the very thing we look at to see which codec
+came from where. As files they can be read, assessed and compared with upstream. Only what changes
+existing Bluedroid code goes into `patches/`.
 
-Підняти IDF: змінити `idf.pin`, перезапустити скрипт, розрулити конфлікти, які він назве,
-закомітити оновлені патчі. `git diff` по `patches/` і є вся наша дельта.
-
----
-
-## Чому не інакше
-
-**Не вендорити ціле дерево IDF.** Так робить наступник, з якого ми беремо патчі: у нього в
-корені лежить увесь IDF 5.5.2, без сабмодуля, без пінів, плюс закомічений бінарник
-контролера на 860 КБ. Наслідок: 5.5.6 не буде ніколи, а знайти власні зміни можна лише
-поблоковим diff проти стоку, бо їх ніхто не записував.
-
-**Не патчити спільний IDF на диску.** `C:/esp/v5.5.5/esp-idf` зараз чистий, 1037 з 1037
-блобів збігаються з офіційним тегом, і він спільний з іншими проектами. Скрипт, який його
-править, ламає їх.
-
-**Не робити самий лише component override без патчів.** Перекриття працює (див. нижче), але
-мовчки: заморожена копія `bt` затуляє нову, і кожен апдейт IDF проходить повз без жодного
-слова. Серія патчів дає гучну помилку замість тихого розходження.
+To raise the IDF: change `idf.pin`, rerun the script, resolve the conflicts it names, commit the
+refreshed patches. `git diff` over `patches/` is our whole delta.
 
 ---
 
-## Component override — офіційно підтримано
+## Why not otherwise
 
-ESP-IDF v5.5, Build System guide, розділ «Multiple Components with the Same Name»: компонент
-у теці проекту має вищий пріоритет за однойменний компонент IDF, і це прямо названо способом
-перекрити компонент IDF зміненою версією. Після переміщення потрібен `idf.py reconfigure`.
+**Do not vendor the whole IDF tree.** That is what the successor fork we take the patches from
+does: its root holds the whole of IDF 5.5.2, with no submodule and no pins, plus a committed
+860 KB controller binary. The result: there will never be a 5.5.6, and its own changes can only
+be found by a block-by-block diff against stock, because nobody recorded them.
 
-Що перевірено про `bt` конкретно:
+**Do not patch the shared IDF on disk.** `C:/esp/v5.5.5/esp-idf` is clean now, 1037 of 1037 blobs
+match the official tag, and it is shared with other projects. A script that edits it breaks them.
 
-- **Бінарні блоби залишаються валідними.** `libbtdm_app.a` це **контролер**, він нижче межі
-  VHCI. Уся логіка A2DP, AVDTP, L2CAP і кодеків — це хост, тобто вихідний код. Патч хоста
-  контролер не псує.
-- **Лінкування релокабельне:** контролер підключається через
-  `${CMAKE_CURRENT_FUNCTION_LIST_DIR}/lib_esp32/esp32`, тобто копія несе свій блоб із собою.
-- **Одна пастка з абсолютним шляхом.** У
-  `components/bt/common/ble_log/extension/log_compression/CMakeLists.txt` стоїть
-  `$ENV{IDF_PATH}/components/bt`. Він читається лише під
-  `CONFIG_BLE_MESH_COMPRESSED_LOG_ENABLE` або `CONFIG_BLE_HOST_COMPRESSED_LOG_ENABLE`, обидва
-  за замовчуванням вимкнені. **Не вмикати їх.** Інакше збірка потягне файли зі стокового
-  дерева, а не з нашого.
-- Розмір: `components/bt` це 71 МБ і 1037 файлів. Тому він у `.gitignore`.
+**Do not use a component override alone, without patches.** The override works (see below), but
+silently: a frozen copy of `bt` hides the new one, and every IDF update passes by without a word.
+A patch series gives a loud error instead of a quiet divergence.
 
 ---
 
-## Скільки це коштує насправді
+## Component override — officially supported
 
-Дельта наступника проти стокового `bt`: **44 змінені файли, 2020 доданих**. Тільки в шести
-файлах 1008 змінених рядків: `bta_av_co.c` 518, `btc_av.c` 427, решта по дрібному. Правки
-сягають далеко за кодеки — `l2c_csm.c`, `l2c_link.c`, `avdt_msg.c`, `avct_l2c.c`,
-`hci_hal_h4.c`, `osi/thread.c`. Це справжній форк стека, а не обгортка кодека.
+ESP-IDF v5.5, Build System guide, section "Multiple Components with the Same Name": a component in
+the project directory takes precedence over the IDF component of the same name, and this is named
+outright as the way to override an IDF component with a modified version. After moving it,
+`idf.py reconfigure` is needed.
 
-Старіший репозиторій, з якого ми колись узяли цифру «9 рядків diff плюс 6 у btc_av.c» —
-**та цифра неправильна приблизно в 150 разів**. Реально там 23 змінені файли і 2201 змінений
-рядок, у самому `btc_av.c` 121, а не 6.
+What has been checked about `bt` specifically:
 
-Вартість супроводу, виміряна на реальному апдейті. Між **v5.5.4 і v5.5.5** у `bt` змінилось
-460 файлів із 1033, і з 23 файлів, які патч чіпає, **14 змінились у тому самому патч-релізі**,
-272 рядки. Тобто кожне підняття IDF дасть конфлікти приблизно в половині патчів.
-
-Це не привід не робити. Це привід **прибити IDF і не рухати його без причини**. Для
-персонального пристрою причина може не настати ніколи.
-
----
-
-## Офіційного шляху без патчів немає
-
-У стоковому 5.5.5 є `CONFIG_BT_A2DP_USE_EXTERNAL_CODEC` з
-`esp_a2d_sink_register_stream_endpoint()`, і Espressif називає його рекомендованим для нових
-розробок. Але він **SBC-only за побудовою**, три незалежні блоки:
-
-1. `btc_av_reg_sep()` у `btc_av.c` відхиляє все, крім `ESP_A2D_MCT_SBC`. Заголовок і сам
-   каже: «currently only supports SBC».
-2. `ESP_A2D_MAX_SEPS == 1` — одна кінцева точка, тобто анонсувати SBC і vendor-кодек
-   одночасно не вийде в принципі.
-3. `esp_a2d_mcc_t.cie` це об'єднання sbc/m12/m24/atrac на 7 байтів, **без vendor-члена**.
-   Можливість aptX (4 байти vendor ID плюс 2 байти codec ID) у цю структуру не вкладається.
-
-Константа `ESP_A2D_MCT_NON_A2DP` існує, але лише як **звітний** тип. Гачка реєстрації для
-неї немає.
-
-Також: `CONFIG_BT_A2DP_LDAC_DECODER`, `CONFIG_BT_A2DP_APTX_DECODER` і
-`CONFIG_BT_A2DP_AAC_DECODER` у стоковому 5.5.5 **не існують**. Їх вводить патч. У стоку є
-лише `BT_A2DP_ENABLE` і `BT_A2DP_USE_EXTERNAL_CODEC`.
+- **The binary blobs stay valid.** `libbtdm_app.a` is the **controller**; it is below the VHCI
+  boundary. All the logic of A2DP, AVDTP, L2CAP and the codecs is the host, that is, source code. A
+  patch to the host does not break the controller.
+- **The linking is relocatable:** the controller is linked through
+  `${CMAKE_CURRENT_FUNCTION_LIST_DIR}/lib_esp32/esp32`, so the copy carries its blob with it.
+- **One trap with an absolute path.** In
+  `components/bt/common/ble_log/extension/log_compression/CMakeLists.txt` there is
+  `$ENV{IDF_PATH}/components/bt`. It is read only under `CONFIG_BLE_MESH_COMPRESSED_LOG_ENABLE` or
+  `CONFIG_BLE_HOST_COMPRESSED_LOG_ENABLE`, both off by default. **Do not turn them on.** Otherwise
+  the build will pull files from the stock tree, not from ours.
+- Size: `components/bt` is 71 MB and 1037 files. That is why it is in `.gitignore`.
 
 ---
 
-## Друга пастка з абсолютним шляхом, і вона гірша
+## What it really costs
 
-`components/bt/Kconfig` підключає підменю так:
+The successor's delta against stock `bt`: **44 changed files, 2020 added**. Six files alone have
+1008 changed lines: `bta_av_co.c` 518, `btc_av.c` 427, the rest small. The changes reach far beyond
+the codecs — `l2c_csm.c`, `l2c_link.c`, `avdt_msg.c`, `avct_l2c.c`, `hci_hal_h4.c`, `osi/thread.c`.
+This is a real fork of the stack, not a codec wrapper.
+
+The older repository, where we once took the figure "9 lines of diff plus 6 in btc_av.c" from —
+**that figure is wrong by a factor of about 150**. In reality it is 23 changed files and 2201
+changed lines, 121 of them in `btc_av.c` itself, not 6.
+
+The cost of upkeep, measured on a real update. Between **v5.5.4 and v5.5.5**, 460 of 1033 files
+changed in `bt`, and of the 23 files the patch touches, **14 changed in that same patch release**,
+272 lines. So every IDF raise will give conflicts in about half of the patches.
+
+That is not a reason not to do it. It is a reason to **pin the IDF and not move it without a
+reason**. For a personal device that reason may never come.
+
+---
+
+## There is no official way without patches
+
+Stock 5.5.5 has `CONFIG_BT_A2DP_USE_EXTERNAL_CODEC` with `esp_a2d_sink_register_stream_endpoint()`,
+and Espressif calls it the recommended path for new development. But it is **SBC-only by
+construction**, three independent blocks:
+
+1. `btc_av_reg_sep()` in `btc_av.c` refuses everything but `ESP_A2D_MCT_SBC`. The header says so
+   itself: "currently only supports SBC".
+2. `ESP_A2D_MAX_SEPS == 1` — one endpoint, so announcing SBC and a vendor codec at the same time is
+   impossible in principle.
+3. `esp_a2d_mcc_t.cie` is a 7-byte union of sbc/m12/m24/atrac, **with no vendor member**. An aptX
+   capability (4 bytes of vendor ID plus 2 bytes of codec ID) does not fit into that structure.
+
+The constant `ESP_A2D_MCT_NON_A2DP` exists, but only as a **reporting** type. There is no
+registration hook for it.
+
+Also: `CONFIG_BT_A2DP_LDAC_DECODER`, `CONFIG_BT_A2DP_APTX_DECODER` and `CONFIG_BT_A2DP_AAC_DECODER`
+**do not exist** in stock 5.5.5. The patch introduces them. Stock has only `BT_A2DP_ENABLE` and
+`BT_A2DP_USE_EXTERNAL_CODEC`.
+
+---
+
+## A second trap with an absolute path, and it is worse
+
+`components/bt/Kconfig` pulls in the submenu like this:
 
 ```
 source "$IDF_PATH/components/bt/host/bluedroid/Kconfig.in"
 ```
 
-Це **спільне дерево**, не наша копія. Тобто **будь-який патч до `Kconfig.in` під
-`components/bt/` не читає ніхто**. Помилки не буде: збірка скаже `unknown kconfig symbol`
-одним рядком серед сотень і піде далі з вимкненим кодеком.
+That is the **shared tree**, not our copy. So **any patch to `Kconfig.in` under `components/bt/` is
+read by nobody**. There will be no error: the build says `unknown kconfig symbol` in one line among
+hundreds and carries on with the codec off.
 
-Сам `components/bt/Kconfig` читається з компонента, тому опції кодеків живуть саме в ньому.
-Перевірено: до перенесення `CONFIG_BT_A2DP_APTX_DECODER` не існував, після — працює.
-
----
-
-## Що перевірено збіркою
-
-- **Override працює.** `build/project_description.json` показує `bt` за нашим шляхом, а не за
-  шляхом IDF. Збирається, попереджень немає.
-- **Контролер не постраждав.** Блоб підключається відносним шляхом і їде з копією.
-- **Ціна кодеків у флеші:** SBC сам по собі 0xfe710; з каркасом, aptX, aptX HD і AAC —
-  0x10f580. Тобто **+68 КБ**.
-
-## Не перевірено
-
-- Чи можна викинути з копії `bt` бібліотеки контролера для інших чипів, щоб не тягти 71 МБ.
-  Виглядає безпечно (`register_bt_ctrl_libs()` гілкується по `CONFIG_IDF_TARGET_*`), але не
-  перевірено.
-- Чи домовляються aptX і AAC з реальним телефоном — відтоді перевірено: SBC, aptX і AAC грали на
-  залізі, кожен окремо, коли кодеки вище були вимкнені (коментар у `main/bt_av.c`).
-- Цифра 460/1033 роздута великою фічею `ble_log`, яка приїхала саме в 5.5.5. Несуча цифра —
-  14 з 23 файлів і 272 рядки.
+`components/bt/Kconfig` itself is read from the component, so the codec options live in it.
+Checked: before the move `CONFIG_BT_A2DP_APTX_DECODER` did not exist, after it, it works.
 
 ---
 
-## Що взято з наступника, а що ні
+## What the build has verified
 
-Дельта наступника проти стоку — це дві різні роботи в одному дереві.
+- **The override works.** `build/project_description.json` shows `bt` at our path, not at the IDF's.
+  It builds, with no warnings.
+- **The controller is unharmed.** The blob is linked by a relative path and travels with the copy.
+- **The flash cost of the codecs:** SBC alone 0xfe710; with the framework, aptX, aptX HD and AAC,
+  0x10f580. That is **+68 KB**.
 
-**Взято: архітектура кодеків.** Модель з Android — `a2dp_codec_config.c`, `a2dp_vendor.c`,
-інтерфейс декодера, по файлу на кодек. `btc_a2dp_sink.c` перестає кликати SBC напряму і
-ходить через `decoder->decode_packet()`. `bta_av_main.c` перебирає індекси кодеків.
-`bta_av_co.c` домовляється через `A2DP_BuildCodecConfig`.
+## Not verified
 
-**Не взято: обхідні шляхи під конкретний адаптер автора.** Їхні власні коментарі кажуть «for
-Realtek interop». Що саме лишилось за бортом:
+- Whether the controller libraries for other chips can be dropped from the `bt` copy, so as not to
+  drag 71 MB along. It looks safe (`register_bt_ctrl_libs()` branches on `CONFIG_IDF_TARGET_*`), but
+  it is not verified.
+- Whether aptX and AAC negotiate with a real phone — verified since: SBC, aptX and AAC played on the
+  hardware, each on its own, with the codecs above them disabled (a comment in `main/bt_av.c`).
+- The 460/1033 figure is inflated by the large `ble_log` feature, which arrived in 5.5.5 exactly. The
+  figure that matters is 14 of 23 files and 272 lines.
 
-- `l2c_csm.c` **вимикає перевірку безпеки L2CAP** для PSM 0x0019 і 0x0017;
-- `avdt_api.c` по таймеру лізе в `tL2C_CCB` і ставить `chnl_state = CST_OPEN` повз L2CAP;
-- `avct_l2c.c`, `avdt_l2c.c` прибирають MTU з ConfigReq;
-- `hci_hal_h4.c`, `packet_fragmenter.c` міняють `assert(0)` при нестачі пам'яті на тихе
-  викидання пакета;
-- `thread.c` кладе стеки задач у PSRAM, якої на WROOM немає;
-- `TRACE_DEBUG` → `TRACE_WARNING` у десятках місць.
+---
 
-**Не взято: відкат `btc_av.c` до 5.5.2.** Їхня версія цього файлу прибирає те, що Espressif
-додав після 5.5.2: обкладинки (`BTA_AV_CA_STATUS_EVT`, `BTA_AV_CA_DATA_EVT`), `conn_hdl` і
-`audio_mtu` у звітах про з'єднання. Ми обкладинки віддаємо хосту, тож файл узятий стоковий, а
-зверху накладені тільки дві потрібні зміни: узагальнений розбір конфігурації кодека і
-відповідь на переузгодження кодека у стані OPENED.
+## What was taken from the successor, and what was not
 
-**Не взято: LDAC, Opus, LC3plus, aptX LL.** LDAC — немає ліцензії. Решти немає в
-`DEVICE_SPEC.md`, а кінцева точка, яку пристрій анонсує, але не вміє назвати хосту, гірша за
-її відсутність.
+The successor's delta against stock is two different pieces of work in one tree.
 
-aptX LL 11.10.2026 перенесли (з протоколом 1.10) і того ж дня відкотили: джерела, яке б його
-слало, немає. Робота лишилась в історії — `7727564` і `7f983dc`.
+**Taken: the codec architecture.** The model from Android — `a2dp_codec_config.c`, `a2dp_vendor.c`,
+the decoder interface, one file per codec. `btc_a2dp_sink.c` stops calling SBC directly and goes
+through `decoder->decode_packet()`. `bta_av_main.c` iterates over codec indices. `bta_av_co.c`
+negotiates through `A2DP_BuildCodecConfig`.
 
-## Розбір RTP переїхав у декодери — разом з перевірками
+**Not taken: workarounds for the author's particular adapter.** Their own comments say "for Realtek
+interop". What was left out:
 
-Стоковий `avdt_scb_hdl_pkt_no_frag()` зрізає RTP-заголовок сам. З кількома кодеками так не
-можна: чистий aptX заголовка не має, aptX HD має, AAC має і зверху LATM. Розбір мусить бути в
-декодері.
+- `l2c_csm.c` **turns off the L2CAP security check** for PSM 0x0019 and 0x0017;
+- `avdt_api.c` reaches into `tL2C_CCB` on a timer and sets `chnl_state = CST_OPEN` behind L2CAP's
+  back;
+- `avct_l2c.c`, `avdt_l2c.c` remove the MTU from ConfigReq;
+- `hci_hal_h4.c`, `packet_fragmenter.c` turn `assert(0)` on allocation failure into silently
+  dropping the packet;
+- `thread.c` puts task stacks in PSRAM, which a WROOM does not have;
+- `TRACE_DEBUG` → `TRACE_WARNING` in dozens of places.
 
-Але між 5.5.2 і 5.5.5 Espressif цю функцію зміцнив — кожне поле, яке рухає зміщення,
-звіряється з довжиною пакета. Наступник зрізаний з 5.5.2 і переніс версію **без перевірок**, з
-двома читаннями за межами буфера на додачу: `(uint16_t*)(header + header_len + 2)` множить
-арифметику на розмір структури, а байт доповнення читається з `len`, а не з `len - 1`.
+**Not taken: the rollback of `btc_av.c` to 5.5.2.** Their version of that file removes what
+Espressif added after 5.5.2: cover art (`BTA_AV_CA_STATUS_EVT`, `BTA_AV_CA_DATA_EVT`), `conn_hdl` and
+`audio_mtu` in the connection reports. We hand cover art to the host, so the file is taken from
+stock, with only the two changes that are needed on top: generalised parsing of the codec
+configuration, and answering a codec renegotiation in the OPENED state.
 
-Тому перевірки переїхали разом з розбором, у спільну `a2dp_rtp_strip_header()`
-(`bt_overlay/host/bluedroid/stack/a2dp/a2dp_rtp.c`). Усі декодери ходять через неї.
+**Not taken: LDAC, Opus, LC3plus, aptX LL.** LDAC has no licence. The rest are not in
+`DEVICE_SPEC.md`, and an endpoint the device announces but cannot name to the host is worse than
+none.
+
+aptX LL was carried over on 11.10.2026 (with protocol 1.10) and reverted the same day: there is no
+source that would send it. The work stays in the history — `7727564` and `7f983dc`.
+
+## RTP parsing moved into the decoders — together with its checks
+
+Stock `avdt_scb_hdl_pkt_no_frag()` strips the RTP header itself. With several codecs that will not
+do: plain aptX has no header, aptX HD has one, AAC has one with LATM on top. The parsing has to be
+in the decoder.
+
+But between 5.5.2 and 5.5.5 Espressif hardened that function — every field that moves the offset is
+checked against the packet length. The successor was cut from 5.5.2 and carried over the version
+**without the checks**, with two out-of-bounds reads on top: `(uint16_t*)(header + header_len + 2)`
+multiplies the arithmetic by the size of the type, and the padding byte is read from `len`, not
+`len - 1`.
+
+So the checks moved together with the parsing, into the shared `a2dp_rtp_strip_header()`
+(`bt_overlay/host/bluedroid/stack/a2dp/a2dp_rtp.c`). Every decoder goes through it.
