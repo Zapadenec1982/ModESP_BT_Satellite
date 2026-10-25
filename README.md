@@ -27,15 +27,16 @@ No Wi-Fi, no network, no screen, no files, no OTA, no GPIO for the host.
 
 | | |
 |---|---|
-| [`docs/DEVICE_SPEC.md`](docs/DEVICE_SPEC.md) | the device: hardware, pins, codecs, I2S, behaviour, customer decisions |
+| [`docs/DEVICE_SPEC.md`](docs/DEVICE_SPEC.md) ([українською](docs/DEVICE_SPEC.uk.md)) | the device: hardware, pins, codecs, I2S, behaviour, customer decisions |
 | [`docs/PROTOCOL.md`](docs/PROTOCOL.md) ([українською](docs/PROTOCOL.uk.md)) | the link to the host, byte by byte, version 1.10 |
-| [`docs/BASE.md`](docs/BASE.md) | why the Bluetooth stack is patched and how the patches are carried |
-| [`patches/README.md`](patches/README.md) | what each stack patch does |
-| [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | third-party code in the image and its terms, as found |
+| [`docs/BASE.md`](docs/BASE.md) ([українською](docs/BASE.uk.md)) | why the Bluetooth stack is patched and how the patches are carried |
+| [`patches/README.md`](patches/README.md) ([українською](patches/README.uk.md)) | what each stack patch does |
+| [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) ([українською](THIRD_PARTY_NOTICES.uk.md)) | third-party code in the image and its terms, as found |
+| [`docs/LHDC_UPSTREAM.md`](docs/LHDC_UPSTREAM.md) ([українською](docs/LHDC_UPSTREAM.uk.md)) | where the LHDC V5 decoder comes from, and why it is fetched rather than carried |
 
-The specification is written in Ukrainian. The protocol is in English with a Ukrainian copy
-(`PROTOCOL.uk.md`), and it is a shared contract: word-for-word copies live in the host's
-repository, and they change together. The host this was built for is
+Every document is in English, with a Ukrainian copy beside it (`.uk.md`) that says the same thing
+in the same structure; the English is the primary text. The protocol is a shared contract:
+word-for-word copies of both languages live in the host's repository, and they change together. The host this was built for is
 [ModESP Streamer](https://github.com/Zapadenec1982/ModESP_Streamer), a network streamer on the
 ESP32-P4; its copies are `docs/LINK_PROTOCOL.md` and `docs/LINK_PROTOCOL.uk.md` there.
 
@@ -62,7 +63,7 @@ The same firmware has a second configuration for the **bare module**: the link m
 TX 1 and RX 3, the pair the ROM bootloader listens on, so the host both flashes the device and
 talks to it over the same two wires (and drives EN and IO0). The console is off there. It is a
 Kconfig choice (`SAT_LINK_PORT`) made by building with `sdkconfig.bare`; see
-[`docs/DEVICE_SPEC.md`](docs/DEVICE_SPEC.md), "Голий модуль".
+[`docs/DEVICE_SPEC.md`](docs/DEVICE_SPEC.md), "Bare module".
 
 The CPU runs at 240 MHz: at 160 the aptX decoder could not keep up.
 
