@@ -28,14 +28,15 @@
 | | |
 |---|---|
 | [`docs/DEVICE_SPEC.md`](docs/DEVICE_SPEC.md) | пристрій: залізо, піни, кодеки, I2S, поведінка, рішення замовника |
-| [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | лінк із хостом байт за байтом, версія 1.10 |
+| [`docs/PROTOCOL.uk.md`](docs/PROTOCOL.uk.md) ([англійською](docs/PROTOCOL.md)) | лінк із хостом байт за байтом, версія 1.10 |
 | [`docs/BASE.md`](docs/BASE.md) | чому стек Bluetooth патчиться і як ці патчі нести |
 | [`patches/README.md`](patches/README.md) | що робить кожен патч стека |
 | [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | сторонній код в образі та його умови, як вони записані у файлах |
 
-`PROTOCOL.md` — спільний контракт: копія слово в слово живе в репозиторії хоста, і міняються вони
-разом. Хост, для якого це зроблено, — [ModESP Streamer](https://github.com/Zapadenec1982/ModESP_Streamer),
-мережевий стример на ESP32-P4; його копія там — `docs/LINK_PROTOCOL.md`.
+Протокол написаний англійською (`PROTOCOL.md`) з українською копією (`PROTOCOL.uk.md`) і є
+спільним контрактом: копії слово в слово живуть у репозиторії хоста, і міняються вони разом. Хост,
+для якого це зроблено, — [ModESP Streamer](https://github.com/Zapadenec1982/ModESP_Streamer),
+мережевий стример на ESP32-P4; його копії там — `docs/LINK_PROTOCOL.md` і `docs/LINK_PROTOCOL.uk.md`.
 
 Прогалина в специфікації — це питання до замовника, а не привід шукати відповідь у сусідній теці.
 

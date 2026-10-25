@@ -1,296 +1,315 @@
+**English** · [Українська](PROTOCOL.uk.md)
+
+# Device–host link protocol
+
 <!--
-  Спільний контракт двох прошивок. Документ існує у двох копіях, однакових слово в слово:
-  docs/LINK_PROTOCOL.md у репозиторії плеєра (хост, ESP32-P4) і docs/PROTOCOL.md у репозиторії
-  сателіта (пристрій, ESP32). Жодна зі сторін не залежить від того, чи є на диску тека іншої.
-  tools/check_protocol_mirror.py у репозиторії плеєра порівнює обидві копії разом зі спільними
-  заголовками; різниця CRLF/LF не рахується, будь-яка інша — так.
+  The shared contract of two firmwares. The document is written in English and Ukrainian, and each
+  language exists in two copies: docs/LINK_PROTOCOL.md (English) and docs/LINK_PROTOCOL.uk.md
+  (Ukrainian) in the player repository (host, ESP32-P4), docs/PROTOCOL.md (English) and
+  docs/PROTOCOL.uk.md (Ukrainian) in the satellite repository (device, ESP32). The copies of one
+  language are identical word for word except the first line, whose link points at the other
+  language's file in its own repository. Both languages say the same thing with the same
+  structure. Neither side depends on whether the other's tree is on disk.
+  tools/check_protocol_mirror.py in the player repository compares the copies together with the
+  shared headers; a CRLF/LF difference does not count, any other does.
 
-  Правити обидві копії одночасно. Зміна того, що йде по дроту, піднімає proto_minor; редакційна
-  правка без зміни дроту — ні. Розбіжність між копіями — це зламаний лінк, а не дрібниця
-  форматування.
+  Edit all four copies at once. A change to what goes over the wire raises proto_minor; an
+  editorial edit that does not change the wire does not. A mismatch between copies is a broken
+  link, not a formatting nit.
 
-  Реалізації: пристрій — components/satlink і main/link.c, тести tests/host/;
-  хост — components/sat_link і modules/bt, тести tests/host/test_sat_link.cpp.
-  Спільні файли, однакові в обох репозиторіях: заголовки format_sync.h і cover_wire.h
-  (components/satlink/include/satlink/ у сателіті, components/sat_link/include/sat_link/ у
-  плеєрі) і tests/host/format_sync_cases.h.
+  Implementations: device — components/satlink and main/link.c, tests tests/host/;
+  host — components/sat_link and modules/bt, tests tests/host/test_sat_link.cpp.
+  Shared files, identical in both repositories: the headers format_sync.h and cover_wire.h
+  (components/satlink/include/satlink/ in the satellite, components/sat_link/include/sat_link/ in
+  the player) and tests/host/format_sync_cases.h.
 -->
 
-# Протокол лінка «пристрій — хост»
+Version **1.10**. The frame, version and capability negotiation, every message with its layout and
+rules, audio format transitions, queues, and compatibility between versions.
 
-Версія **1.10**. Кадр, узгодження версій і можливостей, кожне повідомлення з розкладкою й
-правилами, переходи формату звуку, черги й сумісність різних версій.
+The **device** (D) is an ESP32 board that receives audio from a phone over Bluetooth. The **host**
+(H) is another microcontroller that plays that audio and shows the state. Two channels connect
+them:
 
-**Пристрій** (D) — плата ESP32, яка приймає звук з телефона по Bluetooth. **Хост** (H) — інший
-мікроконтролер, який цей звук грає й показує стан. Між ними два канали:
+- **I2S** — audio, D → H only. Lines BCLK, WS, DATA, Philips I2S format, stereo, no MCLK. The
+  device drives DATA; BCLK and WS are driven by whichever side clocks the link (3.5).
+- **UART** — everything else, both ways. This document is about it, and about the rules that tie
+  it to I2S: format announcements and which side clocks.
 
-- **I2S** — звук, лише D → H. Лінії BCLK, WS, DATA, формат Philips I2S, стерео, без MCLK. DATA веде
-  пристрій; BCLK і WS — той, хто тактує лінк (3.5).
-- **UART** — усе інше, в обидва боки. Про нього цей документ, а також про правила, що
-  пов'язують його з I2S: оголошення формату й те, хто тактує.
+Four principles from which the rest follows:
 
-Чотири принципи, з яких випливає решта:
-
-1. **Звук важливіший за телеметрію.** Жодна робота на лінку не має права зупинити чи порвати
-   потік I2S.
-2. **Ніхто не блокується на лінку.** Якщо другий бік не читає, телеметрія відкидається, а не
-   чекає.
-3. **Мовчазний хост — не аварія.** Немає `PONG` — пристрій грає далі й накопичує стан. Виняток —
-   перехід формату, який чекає підтвердження: його без підтвердження не завершує ніхто.
-4. **Різні версії — нормальний випадок.** Плати прошиваються окремо, тож кожна пара версій
-   визначена, а новий біт можливостей діє лише тоді, коли його оголосили обидва боки.
-
----
-
-## 1. Фізичний рівень
-
-- UART **460800 бод, 8N1**, без апаратного керування потоком.
-- TX пристрою з'єднано з RX хоста, і навпаки. Номери пінів — справа кожної плати.
-- Приймач мусить мати запас буфера і окремий лічильник переповнень: без керування потоком байти,
-  які приймач не встиг забрати, губляться разом зі своїми кадрами. Пристрій тримає 4 × 1048
-  байтів (близько 90 мс) і ставить задачу прийому вище за аудіороботу. Хост тримає в драйвері
-  8192 байти (близько 180 мс) і читає їх окремою задачею (розділ 13).
+1. **Audio matters more than telemetry.** No work on the link may stop or break the I2S
+   stream.
+2. **Nobody blocks on the link.** If the other side is not reading, telemetry is dropped, not
+   kept waiting.
+3. **A silent host is not a failure.** No `PONG` — the device keeps playing and keeps
+   accumulating state. The exception is a format transition awaiting acknowledgement: nobody
+   completes it without the acknowledgement.
+4. **Different versions are the normal case.** The boards are flashed separately, so every pair of
+   versions is defined, and a new capability bit takes effect only when both sides have announced
+   it.
 
 ---
 
-## 2. Кадр
+## 1. Physical layer
+
+- UART **460800 baud, 8N1**, no hardware flow control.
+- The device's TX is connected to the host's RX, and vice versa. Pin numbers are up to each
+  board.
+- The receiver must have buffer headroom and a separate overflow counter: without flow control,
+  bytes the receiver has not picked up in time are lost together with their frames. The device
+  holds 4 × 1048 bytes (about 90 ms) and gives its receive task a higher priority than the audio
+  work. The host holds 8192 bytes in the driver (about 180 ms) and reads them with a separate task
+  (section 13).
+
+---
+
+## 2. Frame
 
 ```
 0x00 | COBS( type:u8 | seq:u8 | payload… | crc16:u16 ) | 0x00
 ```
 
-- **`0x00` — роздільник.** Усередині кадру нулів немає за побудовою COBS, тому приймач
-  синхронізується з першого ж роздільника після ввімкнення.
-- **Провідний `0x00` необов'язковий:** кадри впритул ділять один роздільник. Обидві сторони шлють
-  обидва роздільники. Порожні кадри між роздільниками приймач ігнорує.
-- **Розміри.** Декодований кадр (`type | seq | payload | crc16`) — **не більше 1040 байтів**, тож
-  payload до **1036**. Приймальний буфер на дроті — **1048 байтів**, і це не те саме число: COBS
-  у найгіршому випадку додає `ceil(n / 254)` байтів, тобто 1040 + 5 = 1045, плюс два
-  роздільники — 1047, округлено до 1048. Обидві реалізації заводять саме 1048.
-- **Завеликий кадр** приймач відкидає до наступного `0x00` і **не втрачає синхронізацію**. Саме
-  для цього тут COBS.
-- **`crc16`** — CRC-16/CCITT-FALSE: поліном `0x1021`, початкове `0xFFFF`, без відображення й
-  без фінального XOR, над `type | seq | payload` до кодування; на дроті little-endian. Кадр з
-  поганою CRC відкидається.
-- **`seq`** — `u8`, росте по колу окремо в кожному напрямку з кожним надісланим кадром. Приймач
-  рахує розриви, але повторів не просить: повторної передачі в протоколі немає.
+- **`0x00` is the delimiter.** By construction of COBS there are no zeros inside a frame, so the
+  receiver synchronises on the very first delimiter after power-up.
+- **The leading `0x00` is optional:** back-to-back frames share one delimiter. Both sides send
+  both delimiters. The receiver ignores empty frames between delimiters.
+- **Sizes.** A decoded frame (`type | seq | payload | crc16`) is **at most 1040 bytes**, so the
+  payload is up to **1036**. The receive buffer on the wire is **1048 bytes**, and that is not the
+  same number: in the worst case COBS adds `ceil(n / 254)` bytes, i.e. 1040 + 5 = 1045, plus two
+  delimiters — 1047, rounded up to 1048. Both implementations allocate exactly 1048.
+- **An oversize frame** is discarded by the receiver up to the next `0x00`, and the receiver **does
+  not lose synchronisation**. That is what COBS is here for.
+- **`crc16`** — CRC-16/CCITT-FALSE: polynomial `0x1021`, initial `0xFFFF`, no reflection and no
+  final XOR, over `type | seq | payload` before encoding; little-endian on the wire. A frame with a
+  bad CRC is discarded.
+- **`seq`** — `u8`, wraps around, incremented separately in each direction with every frame sent.
+  The receiver counts gaps but does not ask for repeats: the protocol has no retransmission.
 
-### Типи полів
+### Field types
 
-| Позначення | Що це |
+| Notation | Meaning |
 |---|---|
-| `u8`, `u16`, `u32` | беззнакові цілі, **little-endian** |
-| `str` | `u16 len`, далі `len` байтів UTF-8 без завершального нуля. Порожній рядок — `len = 0` і означає «невідомо» |
-| `u8 x[n]` | `n` байтів як є |
+| `u8`, `u16`, `u32` | unsigned integers, **little-endian** |
+| `str` | `u16 len`, then `len` bytes of UTF-8 with no terminating zero. An empty string is `len = 0` and means "unknown" |
+| `u8 x[n]` | `n` bytes as is |
 
-### Що приймач робить із незрозумілим
+### What the receiver does with what it does not understand
 
-- **Невідомий тип** ігнорується; пристрій його ще й рахує. Тому новий тип ніколи не ламає старшу
-  сторону.
-- **Payload, коротший за розкладку**, відкидається повністю.
-- **Зайві байти в кінці payload.** Пристрій відкидає такий payload повністю й рахує його: зайві
-  байти означають, що сторони розходяться в розкладці. Хост точну довжину перевіряє лише в
-  `STREAM_PREPARE`, `COVER_RESET` і `COVER_END` і такий кадр відкидає; в інших повідомленнях зайві
-  байти ігнорує.
-- **Значення поза діапазоном** — за правилами конкретного повідомлення нижче.
-- На жоден кадр немає NACK: у протоколі немає пар «запит — відповідь» з гарантією доставки.
+- **An unknown type** is ignored; the device also counts it. So a new type never breaks the older
+  side.
+- **A payload shorter than the layout** is discarded entirely.
+- **Extra bytes at the end of a payload.** The device discards such a payload entirely and counts
+  it: extra bytes mean the sides disagree on the layout. The host checks the exact length only in
+  `STREAM_PREPARE`, `COVER_RESET` and `COVER_END` and discards such a frame; in other messages it
+  ignores the extra bytes.
+- **Out-of-range values** — per the rules of the specific message below.
+- There is no NACK for any frame: the protocol has no request–response pairs with guaranteed
+  delivery.
 
 ---
 
-## 3. Узгодження: `HELLO`
+## 3. Negotiation: `HELLO`
 
-### `0x01` HELLO, обидва напрямки
+### `0x01` HELLO, both directions
 
 ```
 u8   proto_major      // 1
-u8   proto_minor      // версія цього документа, якої дотримується відправник
-u32  caps             // біти можливостей відправника, свої для кожної сторони (нижче)
-str  build            // збірка відправника, наприклад "sat 0.1.0 v5.5.5"; лише для людей
+u8   proto_minor      // the version of this document the sender follows
+u32  caps             // the sender's capability bits, specific to each side (below)
+str  build            // the sender's build, e.g. "sat 0.1.0 v5.5.5"; for humans only
 ```
 
-### Коли шлеться
+### When it is sent
 
-- **Кожна сторона шле `HELLO` після старту і у відповідь на чужий `HELLO`.** Хост шле свій перший
-  приблизно через секунду після старту, а якщо `HELLO` пристрою прийшов раніше — одразу у
-  відповідь. Після обміну обидві працюють за меншим `proto_minor` з двох.
-- **Пристрій повторює свій `HELLO` раз на секунду**, доки не почує `HELLO` хоста. Втрачене
-  привітання так не лишає щойно перезапущений пристрій у старому режимі. Те, що `PING`/`PONG`
-  ходять, ще не означає, що можливостями обмінялись.
-- **Хост повторює свій `HELLO` раз на секунду, поки лінк не піднятий**: до першого `HELLO`
-  пристрою з тим самим `proto_major` і після втрати лінка (розділ 4). Перше привітання хоста могло
-  потрапити в секундне вікно пристрою (нижче) і лишитись без відповіді, а без можливостей
-  пристрою, зокрема біта 8, хост не тактує I2S. На повтор, що прийшов після вікна, пристрій
-  відповідає.
-- **Хост шле `HELLO` поза обмеженням частоти**, коли лінк щойно піднявся і коли змінились його
-  власні `caps` (біт 7, розділ 9). Решту відповідей на `HELLO` пристрою він шле не частіше разу на
-  секунду.
-- **Усі `HELLO` пристрою — стартовий, повтори й відповіді — йдуть не частіше разу на секунду.**
-  `HELLO` хоста, що прийшов менш як за секунду після попереднього `HELLO` пристрою, окремої
-  відповіді не отримає: свіжий `HELLO` пристрою в хоста вже є, а якщо хост його пропустив, то
-  отримає відповідь на свій повтор. Виняток — коли змінились власні `caps` пристрою (розділ 3.4):
-  тоді відповідь іде одразу.
-- **Пристрій ігнорує `HELLO` своєї ж версії з власним рядком `build`**, хай які в ньому `caps`.
-  Так лінк, замкнутий сам на себе, не вважає себе хостом.
+- **Each side sends `HELLO` after start-up and in reply to the other's `HELLO`.** The host sends
+  its first one about a second after start-up, or straight away in reply if the device's `HELLO`
+  arrived earlier. After the exchange both work at the lower `proto_minor` of the two.
+- **The device repeats its `HELLO` once a second** until it hears the host's `HELLO`. That way a
+  lost greeting does not leave a freshly restarted device in the old mode. `PING`/`PONG` getting
+  through does not yet mean that capabilities have been exchanged.
+- **The host repeats its `HELLO` once a second while the link is not up**: until the first device
+  `HELLO` with the same `proto_major`, and after the link is lost (section 4). The host's first
+  greeting could land in the device's one-second window (below) and go unanswered, and without the
+  device's capabilities, bit 8 in particular, the host does not clock I2S. The device answers a
+  repeat that arrives after the window.
+- **The host sends `HELLO` outside the rate limit** when the link has just come up and when its
+  own `caps` have changed (bit 7, section 9). It sends its other replies to the device's `HELLO` no
+  more than once a second.
+- **All device `HELLO`s — the start-up one, repeats and replies — go no more than once a second.**
+  A host `HELLO` that arrives less than a second after the device's previous `HELLO` gets no
+  separate reply: the host already has a fresh device `HELLO`, and if the host missed it, it will
+  get a reply to its repeat. The exception is when the device's own `caps` have changed
+  (section 3.4): then the reply goes immediately.
+- **The device ignores a `HELLO` of its own version with its own `build` string**, whatever `caps`
+  it carries. That way a link looped back on itself does not take itself for a host.
 
-### Різний `proto_major`
+### Different `proto_major`
 
-Несумісність. Лінк не піднімається.
+Incompatible. The link does not come up.
 
-- **Пристрій** пише помилку в `LOG`, далі шле лише `HELLO`, `PING`, `PONG` і `LOG`, а з
-  отриманого обробляє лише `HELLO`, `PING` і `PONG`; решту рахує й відкидає.
-- **Хост** пише помилку у власний журнал, повторює `HELLO` раз на секунду й відповідає `PONG` на
-  `PING`. `PING` та інших повідомлень він не шле.
+- **The device** writes an error to `LOG`, from then on sends only `HELLO`, `PING`, `PONG` and
+  `LOG`, and of what it receives handles only `HELLO`, `PING` and `PONG`; the rest it counts and
+  discards.
+- **The host** writes an error to its own log, repeats `HELLO` once a second and answers `PING`
+  with `PONG`. It sends neither `PING` nor other messages.
 
-Хост при цьому BCLK і WS не веде (3.5), а формату пристрій йому не оголошує, тож звуку Bluetooth
-хост не грає (6.1).
+In this state the host does not drive BCLK and WS (3.5), and the device announces no format to it,
+so the host plays no Bluetooth audio (6.1).
 
-### 3.1 Можливості пристрою
+### 3.1 Device capabilities
 
-| Біт | Назва | З версії | Значення |
+| Bit | Name | Since | Meaning |
 |---|---|---|---|
-| 0 | A2DP_SINK | 1.0 | приймає A2DP |
-| 1 | AVRCP_META | 1.0 | метадані AVRCP: `TRACK_META`, `TRACK_POS` |
-| 2 | ABS_VOLUME | 1.0 | абсолютна гучність AVRCP: `VOLUME_STATE`, `CMD_VOLUME` |
-| 3 | COVER_ART | 1.0 | обкладинка |
-| 4 | — | | зарезервований, завжди 0 (розділ 11) |
-| 5 | — | | зарезервований, завжди 0 (розділ 11) |
-| 6 | COVER_RETRY | 1.7 | виконує `COVER_RETRY`. Лише разом із бітом 3 |
-| 7 | BT_SETTINGS | 1.8 | шле `0x1A`–`0x1D` і розуміє `0x25`–`0x28` |
-| 8 | I2S_SLAVE | 1.9 | I2S пристрою зараз slave: веде лише DATA, BCLK і WS бере від хоста. **Лише поки це правда** |
+| 0 | A2DP_SINK | 1.0 | receives A2DP |
+| 1 | AVRCP_META | 1.0 | AVRCP metadata: `TRACK_META`, `TRACK_POS` |
+| 2 | ABS_VOLUME | 1.0 | AVRCP absolute volume: `VOLUME_STATE`, `CMD_VOLUME` |
+| 3 | COVER_ART | 1.0 | cover art |
+| 4 | — | | reserved, always 0 (section 11) |
+| 5 | — | | reserved, always 0 (section 11) |
+| 6 | COVER_RETRY | 1.7 | executes `COVER_RETRY`. Only together with bit 3 |
+| 7 | BT_SETTINGS | 1.8 | sends `0x1A`–`0x1D` and understands `0x25`–`0x28` |
+| 8 | I2S_SLAVE | 1.9 | the device's I2S is slave right now: drives only DATA, takes BCLK and WS from the host. **Only while this is true** |
 
-Біт 6 пристрою і біт 6 хоста — різні слова з різними значеннями; збіг номерів випадковий.
+Device bit 6 and host bit 6 sit in different words and mean different things; the matching
+numbers are a coincidence.
 
-### 3.2 Можливості хоста
+### 3.2 Host capabilities
 
-| Біт | Назва | З версії | Потребує | Значення |
+| Bit | Name | Since | Requires | Meaning |
 |---|---|---|---|---|
-| 0 | RELOCK | 1.0 | | уміє переналаштувати прийом I2S на льоту за оголошенням формату |
-| 1 | COVER | 1.0 | | хоче обкладинку (розділ 10) |
-| 2 | — | | | зарезервований: хост не виставляє, пристрій ігнорує (розділ 11) |
-| 3 | WIDE | 1.1 | | приймає 32-бітні слоти |
-| 4 | FORMAT_READY | 1.3 | | підтверджує переходи формату (`STREAM_READY`) |
-| 5 | 96KHZ | 1.4 | 0, 4 | приймає 96 кГц у стерео-слотах 16 або 32 біти |
-| 6 | COVER_STREAM | 1.6 | 1 | приймає потокові обкладинки з `COVER_END` |
-| 7 | PAIR_CONFIRM | 1.8 | | показує запит на спарювання і відповідає `PAIR_REPLY` |
-| 8 | I2S_MASTER | 1.9 | 0, 3 | хост тактує лінк: BCLK і WS на оголошеній частоті, слоти 32 біти |
+| 0 | RELOCK | 1.0 | | can reconfigure I2S reception on the fly on a format announcement |
+| 1 | COVER | 1.0 | | wants cover art (section 10) |
+| 2 | — | | | reserved: the host does not set it, the device ignores it (section 11) |
+| 3 | WIDE | 1.1 | | accepts 32-bit slots |
+| 4 | FORMAT_READY | 1.3 | | acknowledges format transitions (`STREAM_READY`) |
+| 5 | 96KHZ | 1.4 | 0, 4 | accepts 96 kHz in 16- or 32-bit stereo slots |
+| 6 | COVER_STREAM | 1.6 | 1 | accepts streamed cover art with `COVER_END` |
+| 7 | PAIR_CONFIRM | 1.8 | | shows the pairing request and answers with `PAIR_REPLY` |
+| 8 | I2S_MASTER | 1.9 | 0, 3 | the host clocks the link: BCLK and WS at the announced rate, 32-bit slots |
 
-### 3.3 Як пристрій читає можливості хоста
+### 3.3 How the device reads the host's capabilities
 
-Біт діє, лише якщо хост оголосив версію, у якій біт з'явився, і біти, яких він потребує. Решту
-пристрій скидає ще до того, як щось вирішувати, у такому порядку:
+A bit takes effect only if the host has announced the version in which the bit appeared, and the
+bits it requires. The device clears the rest before deciding anything, in this order:
 
-| Біт | Скидається, якщо |
+| Bit | Cleared if |
 |---|---|
 | 4 FORMAT_READY | `proto_minor` < 3 |
-| 5 96KHZ | `proto_minor` < 4, або біт 4 (після попереднього рядка) нуль, або біт 0 нуль |
+| 5 96KHZ | `proto_minor` < 4, or bit 4 (after the previous row) is zero, or bit 0 is zero |
 | 1 COVER | `proto_minor` < 5 |
-| 6 COVER_STREAM | `proto_minor` < 6, або біт 1 (після попереднього рядка) нуль |
+| 6 COVER_STREAM | `proto_minor` < 6, or bit 1 (after the previous row) is zero |
 | 7 PAIR_CONFIRM | `proto_minor` < 8 |
-| 8 I2S_MASTER | `proto_minor` < 9, або біт 0 нуль, або біт 3 нуль |
+| 8 I2S_MASTER | `proto_minor` < 9, or bit 0 is zero, or bit 3 is zero |
 
-Біти 0 і 3 не скидаються ніколи. Біт 3 сам і є узгодженням: хост, який 32-бітних слотів не
-приймає, його не виставляє за будь-якої версії, тож пристрій дивиться на біт, а не на версію.
+Bits 0 and 3 are never cleared. Bit 3 is itself the negotiation: a host that does not accept
+32-bit slots does not set it at any version, so the device looks at the bit, not at the version.
 
-Хост так само скидає біти пристрою, отримавши його `HELLO`:
+The host likewise clears the device's bits when it receives its `HELLO`:
 
-| Біт | Скидається, якщо |
+| Bit | Cleared if |
 |---|---|
-| 6 COVER_RETRY | `proto_minor` < 7, або біт 3 нуль |
+| 6 COVER_RETRY | `proto_minor` < 7, or bit 3 is zero |
 | 7 BT_SETTINGS | `proto_minor` < 8 |
 | 8 I2S_SLAVE | `proto_minor` < 9 |
-| 4, 5 | завжди (розділ 11) |
+| 4, 5 | always (section 11) |
 
-### 3.4 Що пристрій робить на `HELLO` хоста
+### 3.4 What the device does on the host's `HELLO`
 
-Кожен `HELLO` хоста пристрій сприймає як можливий перезапуск хоста і розповідає йому все наново:
+The device treats every host `HELLO` as a possible host restart and tells it everything again:
 
-1. **Роль I2S** (1.9): стає slave з бітом 8 хоста або майстром без нього. Це робиться **до**
-   відповіді, і якщо роль змінилась, відповідь зі зміненим бітом 8 іде без обмеження частоти.
-2. **`HELLO`** у відповідь, з обмеженням частоти вище.
-3. **Формат.** Якщо потік є, пристрій перераховує ширину слота. Якщо нічого не змінилось, він
-   повторює поточне оголошення з тими самими ідентифікаторами. Якщо змінились ширина, режим
-   підтвердження чи дозвіл на 96 кГц, починається новий перехід (розділ 6).
-4. **Метадані й обкладинка.** Пристрій заново читає метадані в телефона, тож `TRACK_META`
-   повториться. Якщо обкладинки узгоджено, він починає обкладинку з **нового** покоління:
-   `COVER_RESET` і повна передача заново, а передача, що йшла, обривається без `COVER_END`.
-5. **Налаштування Bluetooth** (хосту з `proto_minor` >= 8): `BT_CONFIG`, `BOND_LIST` і повтор
-   активного `PAIR_REQUEST`.
-6. **`BT_STATE`**, але не частіше разу на 10 с.
+1. **I2S role** (1.9): becomes slave with host bit 8, or master without it. This is done **before**
+   the reply, and if the role has changed, the reply with the changed bit 8 goes without the rate
+   limit.
+2. **`HELLO`** in reply, with the rate limit above.
+3. **Format.** If there is a stream, the device recomputes the slot width. If nothing has changed,
+   it repeats the current announcement with the same identifiers. If the width, the
+   acknowledgement mode or the 96 kHz permission has changed, a new transition begins (section 6).
+4. **Metadata and cover art.** The device re-reads the metadata from the phone, so `TRACK_META`
+   will repeat. If cover art is negotiated, it starts the cover art from a **new** generation:
+   `COVER_RESET` and a full transfer again, and a transfer in progress is cut off without
+   `COVER_END`.
+5. **Bluetooth settings** (to a host with `proto_minor` >= 8): `BT_CONFIG`, `BOND_LIST` and a
+   repeat of the active `PAIR_REQUEST`.
+6. **`BT_STATE`**, but no more than once every 10 s.
 
-Тому періодичний `HELLO` від хоста коштує дорого: кожен перезапускає обкладинку. `HELLO`
-потрібен хосту на старті й після власного перезапуску, а повтори — лише доти, доки не прийде
-`HELLO` пристрою.
+That is why a periodic `HELLO` from the host is expensive: each one restarts the cover art. The host
+needs `HELLO` at start-up and after its own restart, and repeats of it only until the device's
+`HELLO` arrives.
 
-### 3.5 Хто тактує I2S (1.9)
+### 3.5 Who clocks I2S (1.9)
 
-Лінк може тактувати хост: кадр, який хост відлічує сам, загубитись не може, а як slave на 96 кГц /
-32 біти хост отримує не всі кадри, які несуть піни пристрою.
+The host can clock the link: a frame the host counts out itself cannot be lost, whereas as a slave
+at 96 kHz / 32 bits the host does not receive every frame the device's pins carry.
 
-- **Пристрій стартує slave** і веде тільки DATA. Нічого з того, що може вести хост, він не веде,
-  тож до першого `HELLO` на лінії немає двох драйверів.
-- **`HELLO` хоста з бітом 8** → пристрій лишається slave і відповідає з бітом 8. **Без біта 8**
-  (хост з `proto_minor` < 9 або без можливості) → пристрій стає майстром і відповідає без біта 8.
-- **Хост веде BCLK і WS лише поки останній `HELLO` пристрою несе біт 8**, і перестає, щойно
-  `HELLO` його не несе або лінк зник.
-- **Слоти завжди 32 біти** (`bits` = 32). Частота — оголошена; хост тактує саме її, від того ж
-  годинника, що і свій ЦАП.
-- **Дрейф між телефоном і хостом поглинає пристрій.** Він перераховує частоту дискретизації під
-  такт хоста, тому семпли на дроті вже не побітово ті, що дав декодер, і молодші біти слота не
-  обов'язково нулі.
-- **Пристрій, якому хост так і не сказав `HELLO`, лишається slave**, і звуку на I2S не буде, доки
-  хост не привітається.
-
----
-
-## 4. Живість: `PING` / `PONG`
-
-### `0x02` PING, обидва напрямки
-
-```
-u32  tick_ms          // час роботи відправника, мс
-```
-
-### `0x03` PONG, обидва напрямки
-
-```
-u32  echo_ms          // tick_ms з PING, на який це відповідь
-u32  own_ms           // час роботи того, хто відповідає, мс
-```
-
-- **Пристрій** шле `PING` **раз на секунду**, незалежно від `HELLO`, зокрема несумісному хосту.
-- **Хост** шле `PING` **раз на 2 с** і лише поки лінк піднятий, тобто після `HELLO` пристрою з тим
-  самим `proto_major`. До такого `HELLO` і несумісному пристрою хост `PING` не шле.
-- На `PING` — `PONG` **одразу**, незалежно від `HELLO`. Так роблять обидві сторони.
-- Немає `PONG` — для пристрою це лише лічильник. Він грає далі, нічого не скидає і хоста зниклим не
-  вважає.
-- **Хост, який 6 с не отримав жодного кадру, вважає лінк втраченим**: забуває оголошений формат,
-  можливості пристрою, налаштування Bluetooth і обкладинку, перестає вести BCLK і WS (3.5) і знову
-  повторює `HELLO` раз на секунду. Живий пристрій шле `PING` щосекунди, тож 6 с без жодного кадру
-  означають, що його немає.
-- Працюючий `PING`/`PONG` доводить, що живий дріт, але не те, що сторони обмінялись `HELLO`.
+- **The device starts as slave** and drives only DATA. It drives nothing the host may drive, so
+  until the first `HELLO` no line has two drivers.
+- **Host `HELLO` with bit 8** → the device stays slave and replies with bit 8. **Without bit 8**
+  (a host with `proto_minor` < 9 or without the capability) → the device becomes master and
+  replies without bit 8.
+- **The host drives BCLK and WS only while the device's last `HELLO` carries bit 8**, and stops as
+  soon as a `HELLO` does not carry it or the link is gone.
+- **Slots are always 32 bits** (`bits` = 32). The rate is the announced one; the host clocks
+  exactly that, from the same clock as its own DAC.
+- **The device absorbs the drift between the phone and the host.** It resamples to the host's
+  clock, so the samples on the wire are no longer bit for bit what the decoder produced, and the
+  low bits of the slot are not necessarily zeros.
+- **A device the host has never said `HELLO` to stays slave**, and there is no audio on I2S until
+  the host greets it.
 
 ---
 
-## 5. Перелік повідомлень
+## 4. Liveness: `PING` / `PONG`
 
-Довжина — payload, без `type`, `seq` і CRC; `s` — довжина рядка в байтах. «Відкидне» — може
-загубитись, коли хост не встигає читати (розділ 13).
+### `0x02` PING, both directions
 
-| Код | Назва | Напрям | З версії | Довжина | Відкидне |
+```
+u32  tick_ms          // the sender's uptime, ms
+```
+
+### `0x03` PONG, both directions
+
+```
+u32  echo_ms          // tick_ms from the PING this answers
+u32  own_ms           // the responder's uptime, ms
+```
+
+- **The device** sends `PING` **once a second**, regardless of `HELLO`, including to an
+  incompatible host.
+- **The host** sends `PING` **every 2 s** and only while the link is up, i.e. after a device
+  `HELLO` with the same `proto_major`. Before such a `HELLO`, and to an incompatible device, the
+  host sends no `PING`.
+- `PING` is answered with `PONG` **immediately**, regardless of `HELLO`. Both sides do so.
+- For the device a missing `PONG` is only a counter. It keeps playing, resets nothing and does
+  not consider the host gone.
+- **A host that has received no frame for 6 s considers the link lost**: it forgets the announced
+  format, the device's capabilities, the Bluetooth settings and the cover art, stops driving BCLK
+  and WS (3.5) and again repeats `HELLO` once a second. A live device sends `PING` every second, so
+  6 s without a single frame means it is not there.
+- Working `PING`/`PONG` proves the wire is alive, but not that the sides have exchanged `HELLO`.
+
+---
+
+## 5. Message list
+
+Length is the payload, without `type`, `seq` and CRC; `s` is a string's length in bytes.
+"Droppable" means it may be lost when the host cannot keep up reading (section 13).
+
+| Code | Name | Direction | Since | Length | Droppable |
 |---|---|---|---|---|---|
-| `0x01` | HELLO | обидва | 1.0 | 8 + s | |
-| `0x02` | PING | обидва | 1.0 | 4 | |
-| `0x03` | PONG | обидва | 1.0 | 8 | |
+| `0x01` | HELLO | both | 1.0 | 8 + s | |
+| `0x02` | PING | both | 1.0 | 4 | |
+| `0x03` | PONG | both | 1.0 | 8 | |
 | `0x10` | BT_STATE | D → H | 1.0 | 10 + s | |
 | `0x11` | TRACK_META | D → H | 1.0 | 6 + s₁ + s₂ + s₃ | |
-| `0x12` | TRACK_POS | D → H | 1.0 | 9 | так |
+| `0x12` | TRACK_POS | D → H | 1.0 | 9 | yes |
 | `0x13` | STREAM_FMT | D → H | 1.0 | 6 | |
-| `0x14` | COVER | D → H | 1.0; не шлеться | 11 + len | так |
+| `0x14` | COVER | D → H | 1.0; not sent | 11 + len | yes |
 | `0x15` | VOLUME_STATE | D → H | 1.0 | 2 | |
 | `0x16` | STREAM_PREPARE | D → H | 1.3 | 14 | |
 | `0x17` | COVER_RESET | D → H | 1.5 | 8 | |
-| `0x18` | COVER_DATA | D → H | 1.5 | 16 + 1..1000 | так |
-| `0x19` | COVER_END | D → H | 1.6 | 16 | так |
+| `0x18` | COVER_DATA | D → H | 1.5 | 16 + 1..1000 | yes |
+| `0x19` | COVER_END | D → H | 1.6 | 16 | yes |
 | `0x1A` | PAIR_REQUEST | D → H | 1.8 | 13 + s | |
 | `0x1B` | PAIR_RESULT | D → H | 1.8 | 7 | |
 | `0x1C` | BT_CONFIG | D → H | 1.8 | 7 + s | |
@@ -304,247 +323,250 @@ u32  own_ms           // час роботи того, хто відповіда
 | `0x26` | BT_CONFIG_SET | H → D | 1.8 | 6 + s | |
 | `0x27` | BOND_REMOVE | H → D | 1.8 | 6 | |
 | `0x28` | BT_REFRESH | H → D | 1.8 | 0 | |
-| `0x40` | LOG | D → H | 1.0 | 3 + s | так |
+| `0x40` | LOG | D → H | 1.0 | 3 + s | yes |
 
-Сторона шле повідомлення версії 1.x лише тоді, коли інша оголосила `proto_minor` >= x і біти,
-яких воно потребує. Це сказано при кожному повідомленні нижче.
+A side sends a version 1.x message only when the other side has announced `proto_minor` >= x and
+the bits the message requires. This is stated with each message below.
 
-Коди `0x30`–`0x35` зарезервовані (розділ 11).
+Codes `0x30`–`0x35` are reserved (section 11).
 
 ---
 
-## 6. Формат звуку
+## 6. Audio format
 
-### 6.1 Правило
+### 6.1 The rule
 
-**Пристрій не міняє частоту чи ширину слота, не оголосивши їх наперед.** Причина значення не
-має: нове з'єднання A2DP, інший кодек, зміна можливостей хоста, зміна ролі I2S, перезапуск
-власного I2S. Телефон узгоджує частоту на початку з'єднання, і **зазвичай** вона тримається до
-кінця, але жодна сторона не має права на це **розраховувати**.
+**The device does not change the rate or the slot width without announcing them first.** The reason
+does not matter: a new A2DP connection, a different codec, a change in the host's capabilities, a
+change of I2S role, a restart of its own I2S. The phone negotiates the rate at the start of a
+connection, and it **usually** holds until the end, but neither side may **rely** on that.
 
-**Хост має право не грати, поки формат не оголошений.** Це не помилка, а єдина безпечна
-поведінка: вгадана ширина звучить як шум, а не як тиша, і на слух її не відрізнити від поганого
-кодека.
+**The host may decline to play until the format is announced.** This is not an error but the only
+safe behaviour: a guessed width sounds like noise, not like silence, and by ear it cannot be told
+from a bad codec.
 
-Оголошень два: старе `STREAM_FMT` з паузою в 50 мс (6.3) і підтверджуване `STREAM_PREPARE` /
-`STREAM_READY` (6.4). Друге використовується, коли хост має `proto_minor` >= 3 і біт 4, перше —
-для решти.
+There are two announcements: the old `STREAM_FMT` with a 50 ms pause (6.3) and the acknowledged
+`STREAM_PREPARE` / `STREAM_READY` (6.4). The second is used when the host has `proto_minor` >= 3
+and bit 4, the first for everyone else.
 
-### 6.2 Частота й ширина слота
+### 6.2 Rate and slot width
 
-**Частоти.** Без біта 0 хоста пристрій пропонує телефону **лише 44,1 кГц**: хост, який не
-переналаштовує прийом на льоту, не переживе зміни частоти посеред з'єднання. З бітом 0 — 44,1 і
-48 кГц. 96 кГц — лише LHDC V5 і лише з бітом 5 (а отже з бітами 0 і 4 та `proto_minor` >= 4).
+**Rates.** Without host bit 0 the device offers the phone **only 44.1 kHz**: a host that does not
+reconfigure reception on the fly will not survive a rate change in the middle of a connection. With
+bit 0 — 44.1 and 48 kHz. 96 kHz — only LHDC V5 and only with bit 5 (and therefore with bits 0 and
+4 and `proto_minor` >= 4).
 
-Що пропонувати, пристрій вирішує, коли реєструє кінцеві точки A2DP, а реєструє він їх
-**наново лише тоді, коли телефон не підключений**. Тому можливості, що прийшли з пізнім
-`HELLO`, діють з наступного підключення телефона. Після ввімкнення пристрій до 10 с чекає на
-`HELLO` хоста, перш ніж зареєструвати кінцеві точки вперше.
+The device decides what to offer when it registers its A2DP endpoints, and it registers them
+**again only when no phone is connected**. So capabilities that arrive with a late `HELLO` take
+effect from the next phone connection. After power-up the device waits up to 10 s for the host's
+`HELLO` before registering the endpoints for the first time.
 
-Частота нічого не каже про сам запис: телефон бере частоту за замовчуванням для кодека.
+The rate says nothing about the recording itself: the phone takes the codec's default rate.
 
-**Ширина слота** на дроті:
+**Slot width** on the wire:
 
-| Умова | Слот | Як лягають семпли |
+| Condition | Slot | How the samples sit |
 |---|---|---|
-| хост тактує (біт 8, 1.9) | 32 | див. 3.5 |
-| пристрій тактує, без біта 3 | 16 | 24-бітні джерела звужуються з трикутним дизером |
-| біт 3, без підтверджень (немає біта 4) | 32 для всіх кодеків | старші біти, молодші — нулі |
-| біти 3 і 4 | рідна ширина декодера | старші біти, молодші — нулі |
+| host clocks (bit 8, 1.9) | 32 | see 3.5 |
+| device clocks, no bit 3 | 16 | 24-bit sources are narrowed with triangular dither |
+| bit 3, no acknowledgements (no bit 4) | 32 for all codecs | in the high bits; low bits are zeros |
+| bits 3 and 4 | the decoder's native width | in the high bits; low bits are zeros |
 
-Рідна ширина: SBC і AAC — 16; aptX і aptX HD — 32 (24 значущі біти); LHDC V5 — 16 для 16-бітного
-джерела і 32 для 24-бітного. Біт 3 — це дозвіл, а не наказ розширити все.
+Native width: SBC and AAC — 16; aptX and aptX HD — 32 (24 significant bits); LHDC V5 — 16 for a
+16-bit source and 32 for a 24-bit one. Bit 3 is a permission, not an order to widen everything.
 
-**Звужують з дизером, а не відкиданням молодшого байта.** Відкидання зміщує кожен відлік в
-один бік і лишає помилку, корельовану з сигналом, що на тихому чути як призвук.
+**Narrowing uses dither, not dropping the low byte.** Dropping shifts every sample in one direction
+and leaves an error correlated with the signal, which is audible as an artefact on quiet material.
 
-**Канали — завжди 2.** Усі кінцеві точки пропонують лише стерео. Формат, який не є стерео з
-ненульовою частотою і слотом 16 чи 32, пристрій не оголошує, і звук лишається вимкненим.
+**Channels — always 2.** All endpoints offer stereo only. The device does not announce a format
+that is not stereo with a non-zero rate and a 16- or 32-bit slot, and audio stays off.
 
-**Чого коштує біт 3 хосту, коли лінк тактує пристрій.** 32-бітні слоти на 44,1 і 48 кГц
-потребують у приймача внутрішнього такту 22,6 і 24,6 МГц від джерела вдвічі вищого, а кварц —
-40 МГц. Тому на час такого потоку (і будь-якого потоку 96 кГц) вхідний канал хоста переходить на
-APLL, і поки він грає, **вихідний такт хоста прив'язаний до сім'ї цього потоку**: 96 і 44,1 кГц
-одночасно неможливі.
+**What bit 3 costs the host when the device clocks the link.** 32-bit slots at 44.1 and 48 kHz
+need an internal receiver clock of 22.6 and 24.6 MHz from a source twice as high, and the crystal is
+40 MHz. So for the duration of such a stream (and of any 96 kHz stream) the host's input channel
+switches to the APLL, and while it plays, **the host's output clock is tied to that stream's
+family**: 96 and 44.1 kHz at the same time are impossible.
 
-### 6.3 Старий шлях: `STREAM_FMT` і 50 мс
+### 6.3 The old path: `STREAM_FMT` and 50 ms
 
 #### `0x13` STREAM_FMT, D → H
 
 ```
-u32  rate_hz          // 44100, 48000 або 96000
-u8   bits             // ширина слота на дроті: 16 або 32
+u32  rate_hz          // 44100, 48000 or 96000
+u8   bits             // slot width on the wire: 16 or 32
 u8   channels         // 2
 ```
 
-Для хоста без підтверджень (без біта 4 або з `proto_minor` < 3).
+For a host without acknowledgements (no bit 4, or `proto_minor` < 3).
 
-- **До першого семпла кожного з'єднання A2DP — і перед будь-якою іншою зміною формату.**
-- Після оголошення — **не менш ніж 50 мс тиші** на I2S, і лише потім семпли нового формату.
-  Відлік іде від моменту, коли кадр фізично пішов з UART, а не коли його поставили в чергу.
-- Пристрій повторює `STREAM_FMT` кожні 250 мс, поки перехід не завершився, і на кожен `HELLO`
-  хоста, бо хост міг перезапуститись і пропустити оголошення.
-- Формат забувається на роз'єднання: оголошувати застарілий гірше, ніж не оголошувати.
-- Хост, що вже отримав від пристрою `STREAM_PREPARE`, `STREAM_FMT` ігнорує до втрати лінка.
+- **Before the first sample of every A2DP connection — and before any other format change.**
+- After the announcement — **at least 50 ms of silence** on I2S, and only then samples of the new
+  format. The count starts when the frame has physically left the UART, not when it was queued.
+- The device repeats `STREAM_FMT` every 250 ms until the transition is complete, and on every host
+  `HELLO`, because the host may have restarted and missed the announcement.
+- The format is forgotten on disconnection: announcing a stale one is worse than announcing none.
+- A host that has already received `STREAM_PREPARE` from the device ignores `STREAM_FMT` until the
+  link is lost.
 
-### 6.4 Підтверджуваний перехід (1.3)
+### 6.4 Acknowledged transition (1.3)
 
 #### `0x16` STREAM_PREPARE, D → H
 
 ```
-u32  boot_nonce       // ненульовий, випадковий на кожен запуск пристрою
-u32  generation       // ненульовий, росте з кожним переходом і перепідключенням
+u32  boot_nonce       // non-zero, random on every device boot
+u32  generation       // non-zero, grows with every transition and reconnection
 u32  rate_hz
-u8   bits             // 16 або 32
+u8   bits             // 16 or 32
 u8   channels         // 2
 ```
 
-Рівно 14 байтів. Лише хосту з `proto_minor` >= 3 **і** бітом 4. Біт 3 і далі окремо дозволяє
-32-бітні слоти.
+Exactly 14 bytes. Only to a host with `proto_minor` >= 3 **and** bit 4. Bit 3 still separately
+permits 32-bit slots.
 
 #### `0x23` STREAM_READY, H → D
 
 ```
-u32  boot_nonce       // з STREAM_PREPARE
-u32  generation       // з STREAM_PREPARE
-u8   status           // 0 готовий, 1 відмова
+u32  boot_nonce       // from STREAM_PREPARE
+u32  generation       // from STREAM_PREPARE
+u8   status           // 0 ready, 1 refused
 ```
 
-Рівно 9 байтів. Інша довжина, невідомий `status` або нульові ідентифікатори — недійсні.
+Exactly 9 bytes. Any other length, an unknown `status` or zero identifiers make it invalid.
 
-#### Що робить пристрій
+#### What the device does
 
-1. **Закриває звук.** Закриває виробника PCM, дочікується запису, що вже йде, чистить свої
-   буфери, залишок і TX DMA. Поки чекає, I2S працює на старому такті й несе нулі; такт не
-   зупиняється.
-2. **Шле `STREAM_PREPARE`**, а **лише потім** міняє формат I2S: одразу після того, як кадр
-   фізично пішов з UART.
-3. **Тримає тишу**, доки не виконано все: локальна конфігурація вдалась, прийшов `STREAM_READY`
-   з тими самими `boot_nonce` і `generation` і статусом 0, і від фізичного відправлення минуло
-   щонайменше 50 мс. Постановка в чергу таймер не запускає, повтор його не перезапускає.
-4. **Повторює той самий `STREAM_PREPARE` кожні 250 мс**, поки чекає. Черги лишаються обмеженими.
-   **Жоден тайм-аут не замінює `STREAM_READY`.**
+1. **Closes the audio.** It closes the PCM producer, waits for the write already in progress,
+   flushes its buffers, the remainder and the TX DMA. While it waits, I2S runs on the old clock and
+   carries zeros; the clock does not stop.
+2. **Sends `STREAM_PREPARE`**, and **only then** changes the I2S format: right after the frame has
+   physically left the UART.
+3. **Holds silence** until all of these are true: the local configuration succeeded, a
+   `STREAM_READY` with the same `boot_nonce` and `generation` and status 0 has arrived, and at
+   least 50 ms have passed since the physical send. Queuing does not start the timer, a repeat does
+   not restart it.
+4. **Repeats the same `STREAM_PREPARE` every 250 ms** while it waits. The queues stay bounded.
+   **No timeout replaces `STREAM_READY`.**
 
-#### Що робить хост
+#### What the host does
 
-Хост приймає `STREAM_PREPARE` лише від пристрою з `proto_minor` >= 3, з яким піднятий лінк, і
-публікує запит для аудіотракту одразу й цілком. Якщо Bluetooth вибрано джерелом: згасити
-буферизований старий звук, призупинити прийом, дочекатися його останньої публікації, викинути
-старі буфери й історію ASRC, застосувати план такту й слота і запустити прийом, а вже тоді
-відповісти «готовий»; якщо формат застосувати не вдалося — відмовою. Якщо вибрано інше джерело,
-запит зберегти, а підготовку й `STREAM_READY` відкласти до вибору Bluetooth. Вихід з Bluetooth
-скасовує готовність; повторний вибір потребує підготовки навіть для того самого запиту.
+The host accepts `STREAM_PREPARE` only from a device with `proto_minor` >= 3 with which the link is
+up, and publishes the request to the audio path at once and whole. If Bluetooth is the selected
+source: fade out the buffered old audio, pause reception, wait for its last publication, discard the
+old buffers and the ASRC history, apply the clock and slot plan and start reception, and only then
+answer "ready"; if the format could not be applied, answer with a refusal. If another source is
+selected, keep the request and defer the preparation and `STREAM_READY` until Bluetooth is
+selected. Leaving Bluetooth cancels readiness; selecting it again requires preparation even for the
+same request.
 
-Хост повторює поточну відповідь кожні 100 мс, поки пристрій повторює `STREAM_PREPARE` (до 1 с
-після останнього), щоб відновити загублену.
+The host repeats its current answer every 100 ms while the device keeps repeating `STREAM_PREPARE`
+(up to 1 s after the last one), to recover a lost one.
 
-#### Правила відповідності
+#### Matching rules
 
-- Точний повтор того самого запиту (ідентифікатори й формат) — ідемпотентний. Той самий
-  ідентифікатор з іншим форматом або старіше покоління в поточному запуску — відмова, і хост шле
-  її одразу.
-- Звук відпускає лише `STREAM_READY`, що збігся і за `boot_nonce`, і за `generation`. Старі чи
-  повторні відповіді новіший перехід не відпустять.
-- **Відмова остаточна** для цієї транзакції: звук лишається вимкненим, і пізніший «готовий» для
-  того самого ідентифікатора цього не скасує.
-- Роз'єднання стирає стан формату. Перепідключення, навіть з тими самими частотою й шириною,
-  отримує нове покоління. Коли покоління переповнюється, пристрій бере новий ненульовий
-  `boot_nonce`.
-- `HELLO` хоста викликає повторне оголошення, тож перезапущений хост дізнається поточний
-  формат.
-- Невдача конфігурації I2S лишає тишу. Невдача драйвера на пристрої остаточна до перезапуску:
-  драйвер міг звільнити старі буфери DMA, не виділивши нових.
-- Установлений потік переживає відсутність `PING`/`PONG`, але перехід, що чекає підтвердження,
-  ніколи не переходить на «просто 50 мс».
+- An exact repeat of the same request (identifiers and format) is idempotent. The same identifier
+  with a different format, or an older generation within the current boot, is a refusal, and the
+  host sends it immediately.
+- Audio is released only by a `STREAM_READY` that matches on both `boot_nonce` and `generation`.
+  Old or repeated answers will not release a newer transition.
+- **A refusal is final** for that transaction: audio stays off, and a later "ready" for the same
+  identifier does not undo it.
+- Disconnection erases the format state. A reconnection, even with the same rate and width, gets a
+  new generation. When the generation overflows, the device takes a new non-zero `boot_nonce`.
+- A host `HELLO` triggers a repeat announcement, so a restarted host learns the current format.
+- A failed I2S configuration leaves silence. A driver failure on the device is final until restart:
+  the driver may have freed the old DMA buffers without allocating new ones.
+- An established stream survives the absence of `PING`/`PONG`, but a transition awaiting
+  acknowledgement never falls back to "plain 50 ms".
 
-### 6.5 96 кГц
+### 6.5 96 kHz
 
-Біт 5 — явна можливість частоти: біт 0 сам дозволяє лише 44,1 і 48. Пристрій пропонує LHDC V5 на
-96 кГц лише після `HELLO` 1.4+ з бітами 0, 4 і 5; відсутній, старший чи неповний `HELLO` лишає
-кінцеву точку на 44,1/48. Переходи на 96 кГц ідуть через `STREAM_PREPARE` / `STREAM_READY` з тими
-самими 50 мс. Якщо потік 96 кГц грає, а новий хост цієї можливості не має, звук лишається
-вимкненим і не оголошується. LHDC V5 несе рідний 16-бітний PCM або 24 значущі біти в 32-бітних
-контейнерах. 192 кГц, режимів LL, просторової обробки й lossless кінцева точка не пропонує.
+Bit 5 is an explicit rate capability: bit 0 alone permits only 44.1 and 48. The device offers LHDC
+V5 at 96 kHz only after a 1.4+ `HELLO` with bits 0, 4 and 5; a missing, older or incomplete `HELLO`
+leaves the endpoint at 44.1/48. Transitions to 96 kHz go through `STREAM_PREPARE` / `STREAM_READY`
+with the same 50 ms. If a 96 kHz stream is playing and a new host lacks this capability, audio stays
+off and is not announced. LHDC V5 carries native 16-bit PCM or 24 significant bits in 32-bit
+containers. The endpoint does not offer 192 kHz, LL modes, spatial processing or lossless.
 
 ---
 
-## 7. Стан Bluetooth і трек
+## 7. Bluetooth state and track
 
 ### `0x10` BT_STATE, D → H
 
 ```
-u8   state            // 0 вимкнено, 1 чекає, 2 видимий для спарювання,
-                      // 3 підключається, 4 підключено, 5 грає
-u8   codec            // 0 немає, 1 SBC, 2 AAC, 3 aptX, 4 aptX HD, 5 LHDC V5
-u8   addr[6]          // BD_ADDR телефона, нулі, коли не підключено
-str  name             // ім'я телефона, порожнє, коли невідоме; до 64 байтів
+u8   state            // 0 off, 1 waiting, 2 discoverable for pairing,
+                      // 3 connecting, 4 connected, 5 playing
+u8   codec            // 0 none, 1 SBC, 2 AAC, 3 aptX, 4 aptX HD, 5 LHDC V5
+u8   addr[6]          // the phone's BD_ADDR, zeros when not connected
+str  name             // the phone's name, empty when unknown; up to 64 bytes
 ```
 
-За подією: стан з'єднання A2DP, старт і зупинка потоку, узгоджений кодек, успішна
-автентифікація, прочитане ім'я телефона, зміна радіо чи видимості, а також після `HELLO` хоста
-(не частіше разу на 10 с). Періодично не шлеться.
+On events: A2DP connection state, stream start and stop, codec negotiated, successful
+authentication, phone name read, a radio or discoverability change, and also after a host `HELLO`
+(no more than once every 10 s). Not sent periodically.
 
 ### `0x11` TRACK_META, D → H
 
 ```
-str  title            // до 128 байтів кожне поле
+str  title            // each field up to 128 bytes
 str  artist
 str  album
 ```
 
-На зміну треку. Порожній рядок — невідомо. Атрибути приходять від телефона по одному, тож
-пристрій шле `TRACK_META` через 300 мс після останнього. На роз'єднання — одразу порожній.
+On a track change. An empty string means unknown. The attributes arrive from the phone one by one,
+so the device sends `TRACK_META` 300 ms after the last one. On disconnection — an empty one
+immediately.
 
-**Перший `TRACK_META` після підключення часто порожній**, і це нормально: перша відповідь
-телефона на запит метаданих одразу після з'єднання буває порожньою, а поля наповнює пізніша
-нотифікація про зміну треку. Тому пристрій шле `TRACK_META`, щойно має що слати, навіть
-порожній, і шле **ще раз**, коли поля наповнились. Хост тримає це як «останнє відоме» і не
-вважає перше повідомлення остаточним.
+**The first `TRACK_META` after connecting is often empty**, and that is normal: the phone's first
+answer to a metadata request right after connecting can be empty, and a later track-changed
+notification fills the fields. So the device sends `TRACK_META` as soon as it has something to
+send, even empty, and sends it **again** when the fields have filled. The host keeps it as "last
+known" and does not take the first message as final.
 
 ### `0x12` TRACK_POS, D → H
 
 ```
-u8   state            // 0 зупинено, 1 грає, 2 пауза, 3 перемотка вперед, 4 перемотка назад
+u8   state            // 0 stopped, 1 playing, 2 paused, 3 fast forward, 4 rewind
 u32  elapsed_ms
-u32  total_ms         // 0 = невідомо
+u32  total_ms         // 0 = unknown
 ```
 
-- **Раз на секунду, лише поки грає.** У паузі й у стопі періодичних немає; хост тримає останнє
-  значення.
-- **Одразу на зміну стану** і на кожну відповідь телефона про позицію. Тому `state` 2 чи 0 у
-  `TRACK_POS` теж буває.
-- На роз'єднання `TRACK_POS` не шлеться; хост дізнається це з `BT_STATE`.
+- **Once a second, only while playing.** In pause and stop there are no periodic ones; the host
+  keeps the last value.
+- **Immediately on a state change** and on every position answer from the phone. So `state` 2 or 0
+  does occur in `TRACK_POS` too.
+- `TRACK_POS` is not sent on disconnection; the host learns of it from `BT_STATE`.
 
-Звідки позиція, залежить від телефона, і пристрій пробує дешевший шлях першим:
+Where the position comes from depends on the phone, and the device tries the cheaper path first:
 
-1. Якщо телефон підтримує нотифікацію `PLAY_POS`, пристрій реєструється на неї (крок 5 с), шле
-   `TRACK_POS` на кожну подію, а між подіями раз на секунду — інтерпольовану позицію для рівного
-   руху смужки.
-2. Якщо ні — опитує `GetPlayStatus` раз на секунду і шле позицію на відповідь.
+1. If the phone supports the `PLAY_POS` notification, the device registers for it (5 s step), sends
+   `TRACK_POS` on every event, and between events, once a second, an interpolated position so the
+   bar moves smoothly.
+2. If not, it polls `GetPlayStatus` once a second and sends the position on the answer.
 
-**`total_ms` завжди санітизований**: телефони повертають і від'ємну довжину. Усе від'ємне або
-довше за добу стає 0, тобто «невідомо». Хост застосовує ту саму межу (доба) до `elapsed_ms` і
-`total_ms`.
+**`total_ms` is always sanitised**: phones even return a negative length. Anything negative or
+longer than a day becomes 0, i.e. "unknown". The host applies the same limit (a day) to
+`elapsed_ms` and `total_ms`.
 
 ### `0x15` VOLUME_STATE, D → H
 
 ```
-u8   volume           // 0..127, абсолютна гучність AVRCP
-u8   source           // 0 змінено з цього боку (CMD_VOLUME хоста),
-                      // 1 змінено телефоном
+u8   volume           // 0..127, AVRCP absolute volume
+u8   source           // 0 changed from this side (the host's CMD_VOLUME),
+                      // 1 changed by the phone
 ```
 
-На кожну зміну. **Гучність застосовує хост, а не пристрій.** Пристрій — ціль абсолютної гучності
-AVRCP, тож телефон шле потік на повній шкалі й лише повідомляє число; пристрій пересилає його і
-семпли не масштабує. Масштабувати на пристрої означало б втратити роздільну здатність ще до
-хоста. Хост діє лише на `source` 1: `source` 0 — відлуння його власного `CMD_VOLUME`.
+On every change. **The host applies the volume, not the device.** The device is an AVRCP absolute
+volume target, so the phone sends the stream at full scale and only reports the number; the device
+forwards it and does not scale the samples. Scaling on the device would lose resolution before the
+host. The host acts only on `source` 1: `source` 0 is the echo of its own `CMD_VOLUME`.
 
-Пристрій не повторює `VOLUME_STATE` на `HELLO` чи на підключення, тож до першої зміни хост
-гучності не знає. Після старту пристрій вважає її 127.
+The device does not repeat `VOLUME_STATE` on `HELLO` or on connection, so until the first change the
+host does not know the volume. After start-up the device takes it as 127.
 
 ---
 
-## 8. Керування
+## 8. Control
 
 ### `0x20` CMD_TRANSPORT, H → D
 
@@ -553,15 +575,15 @@ u8   cmd              // 0 play, 1 pause, 2 stop, 3 next, 4 prev,
                       // 5 ffwd start, 6 ffwd stop, 7 rew start, 8 rew stop
 ```
 
-Значення понад 8 ігноруються. Без з'єднання AVRCP команда нічого не робить.
+Values above 8 are ignored. Without an AVRCP connection the command does nothing.
 
-**Пауза, яку телефон ігнорує.** Якщо через 5 с після `pause` чи `stop` потік A2DP усе ще йде,
-пристрій сам призупиняє його (AVDTP SUSPEND). Будь-яка інша команда до спливу 5 с цю перевірку
-скасовує; повторна `pause` відлік не перезапускає. Скасовує її й телефон: коли його потік
-зупиняється або коли він повідомляє, що знову грає (людина відновила відтворення на телефоні).
-Телефон, який паузу ігнорує, не робить ні того, ні іншого. Після такого скасування наступна `pause`
-починає новий відлік. Потік, який пристрій призупинив сам, він сам і запускає (AVDTP START): на
-`play` від хоста або коли телефон повідомляє, що знову грає.
+**A pause the phone ignores.** If the A2DP stream is still running 5 s after `pause` or `stop`, the
+device suspends it itself (AVDTP SUSPEND). Any other command before the 5 s run out cancels this
+check; a repeated `pause` does not restart the count. The phone cancels it too: when its stream
+stops or when it reports that it is playing again (the person resumed playback on the phone). A
+phone that ignores the pause does neither. After such a cancellation the next `pause` starts a new
+count. The device restarts a stream it suspended itself (AVDTP START): on `play` from the host or
+when the phone reports that it is playing again.
 
 ### `0x21` CMD_VOLUME, H → D
 
@@ -569,142 +591,146 @@ u8   cmd              // 0 play, 1 pause, 2 stop, 3 next, 4 prev,
 u8   volume           // 0..127
 ```
 
-Більше 127 обрізається до 127. Телефон дізнається, якщо зареєструвався на нотифікацію
-гучності. Пристрій завжди відповідає `VOLUME_STATE` з `source` 0.
+Anything above 127 is clamped to 127. The phone learns of it if it has registered for the volume
+notification. The device always answers with `VOLUME_STATE` with `source` 0.
 
 ### `0x22` CMD_RADIO, H → D
 
 ```
-u8   radio            // 0 вимкнути, 1 увімкнути
-u8   discoverable     // 0 ні, 1 так
-u8   disconnect       // 1 = розірвати поточне з'єднання
+u8   radio            // 0 turn off, 1 turn on
+u8   discoverable     // 0 no, 1 yes
+u8   disconnect       // 1 = drop the current connection
 ```
 
-Будь-яке ненульове значення — «так». Діє одразу, але **не зберігається**: збережені `radio` і
-`discoverable` міняє лише `BT_CONFIG_SET` (розділ 9). Відповідь — `BT_STATE`. Хост шле
-`CMD_RADIO` лише з `disconnect` = 1; `radio` і `discoverable` у ньому — останні з `BT_CONFIG`, а
-пристрою без біта 7 чи до першого `BT_CONFIG` — 1 і 1.
+Any non-zero value means "yes". Takes effect immediately but is **not persisted**: only
+`BT_CONFIG_SET` changes the stored `radio` and `discoverable` (section 9). The reply is
+`BT_STATE`. The host sends `CMD_RADIO` only with `disconnect` = 1; `radio` and `discoverable` in it
+are the last ones from `BT_CONFIG`, and for a device without bit 7 or before the first
+`BT_CONFIG` — 1 and 1.
 
 ---
 
-## 9. Налаштування Bluetooth (1.8)
+## 9. Bluetooth settings (1.8)
 
-Хост показує налаштування Bluetooth і запити на спарювання, пристрій їх тримає і виконує. Два
-біти, обидва лише з `proto_minor` >= 8:
+The host shows the Bluetooth settings and pairing requests; the device keeps and carries them out.
+Two bits, both only with `proto_minor` >= 8:
 
-- **пристрій, біт 7 BT_SETTINGS** — шле `0x1A`–`0x1D` і розуміє `0x25`–`0x28`;
-- **хост, біт 7 PAIR_CONFIRM** — показує запит на спарювання і відповідає `PAIR_REPLY`.
+- **device, bit 7 BT_SETTINGS** — sends `0x1A`–`0x1D` and understands `0x25`–`0x28`;
+- **host, bit 7 PAIR_CONFIRM** — shows the pairing request and answers with `PAIR_REPLY`.
 
-Пристрій шле `0x1A`–`0x1D` лише хосту з `proto_minor` >= 8. Хост шле `0x25`–`0x28` лише пристрою з
-`proto_minor` >= 8 і бітом 7, а `0x1A`–`0x1D` приймає лише від такого пристрою. Змішана пара нічого
-не ламає: хост 1.8+ з пристроєм 1.7 просто не показує налаштувань, пристрій 1.8+ з хостом 1.7
-спарюється без запиту.
+The device sends `0x1A`–`0x1D` only to a host with `proto_minor` >= 8. The host sends `0x25`–`0x28`
+only to a device with `proto_minor` >= 8 and bit 7, and accepts `0x1A`–`0x1D` only from such a
+device. A mixed pair breaks nothing: a 1.8+ host with a 1.7 device simply shows no settings, a 1.8+
+device with a 1.7 host pairs without a request.
 
 ### `0x1A` PAIR_REQUEST, D → H
 
 ```
 u8   addr[6]
-u8   kind             // 0 порівняння чисел: показати passkey, чекати PAIR_REPLY
-                      // 1 лише згода (Just Works): коду немає, чекати PAIR_REPLY
-                      // 2 passkey для введення на телефоні: показати, відповідь не потрібна
-u32  passkey          // 0..999999, показувати шістьма цифрами з провідними нулями; 0 для kind 1
-str  name             // ім'я телефона, до 32 байтів UTF-8; порожнє, якщо прочитати не вдалося
+u8   kind             // 0 numeric comparison: show the passkey, wait for PAIR_REPLY
+                      // 1 consent only (Just Works): no code, wait for PAIR_REPLY
+                      // 2 passkey to be entered on the phone: show it, no reply needed
+u32  passkey          // 0..999999, show as six digits with leading zeros; 0 for kind 1
+str  name             // the phone's name, up to 32 bytes of UTF-8; empty if it could not be read
 ```
 
-Лише хосту з бітом 7. Без нього пристрій ні про що не питає й погоджується сам. Хост відкидає
-запит із `kind` понад 2 або `passkey` понад 999999.
+Only to a host with bit 7. Without it the device asks nothing and accepts on its own. The host
+discards a request with `kind` above 2 or `passkey` above 999999.
 
-- **Один запит за раз.** Стек веде одне спарювання в кожен момент і другого пристрою під час
-  активного не пускає, тож другий `PAIR_REQUEST` до `PAIR_RESULT` першого не приходить.
-- **Тайм-аут 25 с для `kind` 0 і 1.** Без `PAIR_REPLY` за 25 с пристрій відхиляє сам і шле
-  `PAIR_RESULT` зі статусом 2. Власний таймер стека довший (35 с), тож першим спрацьовує цей.
-- **`kind` 2 тайм-ауту відповіді не має.** Людина вводить код на телефоні, і результат приходить,
-  коли телефон закінчить або стек здасться.
-- **Активний запит повторюється у відповідь на `HELLO`**, бо хост міг перезапуститись. Повтор з
-  тими самими `addr`, `kind` і `passkey` — той самий запит, не новий.
-- **Хост закриває запит сам**, якщо `PAIR_RESULT` не прийшов за 90 с (`kind` 0 і 1) чи 120 с
-  (`kind` 2) або лінк зник.
+- **One request at a time.** The stack runs one pairing at any moment and does not let a second
+  device in during an active one, so a second `PAIR_REQUEST` does not arrive before the first one's
+  `PAIR_RESULT`.
+- **25 s timeout for `kind` 0 and 1.** Without a `PAIR_REPLY` within 25 s the device rejects on its
+  own and sends `PAIR_RESULT` with status 2. The stack's own timer is longer (35 s), so this one
+  fires first.
+- **`kind` 2 has no reply timeout.** The person types the code on the phone, and the result arrives
+  when the phone finishes or the stack gives up.
+- **The active request is repeated in reply to `HELLO`**, because the host may have restarted. A
+  repeat with the same `addr`, `kind` and `passkey` is the same request, not a new one.
+- **The host closes the request on its own** if `PAIR_RESULT` has not arrived within 90 s (`kind` 0
+  and 1) or 120 s (`kind` 2), or the link is gone.
 
-Яку модель отримає телефон, вирішує стек, а не хост. З бітом 7 пристрій оголошує DisplayYesNo.
-Порівняння чисел (`kind` 0) буває, коли й телефон DisplayYesNo, і хоч одна сторона вимагає захисту
-від MITM. Пристрій вимагає його, коли телефон починає виділене спарювання («додати пристрій» у
-налаштуваннях телефона), тож для звичайного телефона це основний випадок. Решта — Just Works
-(`kind` 1), крім клавіатурних пристроїв (`kind` 2).
+Which model the phone gets is decided by the stack, not by the host. With bit 7 the device announces
+DisplayYesNo. Numeric comparison (`kind` 0) happens when the phone is DisplayYesNo too and at least
+one side requires MITM protection. The device requires it when the phone starts dedicated bonding
+(adding a device from the phone's settings), so for an ordinary phone this is the main case. The
+rest is Just Works (`kind` 1), except keyboard devices (`kind` 2).
 
 ### `0x1B` PAIR_RESULT, D → H
 
 ```
 u8   addr[6]
-u8   status           // 0 спарено
-                      // 1 відхилено хостом (PAIR_REPLY з accept = 0)
-                      // 2 тайм-аут: PAIR_REPLY не прийшов за 25 с (лише kind 0 і 1)
-                      // 3 не вдалося: скасовано на телефоні, помилка автентифікації
-                      //   або втрата зв'язку
+u8   status           // 0 paired
+                      // 1 rejected by the host (PAIR_REPLY with accept = 0)
+                      // 2 timeout: no PAIR_REPLY within 25 s (kind 0 and 1 only)
+                      // 3 failed: cancelled on the phone, authentication error
+                      //   or connection lost
 ```
 
-Рівно один на кожен `PAIR_REQUEST`. Хост закриває діалог. Значення від 4 зарезервовані; хост
-показує їх як 3. Якщо після згоди стек мовчить 60 с, пристрій сам шле статус 3.
+Exactly one per `PAIR_REQUEST`. The host closes the dialog. Values from 4 up are reserved; the host
+shows them as 3. If the stack stays silent for 60 s after consent, the device sends status 3 on its
+own.
 
-Скасування на телефоні окремого статусу не має: Bluedroid повідомляє про нього тим самим кодом,
-що й про помилку автентифікації чи тайм-аут LMP (`AUTH_FAILURE`).
+Cancellation on the phone has no status of its own: Bluedroid reports it with the same code as an
+authentication error or an LMP timeout (`AUTH_FAILURE`).
 
 ### `0x1C` BT_CONFIG, D → H
 
 ```
-u8   radio            // 0 вимкнено, 1 увімкнено
-u8   discoverable     // 0 прихований, 1 видимий
-u8   auto_reconnect   // 0/1: після старту кликати останній телефон
-u8   codecs_supported // біти: 0 SBC, 1 AAC, 2 aptX, 3 aptX HD, 4 LHDC V5 — що є в збірці
-u8   codecs_enabled   // що зараз пропонується телефону; підмножина codecs_supported;
-                      // біт 0 завжди 1; кодек, який збірка не вміє зняти, лишається 1
-str  name             // поточне ім'я пристрою, 1..32 байти UTF-8
+u8   radio            // 0 off, 1 on
+u8   discoverable     // 0 hidden, 1 visible
+u8   auto_reconnect   // 0/1: after start-up, call the last phone
+u8   codecs_supported // bits: 0 SBC, 1 AAC, 2 aptX, 3 aptX HD, 4 LHDC V5 — what the build has
+u8   codecs_enabled   // what is offered to the phone now; a subset of codecs_supported;
+                      // bit 0 always 1; a codec the build cannot withdraw stays 1
+str  name             // the current device name, 1..32 bytes of UTF-8
 ```
 
-Шлеться після `HELLO` від хоста з `proto_minor` >= 8 (далі `BOND_LIST`), після кожного
-`BT_CONFIG_SET` з тим, що реально застосовано, і на `BT_REFRESH`. Біти кодеків — маска, а не
-номери з `BT_STATE`.
+Sent after a `HELLO` from a host with `proto_minor` >= 8 (followed by `BOND_LIST`), after every
+`BT_CONFIG_SET` with what was actually applied, and on `BT_REFRESH`. The codec bits are a mask,
+not the numbers from `BT_STATE`.
 
-- **`radio` 0** — пристрій не приймає з'єднань і не видимий у пошуку. Поточне з'єднання
-  розривається, автоперепідключення немає.
-- **`discoverable` 0** — пристрій не видимий у пошуку **і не приймає нових спарювань**, тож
-  підключаються лише вже спарені телефони. Сама невидимість цього не дає: хто знає адресу,
-  спарювався б і далі. **1** — видимий і приймає спарювання.
-- **Кодеки діють з наступного підключення.** Поточне з'єднання заради них не рветься: пристрій
-  реєструє кінцеві точки заново, коли телефона немає. Телефон бере найкращий запропонований
-  кодек, і попросити в нього менше не можна; зняти верхній кодек — єдиний спосіб опустити телефон
-  на крок. SBC зняти не можна: його вимагає A2DP.
+- **`radio` 0** — the device accepts no connections and is not visible in a scan. The current
+  connection is dropped, there is no auto-reconnect.
+- **`discoverable` 0** — the device is not visible in a scan **and accepts no new pairings**, so
+  only phones already paired connect. Invisibility alone does not give this: anyone who knows the
+  address could still pair. **1** — visible and accepts pairing.
+- **Codecs take effect from the next connection.** The current connection is not dropped for them:
+  the device re-registers the endpoints when no phone is present. The phone takes the best codec
+  offered, and it cannot be asked for less; withdrawing the top codec is the only way to step the
+  phone down. SBC cannot be withdrawn: A2DP requires it.
 
 ### `0x1D` BOND_LIST, D → H
 
 ```
-u8   total            // скільки бондів у пристрої
-u8   count            // скільки в цьому кадрі, <= 16
-count разів:
+u8   total            // how many bonds the device holds
+u8   count            // how many in this frame, <= 16
+count times:
   u8   addr[6]
-  u8   flags          // біт 0 — підключений зараз; біт 1 — останній підключений
-                      // (ціль автоперепідключення)
-  str  name           // до 32 байтів UTF-8, обрізане по межі символу; порожнє = невідоме
+  u8   flags          // bit 0 — connected now; bit 1 — last connected
+                      // (the auto-reconnect target)
+  str  name           // up to 32 bytes of UTF-8, cut at a character boundary; empty = unknown
 ```
 
-Один кадр. Порядок — від останнього підключеного. Якщо `total` більше за `count`, старші бонди в
-кадр не влазять; їх прибирає `BOND_REMOVE` з `FF×6`. 16 записів — це 2 + 16 × 41 = 658 байтів, у
-межах 1036.
+One frame. The order is from the most recently connected. If `total` is greater than `count`, the
+older bonds do not fit in the frame; `BOND_REMOVE` with `FF×6` clears them. 16 entries are
+2 + 16 × 41 = 658 bytes, within 1036.
 
-Шлеться після `HELLO` від хоста з `proto_minor` >= 8, після спарювання, видалення, підключення й
-відключення телефона, коли стало відоме ім'я, і на `BT_REFRESH`. Імен у сховищі бондів Bluedroid
-немає: пристрій тримає власну таблицю адреса → ім'я в NVS і наповнює її при спарюванні та з
-прочитаного імені телефона. У бонда без запису в цій таблиці ім'я з'являється після першого
-підключення.
+Sent after a `HELLO` from a host with `proto_minor` >= 8, after a phone is paired, removed,
+connected or disconnected, when a name becomes known, and on `BT_REFRESH`. Bluedroid's bond storage
+holds no names: the device keeps its own address → name table in NVS and fills it on pairing and
+from the phone name it reads. A bond with no entry in that table gets its name after the first
+connection.
 
 ### `0x25` PAIR_REPLY, H → D
 
 ```
 u8   addr[6]
-u8   accept           // 0 ні, 1 так; інше — недійсне
+u8   accept           // 0 no, 1 yes; anything else is invalid
 ```
 
-Лише для поточного запиту `kind` 0 або 1. Чужа адреса, прострочений або вже закритий запит і
-`kind` 2 — ігнор.
+Only for the current request of `kind` 0 or 1. A different address, an expired or already closed
+request, and `kind` 2 are ignored.
 
 ### `0x26` BT_CONFIG_SET, H → D
 
@@ -712,62 +738,65 @@ u8   accept           // 0 ні, 1 так; інше — недійсне
 u8   radio
 u8   discoverable
 u8   auto_reconnect
-u8   codecs_enabled   // SBC пристрій вмикає сам, навіть коли біт 0 знятий;
-                      // біти поза codecs_supported ігноруються
-str  name             // порожнє = не міняти
+u8   codecs_enabled   // the device enables SBC itself, even when bit 0 is cleared;
+                      // bits outside codecs_supported are ignored
+str  name             // empty = do not change
 ```
 
-Повний стан, не дельта. У полях `radio`, `discoverable` і `auto_reconnect` 0 означає «ні», будь-що
-інше — «так». Пристрій зберігає стан у NVS, застосовує і відповідає `BT_CONFIG`. Ім'я довше за 32
-байти або не UTF-8 не застосовується, і `BT_CONFIG` показує старе. Нове ім'я діє одразу, але
-телефон може ще якийсь час показувати старе з кешу.
+The full state, not a delta. In the `radio`, `discoverable` and `auto_reconnect` fields 0 means
+"no", anything else "yes". The device stores the state in NVS, applies it and answers with
+`BT_CONFIG`. A name longer than 32 bytes or not UTF-8 is not applied, and `BT_CONFIG` shows the old
+one. A new name takes effect immediately, but the phone may keep showing the old one from its cache
+for a while.
 
 ### `0x27` BOND_REMOVE, H → D
 
 ```
-u8   addr[6]          // FF×6 = забути всі
+u8   addr[6]          // FF×6 = forget all
 ```
 
-Якщо цей телефон підключений, з'єднання розривається. Відповідь — `BOND_LIST`, зокрема й тоді,
-коли такої адреси серед бондів не було. Коли видаляється кілька бондів, `BOND_LIST` може прийти
-кілька разів — по одному на кожне видалення; останній і є актуальний.
+If that phone is connected, the connection is dropped. The reply is `BOND_LIST`, including when no
+such address was among the bonds. When several bonds are removed, `BOND_LIST` may arrive several
+times — one per removal; the last one is current.
 
 ### `0x28` BT_REFRESH, H → D
 
 ```
-(порожньо)
+(empty)
 ```
 
-Пристрій шле `BT_CONFIG` і `BOND_LIST`.
+The device sends `BT_CONFIG` and `BOND_LIST`.
 
-### Поведінка
+### Behaviour
 
-- **Спосіб спарювання йде за останнім `HELLO`.** З бітом 7 — DisplayYesNo і запити до хоста. Без
-  нього — NoInputNoOutput і згода без запиту. Перемикання діє з наступного спарювання.
-- **Хост виставляє біт 7, лише коли в нього працює екран**, на якому можна підтвердити, і зміну
-  оголошує новим `HELLO` одразу (розділ 3).
-- **Налаштування тримає пристрій**, у NVS. Хост лише показує їх і шле `BT_CONFIG_SET`. Заводські:
-  `radio` 1, `discoverable` 1, `auto_reconnect` 0, усі кодеки збірки, ім'я `modesp satellite`.
-- **Автоперепідключення.** Після старту, а також коли `radio` стає 1, пристрій кличе останній
-  підключений телефон. Не більше трьох спроб з інтервалом 10 с. Спроби припиняються, щойно
-  будь-який телефон підключився.
-- **Legacy PIN** (телефони до Bluetooth 2.1) не підтримується.
+- **The pairing method follows the last `HELLO`.** With bit 7 — DisplayYesNo and requests to the
+  host. Without it — NoInputNoOutput and consent without a request. A switch takes effect from the
+  next pairing.
+- **The host sets bit 7 only while it has a working screen** to confirm on, and announces the
+  change with a new `HELLO` immediately (section 3).
+- **The device keeps the settings**, in NVS. The host only shows them and sends `BT_CONFIG_SET`.
+  Factory defaults: `radio` 1, `discoverable` 1, `auto_reconnect` 0, all codecs of the build, name
+  `modesp satellite`.
+- **Auto-reconnect.** After start-up, and also when `radio` becomes 1, the device calls the last
+  connected phone. No more than three attempts, 10 s apart. The attempts stop as soon as any phone
+  has connected.
+- **Legacy PIN** (phones before Bluetooth 2.1) is not supported.
 
 ---
 
-## 10. Обкладинка
+## 10. Cover art
 
-### 10.1 Як це влаштовано
+### 10.1 How it works
 
-Обкладинку пристрій бере в телефона по AVRCP Cover Art (OBEX) і передає хосту як JPEG,
-прив'язаний до треку. Кожне зображення має пару `boot_nonce` + `track_generation`, обидва
-ненульові. `boot_nonce` випадковий на кожен запуск пристрою (і не той самий, що в
-`STREAM_PREPARE`), `track_generation` росте з кожним новим зображенням.
+The device fetches the cover art from the phone over AVRCP Cover Art (OBEX) and passes it to the
+host as a JPEG tied to the track. Every image has a `boot_nonce` + `track_generation` pair, both
+non-zero. `boot_nonce` is random on every device boot (and not the same as in `STREAM_PREPARE`),
+`track_generation` grows with every new image.
 
-Пристрій шле обкладинки **лише хосту з `proto_minor` >= 6 і бітами 1 та 6** — тобто тільки
-потоком (10.3). Хост нижче не отримує ні `COVER_RESET`, ні `COVER_DATA`, ні старого `COVER`
-(`0x14`): це нижня межа з боку відправника, а не зміна будь-якої розкладки. Пристрій бере лише
-пов'язану мініатюру, яку дає телефон.
+The device sends cover art **only to a host with `proto_minor` >= 6 and bits 1 and 6** — that is,
+only as a stream (10.3). A lower host gets neither `COVER_RESET`, nor `COVER_DATA`, nor the old
+`COVER` (`0x14`): this is a floor on the sender's side, not a change to any layout. The device takes
+only the linked thumbnail the phone provides.
 
 ### 10.2 `0x17` COVER_RESET, D → H (1.5)
 
@@ -776,121 +805,121 @@ u32  boot_nonce
 u32  track_generation
 ```
 
-Рівно 8 байтів, обидва ненульові. Нова пара прибирає показану обкладинку Bluetooth і скасовує
-збирання й декодування старого зображення. Повтор тієї самої пари — ідемпотентний. Обкладинок
-інших джерел хоста це не зачіпає.
+Exactly 8 bytes, both non-zero. A new pair removes the Bluetooth cover art on display and cancels
+assembly and decoding of the old image. A repeat of the same pair is idempotent. The host's cover
+art from other sources is not affected.
 
-Шлеться перед завантаженням зображення: на підключення й відключення AVRCP, на зміну треку, коли
-зміниться або зникне посилання на зображення, і після `HELLO` хоста чи виконаного
-`COVER_RETRY`. Немає зображення або телефон не вміє — плитка лишається порожньою. `COVER_RESET`
-не відкидне і випереджає дані старого зображення, що ще в черзі; пара не дає змішати треки.
+Sent before an image is fetched: on AVRCP connect and disconnect, on a track change, when the image
+handle changes or disappears, and after a host `HELLO` or an executed `COVER_RETRY`. No image, or
+the phone cannot do it — the tile stays empty. `COVER_RESET` is not droppable and overtakes the old
+image's data still in the queue; the pair keeps tracks from mixing.
 
-### 10.3 `0x18` COVER_DATA, D → H (1.5; потоком з 1.6)
+### 10.3 `0x18` COVER_DATA, D → H (1.5; streamed since 1.6)
 
 ```
 u32  boot_nonce
 u32  track_generation
-u32  total_bytes      // повний розмір; 0 = невідомий (потік, 1.6)
-u32  offset           // зміщення першого байта цього шматка
-u8   jpeg[...]        // 1..1000 байтів; довжина = довжина payload − 16
+u32  total_bytes      // full size; 0 = unknown (stream, 1.6)
+u32  offset           // offset of this chunk's first byte
+u8   jpeg[...]        // 1..1000 bytes; length = payload length − 16
 ```
 
-Внутрішньої довжини немає.
+There is no inner length.
 
-- **Потік (1.6), так шле пристрій:** `total_bytes` = 0, бо до кінця OBEX розмір невідомий:
-  телефон його не повідомляє. Шматки 1..1000 байтів, розмір може мінятись, зміщення суцільні від
-  нуля. Кінець позначає `COVER_END`.
-- **Відома довжина (1.5):** `total_bytes` — повний розмір, однаковий у кожному шматку, кожен
-  шматок, крім останнього, рівно 1000 байтів, і зображення завершене, коли прийшов останній
-  байт. Хост приймає й таке. Змішувати обидва режими в одному поколінні не можна.
+- **Stream (1.6), the way the device sends:** `total_bytes` = 0, because the size is unknown until
+  the end of OBEX: the phone does not report it. Chunks of 1..1000 bytes, the size may vary,
+  offsets contiguous from zero. `COVER_END` marks the end.
+- **Known length (1.5):** `total_bytes` is the full size, the same in every chunk, every chunk
+  except the last is exactly 1000 bytes, and the image is complete when the last byte has arrived.
+  The host accepts this too. The two modes may not be mixed within one generation.
 
-Хост приймає лише поточну пару, першим — зміщення 0, далі суцільні зміщення. Невідомі й старі пари
-ігноруються. Розрив, повтор або зіпсований шматок поточної пари скасовує збирання. Межа — 256 КіБ;
-хост тримає не більше цього. Потокове зображення хост публікує лише на `COVER_END`, зображення
-відомої довжини — коли прийшов його останній байт.
+The host accepts only the current pair, offset 0 first, then contiguous offsets. Unknown and old
+pairs are ignored. A gap, a repeat or a corrupted chunk of the current pair cancels assembly. The
+limit is 256 KiB; the host holds no more than that. The host publishes a streamed image only on
+`COVER_END`, a known-length image when its last byte has arrived.
 
 ### 10.4 `0x19` COVER_END, D → H (1.6)
 
 ```
 u32  boot_nonce
 u32  track_generation
-u32  actual_bytes     // скільки байтів JPEG надіслано
-u32  crc32            // CRC-32 над усіма байтами JPEG поспіль
+u32  actual_bytes     // how many JPEG bytes were sent
+u32  crc32            // CRC-32 over all the JPEG bytes in sequence
 ```
 
-Рівно 16 байтів. CRC-32/ISO-HDLC: поліном `0xEDB88320` (відображений), початкове й фінальне XOR
-`0xFFFFFFFF`; контрольне значення для `123456789` — `0xCBF43926`, на дроті `26 39 F4 CB`.
+Exactly 16 bytes. CRC-32/ISO-HDLC: polynomial `0xEDB88320` (reflected), initial value and final XOR
+`0xFFFFFFFF`; the check value for `123456789` is `0xCBF43926`, on the wire `26 39 F4 CB`.
 
-`COVER_END` іде тією самою чергою, що й `COVER_DATA`, і випередити її не може. Пристрій шле його
-лише після успішного фіналу OBEX. Хост публікує зображення, лише якщо збіглися пара, довжина й
-CRC, довжина в межах 3..262144 і не було жодного розриву, повтору чи помилки. Немає `COVER_END`
-або шматків 5 с поспіль — тайм-аут. Часткове чи зіпсоване зображення не публікується ніколи, бо
-половина картинки гірша за відсутню.
+`COVER_END` goes through the same queue as `COVER_DATA` and cannot overtake it. The device sends it
+only after a successful OBEX final. The host publishes the image only if the pair, the length and
+the CRC match, the length is within 3..262144, and there was no gap, repeat or error. No `COVER_END`
+or chunks for 5 s in a row — timeout. A partial or corrupted image is never published, because half
+a picture is worse than none.
 
-Пристрій обриває зображення **без `COVER_END`**, якщо перші байти не `FF D8 FF` (не JPEG), розмір
-перевищив 256 КіБ, черга чи запас пам'яті не дозволяють поставити шматок, змінилось покоління або
-OBEX повернув помилку. Шматки пристрій не притримує: коли черга повна, він обриває, а не чекає.
+The device aborts an image **without `COVER_END`** if the first bytes are not `FF D8 FF` (not a
+JPEG), the size exceeded 256 KiB, the queue or the memory reserve does not allow a chunk to be
+queued, the generation changed, or OBEX returned an error. The device does not hold chunks back:
+when the queue is full, it aborts rather than waits.
 
 ### 10.5 `0x24` COVER_RETRY, H → D (1.7)
 
 ```
-u32  boot_nonce       // пара, передача якої не вдалась
+u32  boot_nonce       // the pair whose transfer failed
 u32  track_generation
 ```
 
-Рівно 8 байтів, обидва ненульові. Лише пристрою з `proto_minor` >= 7 і бітом 6; інакше не шлеться
-взагалі, і повторів немає.
+Exactly 8 bytes, both non-zero. Only to a device with `proto_minor` >= 7 and bit 6; otherwise it is
+not sent at all, and there are no retries.
 
-Хост шле його, коли передача цієї пари закінчилась без придатного зображення: розрив, повтор чи
-зіпсований шматок, невідповідність довжини чи CRC на `COVER_END` або 5 с тиші. Це підказка, а не
-запит з відповіддю: немає ні відповіді, ні NACK, ні тайм-ауту. Хост, який так нічого й не
-отримав, лишає порожню плитку.
+The host sends it when the transfer of that pair ended without a usable image: a gap, a repeat or a
+corrupted chunk, a length or CRC mismatch at `COVER_END`, or 5 s of silence. It is a hint, not a
+request with a reply: there is no reply, no NACK and no timeout. A host that never received anything
+leaves the tile empty.
 
-Пристрій виконує його, лише якщо пара називає його поточний `boot_nonce` і поточне покоління.
-Інше ігнорується: телефон пішов далі, а наступний `COVER_RESET` принесе нове зображення.
+The device executes it only if the pair names its current `boot_nonce` and current generation.
+Anything else is ignored: the phone has moved on, and the next `COVER_RESET` will bring a new image.
 
-**Виконати — означає нове покоління.** Пристрій заново читає метадані, повторює OBEX GET і шле
-`COVER_RESET` зі **свіжим** `track_generation`, далі `COVER_DATA` від нуля і `COVER_END`, як
-завжди. Старе покоління повторювати не можна: `COVER_RESET` з тією самою парою ідемпотентний,
-тож хост нічого б не очистив, а повтор прийшов би до зіпсованого збирання.
+**Executing means a new generation.** The device re-reads the metadata, repeats the OBEX GET and
+sends `COVER_RESET` with a **fresh** `track_generation`, then `COVER_DATA` from zero and
+`COVER_END`, as always. The old generation may not be repeated: `COVER_RESET` with the same pair is
+idempotent, so the host would clear nothing, and the repeat would land on the corrupted assembly.
 
-Обидва боки обмежують повтори, і жоден не покладається на межу іншого. Хост просить не більше двох
-разів на одне зображення; лічильник починається знову, коли зображення завершилось або коли
-прийшов `COVER_RESET`, який не був відповіддю на його прохання. Пристрій виконує не більше двох
-разів на трек, рахуючи від останньої зміни треку AVRCP або останньої вдалої передачі. Яка межа
-настане першою, та й закінчує ланцюжок, і плитка лишається порожньою. Повтор розрахований на
-поодинокий загублений кадр; телефон чи лінк, що губить кадри постійно, — інша несправність, і
-відповідати на неї необмеженим OBEX не можна.
+Both sides limit retries, and neither relies on the other's limit. The host asks no more than twice
+per image; the counter starts again when an image has completed or when a `COVER_RESET` arrives that
+was not an answer to its request. The device executes no more than twice per track, counting from
+the last AVRCP track change or the last successful transfer. Whichever limit is reached first ends
+the chain, and the tile stays empty. A retry is meant for a single lost frame; a phone or link that
+loses frames constantly is a different fault, and it must not be answered with unbounded OBEX.
 
-Змішані пари визначені: хост, що не бачить біта 6 пристрою, `0x24` не шле; пристрій, якому `0x24`
-не приходить, повторів не робить. Жодна сторона не вважає відсутність повтору помилкою і не чекає
-на нього.
+Mixed pairs are defined: a host that does not see device bit 6 does not send `0x24`; a device that
+receives no `0x24` makes no retries. Neither side treats the absence of a retry as an error or waits
+for one.
 
-### 10.6 `0x14` COVER, D → H (1.0; не шлеться)
+### 10.6 `0x14` COVER, D → H (1.0; not sent)
 
 ```
-u16  chunk            // з нуля
-u16  total            // скільки шматків усього
-u8   mime             // 0 невідомо, 1 jpeg, 2 png
-u32  total_len        // повний розмір зображення
-u16  len              // байтів у цьому шматку, до 1024
+u16  chunk            // from zero
+u16  total            // how many chunks in all
+u8   mime             // 0 unknown, 1 jpeg, 2 png
+u32  total_len        // full image size
+u16  len              // bytes in this chunk, up to 1024
 u8   data[len]
 ```
 
-Обкладинка пристроїв 1.0–1.4. Пристрій 1.10 її не шле, хост 1.10 її відкидає; розкладка лишається
-для повноти. `mime` і `total_len` повторюються в кожному шматку, щоб кожен був самоописним; межа
-— 256 КБ.
+The cover art of 1.0–1.4 devices. A 1.10 device does not send it, a 1.10 host discards it; the
+layout stays for completeness. `mime` and `total_len` are repeated in every chunk so that each is
+self-describing; the limit is 256 KB.
 
 ---
 
-## 11. Зарезервовані коди й біти
+## 11. Reserved codes and bits
 
-- Коди `0x30`–`0x35` не визначені й не перевикористовуються. Пристрій рахує їх як невідомий тип і
-  нічого не робить; хост їх не шле, а отримані відкидає як невідомий тип.
-- Біти 4 і 5 пристрою завжди 0; хост скидає їх для будь-якої версії пристрою (3.3).
-- Біт 2 хоста хост не виставляє, а пристрій ігнорує.
+- Codes `0x30`–`0x35` are undefined and not reused. The device counts them as an unknown type and
+  does nothing; the host does not send them and discards received ones as an unknown type.
+- Device bits 4 and 5 are always 0; the host clears them for any device version (3.3).
+- The host does not set host bit 2, and the device ignores it.
 
-Жоден із цих кодів і бітів не отримає нового значення.
+None of these codes and bits will get a new meaning.
 
 ---
 
@@ -901,48 +930,50 @@ u8   level            // 0 error, 1 warn, 2 info, 3 debug
 str  text
 ```
 
-Лог пристрою для людини на боці хоста. Відкидне. Шлеться й несумісному хосту.
+The device's log, for a human on the host side. Droppable. Sent to an incompatible host too.
 
 ---
 
-## 13. Черги й відкидання
+## 13. Queues and dropping
 
-Пристрій ніколи не чекає на хоста. Коли хост не встигає читати, частина повідомлень губиться,
-і які саме — визначено:
+The device never waits for the host. When the host cannot keep up reading, some messages are lost,
+and which ones is defined:
 
-- **Відкидні:** `TRACK_POS`, `LOG`, `COVER`, `COVER_DATA`, `COVER_END`. Вони йдуть окремими
-  чергами з нижчим пріоритетом і першими губляться під тиском. Хост на них не покладається:
-  позиція оновиться наступною, а зображення без `COVER_END` не публікується.
-- **Решта не відкидається**, зокрема `BT_STATE`, `STREAM_FMT` / `STREAM_PREPARE` і
-  `COVER_RESET`. Вони мають пріоритет над відкидними.
-- **Обкладинка не витісняє нічого.** Шматок, для якого немає місця в черзі чи запасу пам'яті,
-  обриває зображення; повтор — справа `COVER_RETRY`.
-- **Несумісному хосту** (інший `proto_major`) пристрій шле лише `HELLO`, `PING`, `PONG` і `LOG`.
+- **Droppable:** `TRACK_POS`, `LOG`, `COVER`, `COVER_DATA`, `COVER_END`. They go through separate
+  lower-priority queues and are the first to be lost under pressure. The host does not rely on
+  them: the next position will update it, and an image without `COVER_END` is not published.
+- **The rest is not dropped**, including `BT_STATE`, `STREAM_FMT` / `STREAM_PREPARE` and
+  `COVER_RESET`. They take priority over the droppable ones.
+- **Cover art displaces nothing.** A chunk for which there is no room in the queue or in the memory
+  reserve aborts the image; a retry is the business of `COVER_RETRY`.
+- **To an incompatible host** (a different `proto_major`) the device sends only `HELLO`, `PING`,
+  `PONG` and `LOG`.
 
-Хост так само не блокується на прийомі. UART читає окрема задача на ядрі 0 з пріоритетом 8, а
-задачі виводу звуку й прийому I2S працюють на ядрі 1 з пріоритетами 22 і 23. Задача прийому
-кладе цілі кадри в кільце на 6144 байти, не чекаючи на місце, а розбирає їх головний цикл.
-Переповнення драйвера, повне кільце, помилки CRC і COBS, завеликі кадри й розриви `seq` хост
-рахує окремо.
+The host likewise does not block on receive. A separate task on core 0 at priority 8 reads the
+UART, while the audio output and I2S receive tasks run on core 1 at priorities 22 and 23. The
+receive task puts whole frames into a 6144-byte ring without waiting for room, and the main loop
+parses them. The host counts driver overflows, a full ring, CRC and COBS errors, oversize frames and
+`seq` gaps separately.
 
 ---
 
-## 14. Сумісність версій
+## 14. Version compatibility
 
-Кожна сторона бере з іншої лише те, що та оголосила. Що отримує хост залежно від свого
-`proto_minor` від пристрою 1.10:
+Each side takes from the other only what the other has announced. What a host gets from a 1.10
+device, depending on its own `proto_minor`:
 
-| Хост | Що змінюється |
+| Host | What changes |
 |---|---|
-| < 1.1 або без біта 3 | лише 16-бітні слоти, 24-бітні джерела з дизером |
-| < 1.3 або без біта 4 | старий шлях `STREAM_FMT` + 50 мс; з бітом 3 — 32-бітні слоти для всіх кодеків |
-| < 1.4 або без біта 5 | без 96 кГц |
-| < 1.6 або без бітів 1 і 6 | жодної обкладинки |
-| < 1.7 | без `COVER_RETRY`: зображення з однією втраченою частиною лишається порожнім |
-| < 1.8 | без налаштувань Bluetooth; спарювання NoInputNoOutput, без запиту |
-| < 1.9 або без біта 8 | пристрій — майстер I2S |
+| < 1.1 or no bit 3 | 16-bit slots only, 24-bit sources with dither |
+| < 1.3 or no bit 4 | the old `STREAM_FMT` + 50 ms path; with bit 3 — 32-bit slots for all codecs |
+| < 1.4 or no bit 5 | no 96 kHz |
+| < 1.6 or not both bits 1 and 6 | no cover art at all |
+| < 1.7 | no `COVER_RETRY`: an image with one lost part stays empty |
+| < 1.8 | no Bluetooth settings; NoInputNoOutput pairing, without a request |
+| < 1.9 or no bit 8 | the device is the I2S master |
 
-У зворотний бік хост дивиться на `proto_minor` і біти пристрою так само (3.3): `STREAM_PREPARE`
-приймає від пристрою з `proto_minor` >= 3, `COVER_RESET` і `COVER_DATA` — з >= 5, `COVER_END` — з
->= 6; `COVER_RETRY` шле лише з бітом 6 пристрою, `0x25`–`0x28` — лише з бітом 7; BCLK і WS веде,
-лише поки останній `HELLO` пристрою несе біт 8. Коди `0x30`–`0x35` хост не шле (розділ 11).
+In the other direction the host looks at the device's `proto_minor` and bits the same way (3.3): it
+accepts `STREAM_PREPARE` from a device with `proto_minor` >= 3, `COVER_RESET` and `COVER_DATA`
+from >= 5, `COVER_END` from >= 6; it sends `COVER_RETRY` only with device bit 6, `0x25`–`0x28`
+only with bit 7; it drives BCLK and WS only while the device's last `HELLO` carries bit 8. The host
+does not send codes `0x30`–`0x35` (section 11).
