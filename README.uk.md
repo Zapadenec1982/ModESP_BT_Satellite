@@ -27,14 +27,16 @@
 
 | | |
 |---|---|
-| [`docs/DEVICE_SPEC.md`](docs/DEVICE_SPEC.md) | пристрій: залізо, піни, кодеки, I2S, поведінка, рішення замовника |
+| [`docs/DEVICE_SPEC.uk.md`](docs/DEVICE_SPEC.uk.md) ([англійською](docs/DEVICE_SPEC.md)) | пристрій: залізо, піни, кодеки, I2S, поведінка, рішення замовника |
 | [`docs/PROTOCOL.uk.md`](docs/PROTOCOL.uk.md) ([англійською](docs/PROTOCOL.md)) | лінк із хостом байт за байтом, версія 1.10 |
-| [`docs/BASE.md`](docs/BASE.md) | чому стек Bluetooth патчиться і як ці патчі нести |
-| [`patches/README.md`](patches/README.md) | що робить кожен патч стека |
-| [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) | сторонній код в образі та його умови, як вони записані у файлах |
+| [`docs/BASE.uk.md`](docs/BASE.uk.md) ([англійською](docs/BASE.md)) | чому стек Bluetooth патчиться і як ці патчі нести |
+| [`patches/README.uk.md`](patches/README.uk.md) ([англійською](patches/README.md)) | що робить кожен патч стека |
+| [`THIRD_PARTY_NOTICES.uk.md`](THIRD_PARTY_NOTICES.uk.md) ([англійською](THIRD_PARTY_NOTICES.md)) | сторонній код в образі та його умови, як вони записані у файлах |
+| [`docs/LHDC_UPSTREAM.uk.md`](docs/LHDC_UPSTREAM.uk.md) ([англійською](docs/LHDC_UPSTREAM.md)) | звідки декодер LHDC V5 і чому він підтягується, а не лежить у репозиторії |
 
-Протокол написаний англійською (`PROTOCOL.md`) з українською копією (`PROTOCOL.uk.md`) і є
-спільним контрактом: копії слово в слово живуть у репозиторії хоста, і міняються вони разом. Хост,
+Кожен документ написаний англійською, а поруч лежить українська копія (`.uk.md`), яка каже те
+саме тією самою структурою; основний текст — англійський. Протокол — спільний контракт: копії обох
+мов слово в слово живуть у репозиторії хоста, і міняються вони разом. Хост,
 для якого це зроблено, — [ModESP Streamer](https://github.com/Zapadenec1982/ModESP_Streamer),
 мережевий стример на ESP32-P4; його копії там — `docs/LINK_PROTOCOL.md` і `docs/LINK_PROTOCOL.uk.md`.
 
@@ -58,7 +60,7 @@ WS і DOUT лежать поруч у лівому ряду гребінки, BC
 Та сама прошивка має другу конфігурацію — для **голого модуля**: лінк переїжджає на UART0, TX 1 і
 RX 3, саме ту пару, яку слухає ROM-завантажувач, тож хост і прошиває пристрій, і говорить з ним по
 одних двох дротах (EN та IO0 теж веде хост). Консоль там вимкнена. Це вибір у Kconfig
-(`SAT_LINK_PORT`), який робить збірка з `sdkconfig.bare`; див. [`docs/DEVICE_SPEC.md`](docs/DEVICE_SPEC.md),
+(`SAT_LINK_PORT`), який робить збірка з `sdkconfig.bare`; див. [`docs/DEVICE_SPEC.uk.md`](docs/DEVICE_SPEC.uk.md),
 «Голий модуль».
 
 Процесор працює на 240 МГц: на 160 декодер aptX не встигав.
@@ -68,7 +70,7 @@ RX 3, саме ту пару, яку слухає ROM-завантажувач, 
 ESP-IDF прибитий у [`idf.pin`](idf.pin) (v5.5.5). Стоковий Bluedroid у режимі A2DP sink уміє лише
 SBC, тому стек патчиться: `tools/setup.*` копіює `components/bt` зі збереженого IDF, накладає
 `patches/` і копіює зверху `bt_overlay/`. Спільний IDF на диску лише читається. Подробиці — у
-[`docs/BASE.md`](docs/BASE.md).
+[`docs/BASE.uk.md`](docs/BASE.uk.md).
 
 Windows, PowerShell:
 
@@ -149,6 +151,6 @@ tests/host/, tools/        хост-тести і скрипти, що їх за
 разом зі змінами, зробленими тут: у `bt_overlay/` це Apache-2.0 для каркаса кодеків, RealNetworks
 Public Source License для Helix AAC (`RPSL.txt` поруч) і LGPL-2.1-or-later для libfreeaptx. Патчі
 змінюють Bluedroid, і він лишається під Apache-2.0. Усе це перелічено в
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) разом з тим, чого кожна частина вимагає від
+[`THIRD_PARTY_NOTICES.uk.md`](THIRD_PARTY_NOTICES.uk.md) разом з тим, чого кожна частина вимагає від
 зібраного образу; `tools/relink_kit.ps1` готує набір для перелінковки LGPL до релізу. Декодера
 LHDC V5 у репозиторії немає зовсім ([`lhdc.pin`](lhdc.pin)).

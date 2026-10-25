@@ -1,0 +1,41 @@
+[English](THIRD_PARTY_NOTICES.md) · **Українська**
+
+# Сторонній код в образі сателіта
+
+Що злінковано в `modesp_bt_satellite.bin`, звідки воно і під якою ліцензією — **як це записано у
+файлах**, на 2026-09-21 і ще раз на 2026-10-24, перед відкриттям репозиторію. Це перелік фактів для
+того, кому вирішувати, що вони означають; це не юридична консультація, і висновків тут немає.
+
+| Код | Де в цьому дереві | Ліцензія, як вона записана у файлах | Примітки |
+|---|---|---|---|
+| ESP-IDF v5.5.5 (`b774170ff46c393eeb5e495ea37936038d3f4f4f`) | спільний checkout, названий в `idf.pin`; у цьому репозиторії його немає | `LICENSE` у корені IDF: Apache-2.0. Компоненти всередині IDF мають власні повідомлення (ядро FreeRTOS, newlib, mbedTLS та інші); для них авторитетне саме дерево IDF | Усе під `components/bt` копіюють звідти `tools/setup.ps1` / `tools/setup.sh` |
+| Контролер Bluetooth ESP32, `libbtdm_app.a` | копіюється в `components/bt/controller/lib_esp32/` | `LICENSE` у тій теці: Apache-2.0; `README.rst`: "Copyright (C) 2015-2016 Espressif Systems ... provided under the same license as the parent esp-idf project - the Apache License 2.0 ... (The license text refers to this as 'Object' form.)" | Лише бінарний. Нижче межі VHCI; патчі його не чіпають |
+| Хост-стек Bluedroid | копіюється в `components/bt/host/bluedroid/`, потім накладаються `patches/0001`..`0011` | Заголовки файлів: "Copyright (C) 2004-2012 Broadcom Corporation", "Copyright (C) 2014 Google, Inc.", Apache-2.0 | Серія патчів — цього проекту; її зміст — дельта, похідна від `WillyBilly06/ESP32-A2DP-SINK-WITH-CODECS-UPDATED` (`docs/BASE.uk.md`) |
+| Каркас A2DP для кількох кодеків (конфігурація кодеків, розбір vendor-кодеків, обгортки декодерів) | `bt_overlay/host/bluedroid/stack/a2dp/`, `.../stack/include/stack/` | Заголовки файлів: "SPDX-FileCopyrightText: 2016 The Android Open Source Project" (Apache-2.0), "SPDX-FileCopyrightText: 2024 ESP32 A2DP Project" (Apache-2.0), і сам лише `SPDX-License-Identifier: Apache-2.0` на `a2dp_vendor_aptx_decoder.c`, `a2dp_decoder.h` і `a2dp_vendor_aptx_decoder.h`. `a2dp_rtp.c` написаний тут: "SPDX-FileCopyrightText: 2026 Zapadenec1982", Apache-2.0 | Узято з донорського форка `WillyBilly06/ESP32-A2DP-SINK-WITH-CODECS-UPDATED`. Його README закінчується словами "MIT License. See the license file for details.", але власного файлу ліцензії він не має, є лише Apache-2.0 `esp-idf/LICENSE` вендореного IDF; самі файли кажуть Apache-2.0. Кожен файл, змінений у цьому проекті, має "SPDX-FileContributor: 2026 Zapadenec1982" — позначку, якої Apache-2.0 §4(b) вимагає від змінених файлів; файл без неї такий, яким його мав донор. П'ять файлів `a2dp_vendor_lhdcv5*` адаптовано з `a2dp_integration/` репозиторію декодера LHDC, де файли не мають жодного повідомлення; тепер кожен про це каже, з `SPDX-License-Identifier: Apache-2.0` за README апстріму і рядком `SPDX-FileContributor` за зміни, зроблені тут. Вони лишаються в цьому репозиторії: даних, витягнутих з енкодера Savitech, у них немає (див. рядок LHDC) |
+| Декодер AAC Helix з фіксованою комою (RealNetworks, 2005) | `bt_overlay/host/bluedroid/external/libaac-lc/libhelix_aac/` | Кожен файл вихідного коду: "Portions Copyright (c) 1995-2005 RealNetworks, Inc. ... subject to the current version of the RealNetworks Public Source License (the 'RPSL') ... unless you have licensed the file under the current version of the RealNetworks Community Source License (the 'RCSL')", з адресами на helixcommunity.org. Копія, узята в донора, не мала файлу з текстом ліцензії; `readme.txt` — технічний огляд і про умови нічого не каже | Збирається, коли `CONFIG_BT_A2DP_AAC_DECODER=y` (так стоїть у `sdkconfig.defaults`). **Текст RPSL — `libhelix_aac/RPSL.txt`**, доданий 2026-10-24, бо §2.1(b) вимагає копію з кожною копією вихідного коду; це текст у тому вигляді, в якому його несуть копії сирців Helix, однаковий у `pschatzmann/codec-helix`, `ultraembedded/libhelix-mp3` і `Panda381/PicoLibSDK` (разом з одною одрукою, "wtih"). Три службові заголовки, які включають сирці Helix, — `ConfigHelix.h`, `utils/helix_pgm.h` і `utils/helix_memory.h` — власні файли цього проекту, MIT, написані 2026-10-24: файли, які вони замінили, були адаптовані з однойменних файлів `pschatzmann/arduino-libhelix`, репозиторію під GPL-3.0, а RPSL Exhibit B забороняє застосовувати до Helix умови GPL. Обгортка `libaac-lc/aac_decoder_helix.c` — донорова; ліцензії вона не називала, а тепер каже про це і звідки вона. **Змінено тут** 2026-10-12 (коміти `21876ec`, `54ce0fc`): `noiseless.c`, `decelmnt.c`, `bitstream.c` і `coder.h` отримали перевірки меж, що відкидають зіпсовані кадри (`max_sfb`, довжини секцій, позиції імпульсів, від'ємні кількості бітів, порядок TNS, кінець маски M/S у CPE), а розбір gain control у `noiseless.c` прибрано на користь відкидання кадру. RPSL §2.1(c) вимагає, щоб кожен змінений файл зберігав повідомлення з Exhibit A і казав, що й коли змінено: ліцензійний блок не чіпається, а кожен змінений файл має датовану примітку про зміну в коментарі з описом під ним |
+| libfreeaptx (aptX / aptX HD) | `bt_overlay/host/bluedroid/external/libfreeaptx/main/` | Заголовки файлів: "Copyright (C) 2017 Aurelien Jacobs, 2018-2020 Pali Rohár, 2021 Hunter Wardlaw ... GNU Lesser General Public License ... version 2.1 ... or (at your option) any later version"; повний текст — у `main/COPYING` і в `LICENSE` поруч | LGPL-2.1-or-later, статично злінкована в `libbt.a`. Перенесена такою, як її мав донор, без змін. `tools/relink_kit.ps1` готує набір для перелінковки до релізу |
+| Декодер LHDC V5 | **у цьому репозиторії його немає.** `tools/setup.sh --with-lhdc` підтягує його на коміті з `lhdc.pin` у `components/lhdcv5_decoder/`, яку git ігнорує | **В апстрімі немає файлу ліцензії.** `README.md` апстріму каже, що реалізація "is released under the Apache License 2.0" і що це "does not grant any rights to the LHDC codec itself, which is the property of Savitech". Сирці не мають ні рядка копірайту, ні ідентифікатора SPDX; `lhdc_tables.c` каже про свої таблиці "REAL EXTRACTED DATA FROM liblhdcv5.so (LHDC V5 Encoder Binary)" | Подробиці — у `docs/LHDC_UPSTREAM.uk.md`. Збирається, лише коли підтягнутий і `CONFIG_BT_A2DP_LHDCV5_DECODER=y`, що ставить `sdkconfig.lhdc`; за замовчуванням вимкнений |
+| LDAC | немає | — | Виключено навмисно: єдиний декодер, що є в обігу (`external/libldac-dec` у донорському форку), не має ні копірайту, ні ліцензії, а Sony публікує лише енкодер (`CLAUDE.md`, `docs/BASE.uk.md`) |
+| Ця прошивка (`main/`, `components/satlink/`, `patches/`, `tests/`, `tools/`, документація) | цей репозиторій | **MIT**, `LICENSE` у корені: "Copyright (c) 2026 Zapadenec1982" | З 2026-10-24. Файл із власним ліцензійним заголовком лишається під ним, разом зі змінами, зробленими тут; патчі змінюють Bluedroid, який лишається під Apache-2.0 |
+
+Як перевірити будь-який рядок наново: стовпець ліцензії цитує файли, тож `grep -rn -i
+"copyright\|SPDX\|licen" <шлях>` по теці рядка це відтворює.
+
+## Бінарний реліз
+
+Чого умови вище вимагають від того, хто роздає зібраний образ, а не ці сирці. Записано тут, не
+розв'язано. Артефакт CI-workflow публічного репозиторію був би саме такою роздачею, тож CI їх не
+зберігає.
+
+- **Apache-2.0** (ESP-IDF, Bluedroid, контролер, каркас кодеків): копія ліцензії йде разом з
+  образом (§4(a)).
+- **LGPL-2.1-or-later** (libfreeaptx, статично злінкована): сирці бібліотеки і те, що потрібно,
+  щоб перелінкувати образ зі зміненою збіркою бібліотеки (§6). Це збирає `tools/relink_kit.ps1`.
+- **RPSL 1.0** (Helix AAC, у кожному образі, зібраному з `sdkconfig.defaults`): §2.1(e) вимагає
+  помітного повідомлення, "in the code itself as well as in related documentation", що сирці
+  доступні під RPSL і де саме, і Object Code Notice з Exhibit A там, де показано повідомлення про
+  авторські права: "Helix DNA Client technology included. Copyright (c) RealNetworks, Inc.,
+  1995-2002. All rights reserved." Зараз образ цього повідомлення не несе. §4.2 ще вимагає, щоб
+  код, поєднаний з Helix, був під однією з ліцензій з Exhibit B і доступний у сирцях; образ також
+  лінкує бінарні бібліотеки Espressif, серед них контролер Bluetooth `libbtdm_app.a`.
+- **LHDC V5**: цей репозиторій не роздає жодного образу з декодером усередині.

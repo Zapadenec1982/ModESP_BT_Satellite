@@ -1,6 +1,6 @@
 /*
- * The check after a pause from the host (DEVICE_SPEC "Пауза від хоста, яку телефон
- * ігнорує"), as pure C: bt_av.c runs it on an esp_timer, tests/host/test_rules.c walks it.
+ * The check after a pause from the host (DEVICE_SPEC "A host pause the phone
+ * ignores"), as pure C: bt_av.c runs it on an esp_timer, tests/host/test_rules.c walks it.
  *
  * A PAUSE or STOP from the host arms a one-shot wait; a stream still going when it runs
  * out is suspended. The wait is for a phone that ignores the pause, so it ends early on
