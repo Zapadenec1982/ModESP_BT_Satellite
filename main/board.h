@@ -1,7 +1,7 @@
 /*
  * Board wiring. ESP32-WROOM-32, on a DevKitC or as a bare module.
  *
- * Confirmed by the customer on 18.09.2026 (docs/DEVICE_SPEC.md, section "Піни").
+ * Confirmed by the customer on 18.09.2026 (docs/DEVICE_SPEC.md, section "Pins").
  * The pins were chosen by where they sit on the header, not by number: WS and DOUT are
  * consecutive in the left row, BCLK sits apart next to a GND pin, the UART is two
  * consecutive in the right row. Nothing here may be changed without changing that document.

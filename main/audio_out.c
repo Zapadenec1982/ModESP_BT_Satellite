@@ -334,7 +334,7 @@ static inline int16_t audio_narrow_32_to_16(int32_t v)
  * Every step re-derives the APLL live (i2s_common.c:1486, IDF 5.5.5): the sdm
  * coefficients are rewritten and a calibration cycle runs while BCLK is
  * expected to keep going. Whether it really does is a scope measurement, not a
- * code reading -- docs/DEVICE_SPEC.md, "Вихід I2S".
+ * code reading -- docs/DEVICE_SPEC.md, "I2S output".
  */
 #define AUDIO_SERVO_PERIOD_US   (1000 * 1000)
 #define AUDIO_SERVO_TARGET      (AUDIO_RING_BYTES / 2)
@@ -1163,7 +1163,7 @@ static void audio_out_task(void *arg)
  * Protocol 1.9: the channel in either role.
  *
  * MASTER (hosts before 1.9): this device makes BCLK and WS from the APLL, and the clock
- * servo absorbs the phone's drift by tuning that APLL (DEVICE_SPEC, "Вихід I2S").
+ * servo absorbs the phone's drift by tuning that APLL (DEVICE_SPEC, "I2S output").
  *
  * SLAVE (1.9 hosts): the host makes BCLK and WS from the PLL that also clocks its DAC and
  * reads DATA on its own clock -- measured on 30.09.2026, the host as a SLAVE received
@@ -1189,7 +1189,7 @@ static i2s_std_clk_config_t master_clock(uint32_t rate)
 {
     i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(rate);
     /* APLL, not the 160 MHz PLL: 44.1 kHz lands far closer, and the clock servo
-     * absorbs the phone's drift by tuning it (DEVICE_SPEC, "Вихід I2S"). */
+     * absorbs the phone's drift by tuning it (DEVICE_SPEC, "I2S output"). */
     clk.clk_src = I2S_CLK_SRC_APLL;
     return clk;
 }
